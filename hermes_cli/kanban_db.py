@@ -2921,6 +2921,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _retire_legacy_review_rows(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -3055,6 +3056,112 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
         raise
+
+
+def _retire_legacy_review_rows(conn: sqlite3.Connection) -> None:
+    """Return legacy review rows to the ordinary worker queue once.
+
+    Review execution is no longer a product workflow. Existing boards may
+    still contain review rows or an in-flight review run, so upgrading must
+    preserve their history without leaving work permanently undispatchable.
+    """
+    candidates = conn.execute(
+        "SELECT id, status, current_run_id, worker_pid, claim_lock "
+        "FROM tasks WHERE status IN ('review', 'running')"
+    ).fetchall()
+    rows = []
+    for row in candidates:
+        if row["status"] == "review":
+            rows.append(row)
+            continue
+        claimed = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (row["id"], row["current_run_id"]),
+        ).fetchone()
+        try:
+            claimed_payload = (
+                json.loads(claimed["payload"])
+                if claimed and claimed["payload"]
+                else {}
+            )
+        except (json.JSONDecodeError, TypeError):
+            claimed_payload = {}
+        if claimed_payload.get("source_status") == "review":
+            rows.append(row)
+    if not rows:
+        return
+
+    now = int(time.time())
+    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    with write_txn(conn):
+        for row in rows:
+            task_id = row["id"]
+            landing_status = (
+                "ready" if _parents_satisfied(conn, task_id) else "todo"
+            )
+            event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            try:
+                payload = (
+                    json.loads(event["payload"])
+                    if event and event["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            implementer = payload.get("implementer")
+            if not isinstance(implementer, str) or not implementer.strip():
+                implementer = None
+
+            if row["current_run_id"] is not None:
+                conn.execute(
+                    "UPDATE task_runs SET status = 'reclaimed', "
+                    "outcome = 'reclaimed', ended_at = ?, "
+                    "summary = COALESCE(summary, ?), claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND ended_at IS NULL",
+                    (
+                        now,
+                        "review workflow retired during upgrade",
+                        row["current_run_id"],
+                    ),
+                )
+
+            assignee_sql = ", assignee = ?" if implementer else ""
+            params: tuple[Any, ...] = (
+                (landing_status, implementer, task_id)
+                if implementer
+                else (landing_status, task_id)
+            )
+            updated = conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                + assignee_sql
+                + " WHERE id = ? AND status = ?",
+                (*params, row["status"]),
+            )
+            if updated.rowcount != 1:
+                continue
+            retired_payload: dict[str, Any] = {"status": landing_status}
+            if implementer:
+                retired_payload["implementer"] = implementer
+            _append_event(
+                conn,
+                task_id,
+                "review_retired",
+                retired_payload,
+                run_id=row["current_run_id"],
+            )
+            terminations.append((row["worker_pid"], row["claim_lock"]))
+
+    for pid, claim_lock in terminations:
+        _terminate_reclaimed_worker(pid, claim_lock)
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
@@ -7205,9 +7312,8 @@ def invalidate_descendants_for_parent_reopen(
     whose state assumed the ancestor's result — ``ready``, ``review``,
     ``running`` or ``done`` — is building on a retracted premise, so it is
     demoted to ``todo`` and re-gated on the graph. The CLI deliberately has
-    NO done-reopen verb on this branch (``reopen-review`` only handles the
-    review-phase transition via :func:`reopen_review_task`), so every surface
-    that reopens a done task (dashboard drag-drop / PATCH — single and bulk —
+    no done-reopen verb, so every surface that reopens a done task (dashboard
+    drag-drop / PATCH — single and bulk —
     via ``_set_status_direct``) must route through this function; keeping the
     implementation here means a future CLI or tool reopen verb inherits
     identical semantics for free.
@@ -9762,41 +9868,6 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
-
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
-    """
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
-    ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
-
-
-def review_dispatch_enabled() -> bool:
-    """Return the product-owned review dispatch policy.
-
-    Reviewer/supervisor execution was retired from this product.  Keep this
-    compatibility hook fail-closed so historical callers cannot re-enable the
-    removed workflow through an old configuration file.
-    """
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Memory-aware dispatch guard (OOF-30 / OOF-77)
 #
@@ -10225,42 +10296,6 @@ def _dispatch_once_locked(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
-    # Review rows are enumerated up front (not after the ready loop) so the
-    # budget split below can see whether review work exists at all.
-    review_rows = []
-    if review_dispatch_enabled():
-        review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
-            "ORDER BY priority DESC, created_at ASC"
-        ).fetchall()
-    # Review-lane reservation (OOF-30 review finding): the ready loop runs
-    # first and used to consume the ENTIRE shared budget, so a sustained
-    # ready backlog permanently starved autonomous reviews — completed work
-    # sat in 'review' forever while new work kept spawning. When spawnable
-    # review work exists and the tick has any budget, hold one slot back
-    # from the ready loop so the review lane always gets a spawn
-    # opportunity. The reservation is per-tick and self-releasing: with no
-    # spawnable review work (or no cap at all) the ready loop keeps the
-    # full budget. "Spawnable" mirrors the review loop's own gate
-    # (assigned + real profile) so a review column full of human-pulled
-    # control-plane lanes doesn't permanently tax ready throughput.
-    def _any_spawnable_review() -> bool:
-        if not review_rows:
-            return False
-        try:
-            from hermes_cli.profiles import profile_exists as _rpe
-        except Exception:
-            # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
-
-    ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
-        ready_budget = max(spawn_budget - 1, 0)
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -10299,7 +10334,7 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
-        if ready_budget is not None and spawned >= ready_budget:
+        if spawn_budget is not None and spawned >= spawn_budget:
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -10483,125 +10518,6 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
 
-    # ---- review column dispatch ----
-    # Review tasks are tasks that a worker moved to 'review' after
-    # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the candidate and either approves
-    # (→ done) or requests changes (→ ready/todo for the implementer).
-    #
-    # Same concurrency model as ready dispatch: review spawns count
-    # against max_spawn alongside ready tasks, so the total number of
-    # running workers stays bounded.
-    # Auto-dispatch is enabled by default because Hermes bundles the
-    # ``sdlc-review`` skill and reviewer workers can now approve, request
-    # changes without block-loop accounting, or escalate a genuine blocker.
-    # Human-only boards can disable it with ``kanban.review_dispatch``.
-    #
-    # ``review_rows`` was enumerated before the ready loop; when it is
-    # non-empty the ready loop ran against ``ready_budget`` (one slot held
-    # back) so this lane cannot be permanently starved by a sustained
-    # ready backlog. The review loop itself still checks the FULL shared
-    # ``spawn_budget`` — the reservation caps the ready lane, it does not
-    # grant the review lane extra capacity.
-    for row in review_rows:
-        if spawn_budget is not None and spawned >= spawn_budget:
-            break
-        if not row["assignee"]:
-            result.skipped_unassigned.append(row["id"])
-            continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
-            result.skipped_nonspawnable.append(row["id"])
-            continue
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row["assignee"], 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row["assignee"], current)
-                )
-                continue
-        guard_reason = check_respawn_guard(conn, row["id"], lane="review")
-        if guard_reason is not None:
-            result.respawn_guarded.append((row["id"], guard_reason))
-            if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
-            continue
-        if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
-            spawned += 1
-            if _per_profile_cap is not None:
-                _per_profile_running[row["assignee"]] = (
-                    _per_profile_running.get(row["assignee"], 0) + 1
-                )
-            continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
-        if claimed is None:
-            continue
-        try:
-            resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
-            else:
-                workspace = resolve_workspace(claimed, board=board)
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
-            continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
-        )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            # Worker-lifecycle observer (RFC #58548): same contract as the
-            # ready-lane fire above — after spawn + PID persistence.
-            _fire_worker_spawned_hook(
-                conn, claimed, str(workspace), pid, board=board,
-            )
-            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-            spawned += 1
-            if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
-                )
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
     return result
 
 

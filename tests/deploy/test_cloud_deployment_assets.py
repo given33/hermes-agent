@@ -264,45 +264,47 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "merge-base --is-ancestor" in updater
     assert "refs/remotes/origin/main" in updater
     archive = updater.index('archive --format=tar "${release_commit}"')
-    readable_stage = updater.index('chmod -R a+rX "${stage}"')
-    install_dispatch = updater.rindex('case "${role}" in')
+    locked_sync = updater.index("uv sync --locked", archive)
+    generation_verify = updater.index('verify_generation "${candidate_generation}"')
+    generation_switch = updater.index(
+        'mv -Tf -- "${current_link}.new.$$"', updater.index('ln -s -- "${snapshot}"')
+    )
+    install_dispatch = updater.index('case "${role}" in', generation_switch)
     node_install = updater.index(
         'bash "${preflight_root}/deploy/dbb3/install-dbb3-cloud-connector-user.sh"',
         install_dispatch,
     )
-    assert archive < readable_stage < node_install
+    assert archive < locked_sync < generation_verify < generation_switch < node_install
     assert 'preflight_root="${state_root}/preflight.$$"' in updater
-    assert '-- "${archive_paths[@]}"' in updater
-    for relative in (
-        "deploy/automation/update-fabric-node.sh",
-        "deploy/automation/hermes-fabric-update.service",
-        "deploy/automation/hermes-fabric-update.timer",
-        "deploy/dbb3/install-dbb3-cloud-connector-user.sh",
-        "deploy/dbb3/dbb3_cloud_connector.py",
-        "deploy/dbb3/dbb3-cloud-connector.service",
-        "deploy/pc/install-pc-cloud-connector-user.sh",
-        "deploy/pc/pc-cloud-connector.service",
-        "deploy/hk/install-hk-cloud-connector-user.sh",
-        "deploy/hk/hk-cloud-connector.service",
-        "hermes_cli/__init__.py",
-        "hermes_runtime",
-        "hermes_services",
-        "hermes_constants.py",
-        "hermes_secret_compare.py",
-        "utils.py",
-    ):
-        assert f'"{relative}"' in updater
-    assert (
-        'bash "${stage}/deploy/recovery/install-dbb3-managed-installation-receiver.sh"'
-        in updater
-    )
-    assert 'bash "${stage}/deploy/recovery/install-wsl-managed-installation.sh"' in updater
+    assert 'archive_paths=(' not in updater
+    assert 'runtime_assets=(' not in updater
+    assert '| tar -xf - -C "${candidate_generation}"' in updater
+    assert 'GIT_INDEX_FILE="${verify_index}"' in updater
+    assert "diff-files --quiet --ignore-submodules=none" in updater
+    current_check = updater.index("local_generation_current()")
+    current_check_end = updater.index("\n}\n", current_check)
+    assert 'verify_generation "${resolved}"' in updater[
+        current_check:current_check_end
+    ]
+    assert '"${root}/pyproject.toml"' in updater
+    assert '"${root}/uv.lock"' in updater
+    assert '"${root}/gateway/run.py"' in updater
+    assert '"${root}/run_agent.py"' in updater
+    assert "__HERMES_FABRIC_CURRENT_RUNTIME__" in updater
+    assert 'current + "/.fabric-current"' in updater
+    assert 'preflight_service_home="${state_root}/service-preflight.$$"' in updater
+    assert 'HOME="${preflight_service_home}"' in updater
+    assert 'HERMES_HOME="${preflight_service_home}/.hermes/profiles/${worker_profile}"' in updater
+    assert updater.count('HERMES_HOME="${preflight_service_home}/.hermes/profiles/${worker_profile}"') >= 2
+    assert 'chmod -R a+rX,go-w "${candidate_generation}"' in updater
+    assert 'bash "${preflight_root}/deploy/recovery/install-dbb3-managed-installation-receiver.sh"' in updater
+    assert 'bash "${preflight_root}/deploy/recovery/install-wsl-managed-installation.sh"' in updater
     assert 'bash "${preflight_root}/deploy/hk/install-hk-cloud-connector-user.sh"' in updater
     assert 'case "${role}" in dbb3|wsl|hk)' in updater
-    assert '"hermes_cli/managed_node_recovery_service.py"' in updater
+    assert "import hermes_cli.managed_node_recovery_service" in updater
     assert "hermes.fabric-release.v1" in updater
     updater_refresh = updater.index(
-        '"${stage}/deploy/automation/update-fabric-node.sh"'
+        '"${snapshot}/deploy/automation/update-fabric-node.sh"'
     )
     deployed_commit = updater.index('mv -f -- "${deployed_file}.new.$$"')
     assert node_install < updater_refresh < deployed_commit
@@ -314,10 +316,22 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert '--config "${curl_config}"' in updater
     assert 'Authorization: Bearer $(cat' not in updater
     assert "^[A-Za-z0-9._~+/-]+={0,3}$" in updater
-    assert node_install < updater.index(
-        'mv -f -- "${deployed_file}.new.$$"'
+    connector_health = updater.index(
+        "target worker WebSocket generation/release did not become healthy"
     )
+    final_generation_verify = updater.index(
+        'verify_generation "${snapshot}"', connector_health
+    )
+    assert node_install < connector_health < final_generation_verify < deployed_commit
+    assert '"source": {' in updater
+    assert '"lock": "uv.lock"' in updater
+    assert "prune_old_generations" in updater
+    assert '[[ "${generation_name}" =~ ^[0-9a-f]{40}$ ]]' in updater
+    assert "after-deployed" in updater
+    assert "previous-deployed-commit" in updater
     assert "systemctl enable --now hermes-fabric-update.timer" in bootstrap
+    assert 'flock -w 900 8' in bootstrap
+    assert 'mv -f -- "${script_temp}" "${script_target}"' in bootstrap
     assert "initial_state=pending" in bootstrap
     assert (
         "install -d -o root -g root -m 0755 /var/lib/hermes-agent-fabric-update"
@@ -325,7 +339,7 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     )
     assert "Persistent=true" in timer
     assert "ProtectSystem=strict" in service
-    assert "TimeoutStartSec=5min" in service
+    assert "TimeoutStartSec=15min" in service
     assert "/opt/hk-team" in service
     assert "TimeoutStopSec=30s" in service
     assert "KillMode=control-group" in service
@@ -499,13 +513,18 @@ def test_fabric_updater_transaction_and_rollback_behavior():
     assert "fabric updater transaction harness passed" in result.stdout
 
 
-def test_fabric_updater_stages_sqlite_fallback_dependency():
+def test_fabric_updater_deploys_the_complete_locked_source_tree():
     updater = (AUTOMATION / "update-fabric-node.sh").read_text(encoding="utf-8")
     harness = (AUTOMATION / "test-update-fabric-node.sh").read_text(encoding="utf-8")
 
-    assert '"hermes_cli/sqlite_util.py"' in updater
-    assert '"utils.py"' in updater
-    assert "managed_node_recovery_service.py sqlite_util.py" in harness
+    assert 'git --git-dir="${mirror}" archive --format=tar "${release_commit}"' in updater
+    assert '-- "${archive_paths[@]}"' not in updater
+    assert "uv sync --locked --python 3.11 --extra all" in updater
+    assert ".hermes-source-commit" in updater
+    assert ".hermes-source-tree" in updater
+    assert ".fabric-generations" in updater
+    assert ".fabric-current" in updater
+    assert "full-source-sentinel.txt" in harness
     assert "import hermes_cli.managed_node_recovery_service" in updater
 
 
@@ -626,9 +645,11 @@ def test_public_release_contains_the_complete_application_service_layer():
     assert 'destination_parent="$(dirname "${target_root}/${relative}")"' in installer
     assert '"hermes_cli/sqlite_util.py"' in installer
     assert '"hermes_cli/sqlite_util.py"' in deployer
-    assert '"hermes_cli/sqlite_util.py"' in (AUTOMATION / "update-fabric-node.sh").read_text(
-        encoding="utf-8"
-    )
+    updater = (AUTOMATION / "update-fabric-node.sh").read_text(encoding="utf-8")
+    assert 'archive --format=tar "${release_commit}"' in updater
+    assert '| tar -xf - -C "${candidate_generation}"' in updater
+    assert 'archive_paths=(' not in updater
+    assert 'diff-files --quiet --ignore-submodules=none' in updater
     assert 'backup_one "${target_root}/${relative}"' in installer
     assert 'install_atomic "${snapshot}/${relative}"' in installer
     assert 'restore_one "${backup}/${relative}"' in installer
@@ -722,6 +743,133 @@ def test_fabric_updater_uses_distinct_connector_id_overrides_per_worker():
     assert 'connector_id="${DBB3_CONNECTOR_ID:-dbb3-primary}"' in updater
     assert 'connector_id="${PC_CONNECTOR_ID:-pc-primary}"' in updater
     assert 'connector_id="${HK_CONNECTOR_ID:-hk-primary}"' in updater
+
+
+def test_role_installers_reject_symlinked_ancestors_before_writes_and_tracked_links():
+    updater = (AUTOMATION / "update-fabric-node.sh").read_text(encoding="utf-8")
+    bootstrap = (AUTOMATION / "install-fabric-auto-update.sh").read_text(
+        encoding="utf-8"
+    )
+    dbb3 = (DBB3 / "install-dbb3-cloud-connector-user.sh").read_text(
+        encoding="utf-8"
+    )
+    hk_bootstrap = (ROOT / "deploy/hk/install-hk-worker.sh").read_text(
+        encoding="utf-8"
+    )
+    hk_connector = (ROOT / "deploy/hk/install-hk-cloud-connector-user.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for script in (updater, bootstrap, dbb3, hk_bootstrap, hk_connector):
+        assert "assert_canonical_path()" in script
+        assert "has a symlink ancestor" in script
+        assert "realpath -e" in script
+
+    assert "tracked_tree_listing=\"$(git --git-dir=\"${mirror}\" ls-tree -r" in updater
+    assert "120000|160000" in updater
+    archive_index = updater.index(
+        'git --git-dir="${mirror}" archive --format=tar "${release_commit}"'
+    )
+    tracked_tree_index = updater.index("tracked_tree_listing=", archive_index)
+    locked_sync_index = updater.index("uv sync --locked", tracked_tree_index)
+    assert archive_index < tracked_tree_index < locked_sync_index
+    assert updater.index('assert_canonical_path "$(dirname -- "${state_root}")"') < updater.index(
+        'install -d -o root -g root -m 0755 "$(dirname "${state_root}")"'
+    )
+    assert dbb3.index('assert_canonical_path "${install_lock_dir}"') < dbb3.index(
+        'install -d -o root -g root -m 0755 "${install_lock_dir}"'
+    )
+    assert hk_bootstrap.index('assert_canonical_path /opt/hk-team') < hk_bootstrap.index(
+        "install -d -o root -g root -m 0755 /opt/hk-team"
+    )
+
+
+def test_four_role_runtime_homes_are_explicit_and_pairwise_disjoint():
+    """Every local-owner worker must resolve into its own mutable Hermes home."""
+    updater = (AUTOMATION / "update-fabric-node.sh").read_text(encoding="utf-8")
+    dispatcher = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    dbb3_installer = (DBB3 / "install-dbb3-cloud-connector-user.sh").read_text(
+        encoding="utf-8"
+    )
+    pc_installer = (PC / "install-pc-cloud-connector-user.sh").read_text(
+        encoding="utf-8"
+    )
+    hk_installer = (ROOT / "deploy/hk/install-hk-cloud-connector-user.sh").read_text(
+        encoding="utf-8"
+    )
+
+    role_homes = {
+        "dispatcher": "/home/hermes/.hermes/profiles/dispatcher",
+        "dbb3": "/home/hermes/.hermes/profiles/dbb3-worker",
+        "pc": "/mnt/d/Hermes/home/profiles/pc-worker",
+        "hk": "/home/hermes/.hermes/profiles/hk-worker",
+    }
+    values = list(role_homes.values())
+    for index, left in enumerate(values):
+        for right in values[index + 1 :]:
+            assert not (
+                left == right
+                or left.startswith(right + "/")
+                or right.startswith(left + "/")
+            ), (left, right)
+
+    assert (
+        'dispatcher_home_default="${service_home}/.hermes/profiles/dispatcher"'
+        in dispatcher
+    )
+    assert 'runtime_home="${HERMES_HOME_DIR:-${systemd_runtime_home:-${env_runtime_home:-${dispatcher_home_default}}}}"' in dispatcher
+    assert "path_overlaps()" in dispatcher
+    assert (
+        'external_hermes_home="${HERMES_DBB3_HOME:-${service_home}/.hermes/profiles/dbb3-worker}"'
+        in updater
+    )
+    assert (
+        'external_hermes_home="${HERMES_WSL_HOME:-/mnt/d/Hermes/home/profiles/pc-worker}"'
+        in updater
+    )
+    assert (
+        'external_hermes_home="${HERMES_HK_HOME:-${service_home}/.hermes/profiles/hk-worker}"'
+        in updater
+    )
+    assert 'hermes_home="${HERMES_CONNECTOR_HERMES_HOME:-${user_home}/.hermes/profiles/dbb3-worker}"' in dbb3_installer
+    assert 'pc_home="${PC_CONNECTOR_HERMES_HOME:-/mnt/d/Hermes/home/profiles/pc-worker}"' in pc_installer
+    assert 'hermes_home="${HK_CONNECTOR_HERMES_HOME:-${user_home}/.hermes/profiles/hk-worker}"' in hk_installer
+    assert "HERMES_CONNECTOR_HERMES_HOME=\"${external_hermes_home}\"" in updater
+    assert "DBB3_CONNECTOR_ARTIFACT_ROOTS=\"${external_hermes_home}\"" in updater
+    fabric_bootstrap = (AUTOMATION / "install-fabric-auto-update.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'worker_home="${service_home}/.hermes/profiles/dbb3-worker"' in fabric_bootstrap
+    assert 'worker_home="/mnt/d/Hermes/home/profiles/pc-worker"' in fabric_bootstrap
+    assert 'worker_home="${service_home}/.hermes/profiles/hk-worker"' in fabric_bootstrap
+
+    dbb3_service = (ROOT / "deploy/dbb3/dbb3-cloud-connector.service").read_text(
+        encoding="utf-8"
+    )
+    pc_service = (ROOT / "deploy/pc/pc-cloud-connector.service").read_text(
+        encoding="utf-8"
+    )
+    hk_service = (ROOT / "deploy/hk/hk-cloud-connector.service").read_text(
+        encoding="utf-8"
+    )
+    assert "ReadWritePaths=%h/.hermes " not in dbb3_service
+    assert "ReadWritePaths=%h/.hermes " not in hk_service
+    assert "ReadWritePaths=%h/.local/state/pc-cloud-connector /mnt/d/Hermes/home\n" not in pc_service
+    assert "ReadWritePaths=%h/.hermes/profiles/dbb3-worker" in (
+        ROOT / "deploy/dbb3/dbb3-cloud-connector.service"
+    ).read_text(encoding="utf-8")
+    assert "/mnt/d/Hermes/home/profiles/pc-worker" in (
+        ROOT / "deploy/pc/pc-cloud-connector.service"
+    ).read_text(encoding="utf-8")
+    assert "ReadWritePaths=%h/.hermes/profiles/hk-worker" in (
+        ROOT / "deploy/hk/hk-cloud-connector.service"
+    ).read_text(encoding="utf-8")
+    assert (DBB3 / "profile/config.yaml.example").is_file()
+    assert (DBB3 / "profile/SOUL.md").is_file()
+    assert (PC / "profile/config.yaml.example").is_file()
+    assert (PC / "profile/SOUL.md").is_file()
 
 
 def test_public_installer_reclaims_only_bounded_deployment_artifacts_on_disk_pressure():
@@ -1215,7 +1363,7 @@ def test_public_installer_uses_effective_systemd_hermes_home_before_env_fallback
         'systemctl show "${service}" --property=Environment --value'
     )
     runtime_choice = installer.index(
-        'runtime_home="${HERMES_HOME_DIR:-${systemd_runtime_home:-${env_runtime_home:-${service_home}/.hermes}}}"'
+        'runtime_home="${HERMES_HOME_DIR:-${systemd_runtime_home:-${env_runtime_home:-${dispatcher_home_default}}}}"'
     )
     registration = installer.index(
         'env HERMES_HOME="${runtime_home}"', runtime_choice
@@ -2727,7 +2875,7 @@ def test_session_discovery_falls_back_for_older_hermes_cli(tmp_path):
     local = {
         "remote_run_id": "legacy-cli",
         "root_task_id": "task-legacy",
-        "profile": "reviewer",
+        "profile": "worker",
     }
     detail = {
         "task": {

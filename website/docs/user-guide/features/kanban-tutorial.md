@@ -143,66 +143,46 @@ Two transcribes done, one running, two ready waiting for the next dispatcher tic
 
 ## Story 3 — Role pipeline with retry
 
-This is where Kanban earns its keep over a flat TODO list. A PM writes a spec. An engineer implements it. A reviewer rejects the first attempt. The engineer tries again with changes. The reviewer approves.
+This is where Kanban earns its keep over a flat TODO list. A dispatcher splits a specification into dependency-linked cards. Each worker implements and verifies its own card, then a downstream QA or release worker consumes the structured handoff.
 
 The dashboard view, filtered by `auth-project`:
 
 ![Pipeline view for a multi-role feature](/img/kanban-tutorial/08-pipeline-auth.png)
 
-The screenshot uses the **pre-created downstream card** model: the implementation card has a dedicated reviewer child. In that model the engineer must call `kanban_complete` when implementation is ready so the reviewer child can leave `todo`. Never block the implementation parent merely to ask for review.
+The screenshot illustrates a pre-created downstream card. Treat every lane as ordinary worker work: the implementation worker calls `kanban_complete` only after its checks pass, and then the dependent QA card can leave `todo`. Never block an implementation parent merely to manufacture an approval phase.
 
-For workflows where the same card owns implementation and review, use the first-class review lifecycle instead. The full implement → review → changes → re-review choreography is:
+The complete implementation and downstream verification choreography is:
 
 ```python
-# --- Engineer: first implementation attempt ---
+# --- Implementation worker ---
 kanban_show()
-# (write code, run tests, prepare the candidate)
-kanban_request_review(
-    summary="implemented reset flow; candidate is ready for review",
-    metadata={"changed_files": ["auth/reset.py"], "tests_run": 8},
-    reviewer="reviewer",
-)
-# → the same card enters review; the implementation run closes as
-#   outcome='review_requested'
-
-# --- Reviewer: request concrete changes ---
-kanban_show()
-# (inspect the handoff and candidate)
-kanban_request_changes(
-    reason="Add password-strength validation and make reset tokens single-use."
-)
-# → the review run closes as outcome='changes_requested'; the card returns
-#   to backend-dev in ready/todo without touching block-loop accounting
-
-# --- Engineer: second implementation attempt ---
-kanban_show()  # prior review evidence is in worker_context
-# (apply feedback and re-run tests)
-kanban_request_review(
-    summary="added zxcvbn validation and single-use reset tokens",
+# (write code, run tests, fix failures, and re-run the checks)
+kanban_complete(
+    summary="implemented reset flow and verified reset-token behavior",
     metadata={
-        "changed_files": [
-            "auth/reset.py",
-            "auth/tests/test_reset.py",
-            "migrations/003_single_use_reset_tokens.sql",
-        ],
+        "changed_files": ["auth/reset.py", "auth/tests/test_reset.py"],
         "tests_run": 11,
-        "review_iteration": 2,
     },
-    reviewer="reviewer",
 )
+# -> the implementation card is done and its dependent card becomes ready
 
-# --- Reviewer: approve ---
-kanban_complete(summary="review passed; acceptance criteria verified")
-# → done
+# --- Downstream QA worker ---
+kanban_show()
+# (read the parent handoff, run the integration checks, and publish the result)
+kanban_complete(
+    summary="integration checks passed; reset tokens are single-use",
+    metadata={"tests_run": 6, "suite": "auth-integration"},
+)
+# -> done
 ```
 
-The task's run history now records `review_requested → changes_requested → review_requested → completed`. Each attempt has its own actor, summary, metadata, and outcome, so the second engineer sees exactly what the reviewer rejected and the final approval remains auditable. `kanban_block` is reserved for a real external escalation (missing access, a product decision, unavailable infrastructure), not normal review feedback.
+The task graph records two ordinary worker completions and their structured evidence. A worker that finds a fixable defect keeps working on its own card; `kanban_block` is reserved for a real external dependency such as missing access, a product decision, or unavailable infrastructure.
 
-If you intentionally use the downstream-card model shown in the screenshot, the reviewer opens `Review password reset PR` after its implementation parent completes:
+The downstream worker opens its card after the implementation parent completes:
 
-![Reviewer's drawer view of the pipeline](/img/kanban-tutorial/09-drawer-pipeline-review.png)
+![Downstream worker drawer view of the pipeline](/img/kanban-tutorial/09-drawer-pipeline-review.png)
 
-The reviewer card's `worker_context` includes the completed implementation handoff. That is a separate card workflow; do not combine it with same-card `kanban_request_review` or you will duplicate the review lane.
+The downstream card's `worker_context` includes the completed implementation handoff, so it can verify the exact artifacts without introducing another role or hidden approval loop.
 
 ## Story 4 — Circuit breaker and crash recovery
 
@@ -268,7 +248,7 @@ When a worker on task B is spawned and calls `kanban_show()`, the `worker_contex
 - B's **prior attempts** (previous runs: outcome, summary, error, metadata) so a retrying worker doesn't repeat a failed path.
 - **Parent task results** — for each parent, the most-recent completed run's summary and metadata — so downstream workers see why and how the upstream work was done.
 
-This replaces the "dig through comments and the work output" dance that plagues flat kanban systems. A PM writes acceptance criteria in the spec's metadata, and the engineer's worker sees them structurally in the parent handoff. An engineer records which tests they ran and how many passed, and the reviewer's worker has that list in hand before opening a diff.
+This replaces the "dig through comments and the work output" dance that plagues flat kanban systems. A dispatcher writes acceptance criteria in the spec's metadata, and the implementation worker sees them structurally in the parent handoff. That worker records which tests ran and how many passed, and the downstream QA worker receives the same evidence before exercising the integrated result.
 
 The bulk-close guard exists because this data is per-run. `hermes kanban complete a b c --summary X` (you, from the CLI) is refused — copy-pasting the same summary to three tasks is almost always wrong. Bulk close without the handoff flags still works for the common "I finished a pile of admin tasks" case. The tool surface doesn't expose a bulk variant at all; `kanban_complete` is always single-task-at-a-time for the same reason.
 

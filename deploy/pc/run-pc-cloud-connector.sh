@@ -6,7 +6,7 @@ state_root="${PC_CONNECTOR_STATE_ROOT:-/home/hermes/.local/state/pc-cloud-connec
 source_file="${PC_CONNECTOR_SOURCE:-/opt/pc-team/pc_cloud_connector.py}"
 token_file="${HERMES_CLOUD_TOKEN_FILE:-/etc/pc-team/cloud_connector_token}"
 cloud_url="${HERMES_CLOUD_URL:-https://daxueshenmai.top/api/plugins/collaboration}"
-hermes_home="${HERMES_HOME:-/mnt/d/Hermes/home}"
+hermes_home="${HERMES_HOME:-/mnt/d/Hermes/home/profiles/pc-worker}"
 
 mkdir -p "${state_root}"
 chmod 0700 "${state_root}"
@@ -18,7 +18,8 @@ export HERMES_CLOUD_URL="${cloud_url}"
 export HERMES_CLOUD_TOKEN_FILE="${token_file}"
 export DBB3_CONNECTOR_ID="pc-primary"
 export DBB3_CONNECTOR_STATE_FILE="${state_root}/checkpoint.json"
-export DBB3_CONNECTOR_ARTIFACT_ROOTS="${hermes_home}:/home/hermes/.hermes"
+export DBB3_CONNECTOR_ARTIFACT_ROOTS="${PC_CONNECTOR_ARTIFACT_ROOTS:-${hermes_home}}"
+export HERMES_CONNECTOR_DRAIN_FILE="${state_root}/drain_request.json"
 
 exec /usr/bin/python3 "${source_file}" \
   --interval 2 \

@@ -2290,11 +2290,15 @@ class TestWebServerEndpoints:
                 "name": "Proxy",
                 "base_url": "https://llm.example.com/v1",
                 "model": "m",
+                "make_default": True,
             },
         )
 
-        raw = yaml.safe_load(get_config_path().read_text(encoding="utf-8"))
+        config_text = get_config_path().read_text(encoding="utf-8")
+        raw = yaml.safe_load(config_text)
         assert raw["providers"]["proxy"]["api_key"] == "${MY_PROXY_KEY}"
+        assert raw["model"]["api_key"] == "${MY_PROXY_KEY}"
+        assert "sk-user-managed" not in config_text
         assert not get_env_value(custom_endpoint_key_env("proxy"))
 
 
@@ -2342,6 +2346,303 @@ class TestWebServerEndpoints:
         endpoint = next(e for e in resp.json()["endpoints"] if e["id"] == "proxy")
         assert endpoint["has_api_key"] is True
         assert "sk-in-env" not in (endpoint["api_key_preview"] or "")
+        assert "sk-in-env" not in resp.text
+
+    def test_custom_endpoint_post_put_and_get_round_trip_runtime_options(self):
+        from hermes_cli.config import load_config
+
+        base_payload = {
+            "id": "custom",
+            "name": "Custom",
+            "base_url": "https://llm.example.com/v1",
+            "model": "acme/model-1",
+            "make_default": True,
+        }
+        created = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                **base_payload,
+                "api_mode": "chat_completions",
+                "reasoning_effort": "low",
+            },
+        )
+        assert created.status_code == 200
+        created_endpoint = next(
+            row for row in created.json()["endpoints"] if row["id"] == "custom"
+        )
+        assert created_endpoint["api_mode"] == "chat_completions"
+        assert created_endpoint["reasoning_effort"] == "low"
+
+        collection_updated = self.client.put(
+            "/api/providers/custom-endpoints",
+            json={
+                **base_payload,
+                "api_mode": "codex_responses",
+                "reasoning_effort": "high",
+            },
+        )
+        assert collection_updated.status_code == 200
+        assert collection_updated.json()["current"]["api_mode"] == "codex_responses"
+        assert collection_updated.json()["current"]["reasoning_effort"] == "high"
+
+        item_updated = self.client.put(
+            "/api/providers/custom-endpoints/custom",
+            json={
+                **base_payload,
+                "api_mode": "anthropic_messages",
+                "reasoning_effort": "xhigh",
+            },
+        )
+        assert item_updated.status_code == 200
+
+        listed = self.client.get("/api/providers/custom-endpoints")
+        endpoint = next(
+            row for row in listed.json()["endpoints"] if row["id"] == "custom"
+        )
+        assert endpoint["api_mode"] == "anthropic_messages"
+        assert endpoint["reasoning_effort"] == "xhigh"
+
+        cfg = load_config()
+        assert cfg["providers"]["custom"]["api_mode"] == "anthropic_messages"
+        assert cfg["providers"]["custom"]["reasoning_effort"] == "xhigh"
+        assert cfg["model"]["api_mode"] == "anthropic_messages"
+        assert cfg["agent"]["reasoning_effort"] == "xhigh"
+
+    def test_custom_endpoint_catalog_uses_profile_scoped_saved_key(
+        self, monkeypatch
+    ):
+        from hermes_cli import profiles as profiles_mod
+
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True)
+        payload = {
+            "id": "custom",
+            "name": "Custom",
+            "base_url": "http://localhost:8000/v1",
+            "model": "local-model",
+        }
+        assert self.client.post(
+            "/api/providers/custom-endpoints",
+            json={**payload, "api_key": "default-secret"},
+        ).status_code == 200
+        assert self.client.post(
+            "/api/providers/custom-endpoints?profile=worker",
+            json={**payload, "api_key": "worker-secret"},
+        ).status_code == 200
+
+        captured_headers = []
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "local-model"}]}
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, *args, headers=None, **kwargs):
+                captured_headers.append(headers)
+                return _Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        validation_payload = {
+            **payload,
+            "model": "",
+            "validation_mode": "catalog",
+        }
+        assert self.client.post(
+            "/api/providers/custom-endpoints/validate", json=validation_payload
+        ).status_code == 200
+        assert self.client.post(
+            "/api/providers/custom-endpoints/validate?profile=worker",
+            json=validation_payload,
+        ).status_code == 200
+        assert [headers["Authorization"] for headers in captured_headers] == [
+            "Bearer default-secret",
+            "Bearer worker-secret",
+        ]
+
+    def test_custom_endpoint_validation_does_not_send_saved_key_to_new_url(
+        self, monkeypatch
+    ):
+        assert self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "custom",
+                "name": "Custom",
+                "base_url": "http://localhost:8000/v1",
+                "model": "local-model",
+                "api_key": "saved-secret",
+            },
+        ).status_code == 200
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "other-model"}]}
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, *args, headers=None, **kwargs):
+                captured.update(url=url, headers=headers)
+                return _Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "id": "custom",
+                "base_url": "http://localhost:9000/v1",
+                "validation_mode": "catalog",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        assert captured["url"] == "http://localhost:9000/v1/models"
+        assert "Authorization" not in captured["headers"]
+
+    def test_custom_endpoint_validation_never_borrows_process_key_in_multiplex(
+        self, monkeypatch
+    ):
+        from hermes_cli.config import load_config, save_config
+        import agent.secret_scope as secret_scope
+
+        cfg = load_config()
+        cfg["providers"] = {
+            "custom": {
+                "name": "Custom",
+                "base_url": "http://localhost:8000/v1",
+                "model": "local-model",
+                "key_env": "CUSTOM_SHARED_KEY",
+            }
+        }
+        save_config(cfg)
+        monkeypatch.setenv("CUSTOM_SHARED_KEY", "other-profile-secret")
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "local-model"}]}
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, *args, headers=None, **kwargs):
+                captured.update(url=url, headers=headers)
+                return _Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "id": "custom",
+                "base_url": "http://localhost:8000/v1",
+                "validation_mode": "catalog",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        assert "Authorization" not in captured["headers"]
+        assert "other-profile-secret" not in response.text
+
+    def test_custom_endpoint_validation_does_not_guess_between_shared_url_keys(
+        self, monkeypatch
+    ):
+        base_payload = {
+            "name": "Shared",
+            "base_url": "http://localhost:8000/v1",
+            "model": "local-model",
+        }
+        for endpoint_id, api_key in (("first", "first-secret"), ("second", "second-secret")):
+            response = self.client.post(
+                "/api/providers/custom-endpoints",
+                json={
+                    **base_payload,
+                    "id": endpoint_id,
+                    "name": endpoint_id.title(),
+                    "api_key": api_key,
+                },
+            )
+            assert response.status_code == 200
+
+        captured_headers = []
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "local-model"}]}
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, *args, headers=None, **kwargs):
+                captured_headers.append(headers)
+                return _Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+
+        anonymous = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "base_url": base_payload["base_url"],
+                "validation_mode": "catalog",
+            },
+        )
+        explicit = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "id": "second",
+                "base_url": base_payload["base_url"],
+                "validation_mode": "catalog",
+            },
+        )
+
+        assert anonymous.status_code == 200
+        assert explicit.status_code == 200
+        assert "Authorization" not in captured_headers[0]
+        assert captured_headers[1]["Authorization"] == "Bearer second-secret"
 
     def test_activating_an_endpoint_carries_its_credential_either_way(self):
         """Activate must work for both key_env and pre-#69449 plaintext entries."""
@@ -2361,6 +2662,8 @@ class TestWebServerEndpoints:
                 "base_url": "https://llm.modern.com/v1",
                 "model": "m",
                 "key_env": "MODERN_API_KEY",
+                "api_mode": "codex_responses",
+                "reasoning_effort": "high",
                 "models": {"m": {}},
             },
         }
@@ -2369,11 +2672,15 @@ class TestWebServerEndpoints:
         self.client.post("/api/providers/custom-endpoints/modern/activate", json={})
         model_cfg = load_config()["model"]
         assert model_cfg["key_env"] == "MODERN_API_KEY"
+        assert model_cfg["api_mode"] == "codex_responses"
         assert "api_key" not in model_cfg
+        assert load_config()["agent"]["reasoning_effort"] == "high"
 
         self.client.post("/api/providers/custom-endpoints/legacy/activate", json={})
         model_cfg = load_config()["model"]
         assert model_cfg["api_key"] == "sk-legacy"
+        assert "key_env" not in model_cfg
+        assert "api_mode" not in model_cfg
 
     def test_get_sessions_rejects_negative_limit(self):
         """limit=-1 must be rejected (422), not passed through to SQLite as
@@ -5118,6 +5425,14 @@ class TestValidateProviderCredential:
                 return _Resp()
 
         monkeypatch.setattr("httpx.AsyncClient", _Client)
+        async def _safe(_url):
+            return True
+
+        monkeypatch.setattr("tools.url_safety.async_is_safe_url", _safe)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **_kwargs: _Client(),
+        )
 
         resp = self.client.post(
             "/api/providers/validate",
@@ -5166,6 +5481,162 @@ class TestValidateProviderCredential:
         )
         assert captured["headers"] is None
 
+    def test_legacy_loopback_probe_disables_process_proxies(self, monkeypatch):
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": []}
+
+        class _Client:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return _Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        response = self.client.post(
+            "/api/providers/validate",
+            json={
+                "key": "OPENAI_BASE_URL",
+                "value": "http://127.0.0.1:8000/v1",
+                "api_key": "local-secret",
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured["trust_env"] is False
+
+    def test_remote_legacy_endpoint_uses_ssrf_guard_without_redirects(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "remote-model"}]}
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, *args, headers=None, **kwargs):
+                captured.update(url=url, headers=headers, kwargs=kwargs)
+                return _Resp()
+
+        async def _safe(url):
+            captured["preflight_url"] = url
+            return True
+
+        def _guarded(**kwargs):
+            captured["client_kwargs"] = kwargs
+            return _Client()
+
+        monkeypatch.setattr("tools.url_safety.async_is_safe_url", _safe)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", _guarded
+        )
+
+        response = self.client.post(
+            "/api/providers/validate",
+            json={
+                "key": "OPENAI_BASE_URL",
+                "value": "https://llm.public.example/v1",
+                "api_key": "remote-secret",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["models"] == ["remote-model"]
+        assert captured["preflight_url"] == "https://llm.public.example/v1/models"
+        assert captured["url"] == captured["preflight_url"]
+        assert captured["headers"] == {"Authorization": "Bearer remote-secret"}
+        assert captured["client_kwargs"]["follow_redirects"] is False
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "http://169.254.169.254/v1",
+            "https://user:secret@llm.example/v1",
+            "https://llm.example/v1?tenant=secret",
+            "https://llm.example/v1#secret",
+            "https://llm.example/v1\nextra",
+            "ftp://llm.example/v1",
+        ],
+    )
+    def test_legacy_endpoint_rejects_unsafe_or_ambiguous_urls(
+        self, value, monkeypatch
+    ):
+        def _unexpected_client(**_kwargs):
+            raise AssertionError("unsafe legacy endpoint reached HTTP client")
+
+        async def _unexpected_preflight(_url):
+            raise AssertionError("ambiguous legacy endpoint reached DNS preflight")
+
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", _unexpected_client
+        )
+        monkeypatch.setattr("tools.url_safety.async_is_safe_url", _unexpected_preflight)
+
+        response = self.client.post(
+            "/api/providers/validate",
+            json={
+                "key": "OPENAI_BASE_URL",
+                "value": value,
+                "api_key": "secret-token",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is False
+        assert response.json()["reachable"] is False
+        assert "secret" not in response.text
+
+    def test_legacy_endpoint_blocks_private_remote_before_client(self, monkeypatch):
+        captured = {"preflight": 0, "client": 0}
+
+        async def _blocked(_url):
+            captured["preflight"] += 1
+            return False
+
+        def _unexpected_client(**_kwargs):
+            captured["client"] += 1
+            raise AssertionError("blocked legacy endpoint reached HTTP client")
+
+        monkeypatch.setattr("tools.url_safety.async_is_safe_url", _blocked)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", _unexpected_client
+        )
+        response = self.client.post(
+            "/api/providers/validate",
+            json={
+                "key": "OPENAI_BASE_URL",
+                "value": "https://169.254.169.254/v1",
+                "api_key": "secret-token",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is False
+        assert response.json()["reachable"] is False
+        assert captured == {"preflight": 1, "client": 0}
+
     def test_named_custom_endpoint_probe_is_async(self, monkeypatch):
         """Custom endpoint validation must not block the dashboard event loop."""
         captured = {}
@@ -5204,12 +5675,13 @@ class TestValidateProviderCredential:
             },
         )
 
-        assert response.json() == {
-            "ok": True,
-            "reachable": True,
-            "message": "",
-            "models": ["local-model"],
-        }
+        result = response.json()
+        assert result["ok"] is True
+        assert result["reachable"] is True
+        assert result["status"] == 200
+        assert result["message"] == ""
+        assert result["models"] == ["local-model"]
+        assert result["latency_ms"] >= 0
         assert captured == {
             "url": "http://localhost:8000/v1/models",
             "headers": {
@@ -5217,6 +5689,320 @@ class TestValidateProviderCredential:
                 "Authorization": "Bearer local-secret",
             },
         }
+
+    def test_custom_endpoint_remote_probe_uses_async_ssrf_guards_without_redirects(
+        self, monkeypatch
+    ):
+        captured = {"requests": 0}
+
+        class _Resp:
+            status_code = 302
+            is_success = False
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, *args, headers=None, **kwargs):
+                captured["requests"] += 1
+                captured["url"] = url
+                return _Resp()
+
+        async def _async_is_safe_url(url):
+            captured["preflight_url"] = url
+            return True
+
+        def _sync_is_safe_url(_url):
+            raise AssertionError("synchronous DNS safety check reached the event loop")
+
+        def _guarded_client(**kwargs):
+            captured["client_kwargs"] = kwargs
+            return _Client()
+
+        monkeypatch.setattr("tools.url_safety.is_safe_url", _sync_is_safe_url)
+        monkeypatch.setattr("tools.url_safety.async_is_safe_url", _async_is_safe_url)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", _guarded_client
+        )
+
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "name": "Remote",
+                "base_url": "https://llm.public.example/v1",
+                "validation_mode": "catalog",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["message"] == (
+            "The endpoint rejected the test request with HTTP 302."
+        )
+        assert captured["preflight_url"] == "https://llm.public.example/v1/models"
+        assert captured["url"] == captured["preflight_url"]
+        assert captured["client_kwargs"]["follow_redirects"] is False
+        assert captured["requests"] == 1
+
+    def test_custom_loopback_probe_disables_process_proxies(self, monkeypatch):
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": []}
+
+        class _Client:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return _Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "name": "Local",
+                "base_url": "http://localhost:8000/v1",
+                "validation_mode": "catalog",
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured["trust_env"] is False
+
+    def test_custom_endpoint_remote_probe_blocks_unsafe_resolution_before_client(
+        self, monkeypatch
+    ):
+        async def _blocked(_url):
+            return False
+
+        def _unexpected_client(**_kwargs):
+            raise AssertionError("blocked endpoint reached the HTTP client")
+
+        monkeypatch.setattr("tools.url_safety.async_is_safe_url", _blocked)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", _unexpected_client
+        )
+
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "name": "Metadata alias",
+                "base_url": "https://metadata-alias.example/v1",
+                "validation_mode": "catalog",
+            },
+        )
+
+        assert response.status_code == 400
+        assert "blocked private or metadata address" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://169.254.169.254/v1",
+            "https://user:secret@llm.example.com/v1",
+            "https://llm.example.com/v1?tenant=secret",
+            "https://llm.example.com/v1#secret",
+            "https://llm.example.com/v1\nextra",
+        ],
+    )
+    def test_custom_endpoint_probe_rejects_ambiguous_or_insecure_urls(
+        self, base_url
+    ):
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "name": "Unsafe",
+                "base_url": base_url,
+                "validation_mode": "catalog",
+            },
+        )
+
+        assert response.status_code == 400
+        assert "secret" not in response.text
+
+    def test_custom_endpoint_anthropic_catalog_uses_native_headers(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "claude-compatible"}]}
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, *args, headers=None, **kwargs):
+                captured.update(url=url, headers=headers)
+                return _Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "name": "Anthropic compatible",
+                "base_url": "http://localhost:8000/v1",
+                "api_key": "anthropic-secret",
+                "api_mode": "anthropic_messages",
+                "validation_mode": "catalog",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["models"] == ["claude-compatible"]
+        assert captured["headers"] == {
+            "Accept": "application/json",
+            "anthropic-version": "2023-06-01",
+            "x-api-key": "anthropic-secret",
+        }
+
+    @pytest.mark.parametrize(
+        ("api_mode", "path", "auth_header", "token_field"),
+        [
+            (
+                "chat_completions",
+                "/chat/completions",
+                "Authorization",
+                "max_tokens",
+            ),
+            (
+                "codex_responses",
+                "/responses",
+                "Authorization",
+                "max_output_tokens",
+            ),
+            (
+                "anthropic_messages",
+                "/messages",
+                "x-api-key",
+                "max_tokens",
+            ),
+        ],
+    )
+    def test_custom_endpoint_inference_uses_selected_protocol(
+        self, monkeypatch, api_mode, path, auth_header, token_field
+    ):
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, *args, headers=None, json=None, **kwargs):
+                captured.update(url=url, headers=headers, payload=json)
+                return _Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "id": "custom",
+                "name": "Custom",
+                "base_url": "http://localhost:8000/v1",
+                "model": "local-model",
+                "api_key": "local-secret",
+                "api_mode": api_mode,
+                "validation_mode": "inference",
+            },
+        )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["ok"] is True
+        assert result["reachable"] is True
+        assert result["message"] == "Connection and model protocol verified."
+        assert captured["url"] == f"http://localhost:8000/v1{path}"
+        expected_auth = (
+            "Bearer local-secret"
+            if auth_header == "Authorization"
+            else "local-secret"
+        )
+        assert captured["headers"][auth_header] == expected_auth
+        assert captured["payload"]["model"] == "local-model"
+        assert token_field in captured["payload"]
+        if api_mode == "anthropic_messages":
+            assert captured["headers"]["anthropic-version"] == "2023-06-01"
+            assert "Authorization" not in captured["headers"]
+
+    @pytest.mark.parametrize(
+        ("status_code", "message"),
+        [
+            (401, "The endpoint rejected the API key."),
+            (404, "The selected protocol path is not available at this Base URL."),
+            (429, "The endpoint is reachable but currently rate limited."),
+            (500, "The endpoint rejected the test request with HTTP 500."),
+        ],
+    )
+    def test_custom_endpoint_inference_returns_stable_http_errors(
+        self, monkeypatch, status_code, message
+    ):
+        class _Resp:
+            is_success = False
+
+            def __init__(self, status):
+                self.status_code = status
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, *args, **kwargs):
+                return _Resp(status_code)
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "name": "Local",
+                "base_url": "http://localhost:8000/v1",
+                "model": "local-model",
+                "api_mode": "chat_completions",
+                "validation_mode": "inference",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["message"] == message
+        assert response.json()["reachable"] is True
 
 
 class TestDesktopCronTicker:

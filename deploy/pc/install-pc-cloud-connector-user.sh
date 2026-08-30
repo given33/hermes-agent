@@ -20,11 +20,12 @@ die() { printf 'install-pc-cloud-connector-user: %s\n' "$*" >&2; exit 1; }
   || die "PC user unit template is missing"
 
 connector_user="${PC_CONNECTOR_USER:-hermes}"
-pc_home="${PC_CONNECTOR_HERMES_HOME:-/mnt/d/Hermes/home}"
+pc_home="${PC_CONNECTOR_HERMES_HOME:-/mnt/d/Hermes/home/profiles/pc-worker}"
 user_home="$(getent passwd "${connector_user}" | cut -d: -f6)"
 [[ -n "${user_home}" && -d "${user_home}" ]] || die "connector user home is missing"
-[[ -d "${pc_home}" ]] || die "Hermes PC home is missing: ${pc_home}"
-artifact_roots="${PC_CONNECTOR_ARTIFACT_ROOTS:-${pc_home}:${user_home}/.hermes}"
+artifact_roots="${PC_CONNECTOR_ARTIFACT_ROOTS:-${pc_home}}"
+[[ "${pc_home}" == /* && ! -L "${pc_home}" ]] \
+  || die "PC worker Hermes home must be an absolute non-symlink path"
 
 exec env \
   DBB3_CONNECTOR_USER="${connector_user}" \
@@ -40,4 +41,5 @@ exec env \
   HERMES_CONNECTOR_CONFIG_DIR="${user_home}/.config/pc-team" \
   HERMES_CONNECTOR_STATE_DIR="${user_home}/.local/state/pc-cloud-connector" \
   HERMES_CONNECTOR_HERMES_HOME="${pc_home}" \
+  HERMES_CONNECTOR_PROFILE_TEMPLATE_ROOT="${here}/profile" \
   bash "${shared_installer}" "${shared_source}" "${1:-}"

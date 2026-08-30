@@ -7,7 +7,7 @@ Requires=hermes-wsl-managed-installation-receiver.service
 [Service]
 Type=simple
 Environment=HOME=/home/hermes
-Environment=HERMES_HOME=/mnt/d/Hermes/home
+Environment=HERMES_HOME=/mnt/d/Hermes/home/profiles/pc-worker
 ExecStart=/usr/bin/ssh -i /home/hermes/.ssh/aliyun_hermes_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -N -R 127.0.0.1:19123:127.0.0.1:9122 admin@10.66.0.1
 Restart=always
 RestartSec=5

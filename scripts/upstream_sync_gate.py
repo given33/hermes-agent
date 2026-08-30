@@ -49,6 +49,58 @@ _RETIRED_HOSTED_EXECUTION_SYMBOLS = frozenset(
 )
 _RETIRED_HOSTED_STAGES = frozenset({"reviewer", "supervisor", "reporter"})
 _LEGACY_RESULT_FIELDS = frozenset({"reporter_result", "reporter_status"})
+_RETIRED_REVIEW_RUNTIME_TOKENS = {
+    "tools/kanban_tools.py": frozenset(
+        {"kanban_request_review", "kanban_request_changes"}
+    ),
+    "toolsets.py": frozenset(
+        {"kanban_request_review", "kanban_request_changes"}
+    ),
+    "acp_adapter/tools.py": frozenset(
+        {"kanban_request_review", "kanban_request_changes"}
+    ),
+    "agent/transports/hermes_tools_mcp_server.py": frozenset(
+        {"kanban_request_review", "kanban_request_changes"}
+    ),
+    "agent/prompt_builder.py": frozenset(
+        {"kanban_request_review", "kanban_request_changes"}
+    ),
+    "hermes_cli/goals.py": frozenset(
+        {"kanban_request_review", "kanban_request_changes"}
+    ),
+    "hermes_cli/kanban.py": frozenset(
+        {"request-review", "request-changes", "reopen-review"}
+    ),
+    "hermes_cli/config_defaults.py": frozenset({"review_dispatch"}),
+    "cli-config.yaml.example": frozenset({"review_dispatch"}),
+    "gateway/kanban_watchers.py": frozenset(
+        {"review_dispatch_enabled", "has_spawnable_review"}
+    ),
+    "plugins/kanban/dashboard/plugin_api.py": frozenset(
+        {"kanban_db.request_review", "review_assignee_deferred"}
+    ),
+    "plugins/kanban/dashboard/dist/index.js": frozenset(
+        {'review: "Review"', "hermes-kanban-dot-review"}
+    ),
+    "website/docs/reference/slash-commands.md": frozenset({"`/review"}),
+    "website/docs/user-guide/features/delegation.md": frozenset(
+        {"The `/review` Command", "auxiliary.review"}
+    ),
+    "website/docs/user-guide/features/kanban.md": frozenset(
+        {
+            "kanban_request_review",
+            "kanban_request_changes",
+            "review_dispatch",
+            "sdlc-review",
+        }
+    ),
+    "website/docs/user-guide/features/kanban-worker-lanes.md": frozenset(
+        {"kanban_request_review", "kanban_request_changes", "sdlc-review"}
+    ),
+    "website/docs/user-guide/features/kanban-tutorial.md": frozenset(
+        {"kanban_request_review", "kanban_request_changes"}
+    ),
+}
 
 
 def _literal_string(node: ast.AST | None) -> str:
@@ -96,6 +148,50 @@ def _assert_retired_hosted_runtime_absent(path: Path) -> None:
         raise SystemExit("upstream sync gate: " + "; ".join(sorted(set(violations))))
 
 
+def _assert_retired_review_runtime_absent() -> None:
+    violations: list[str] = []
+    for relative, tokens in _RETIRED_REVIEW_RUNTIME_TOKENS.items():
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        for token in tokens:
+            if token in text:
+                violations.append(f"retired review token {token!r} in {relative}")
+
+    dispatch_path = ROOT / "hermes_cli/kanban_db.py"
+    dispatch_text = dispatch_path.read_text(encoding="utf-8")
+    dispatch_tree = ast.parse(dispatch_text, filename=str(dispatch_path))
+    dispatch_node = next(
+        (
+            node
+            for node in dispatch_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_dispatch_once_locked"
+        ),
+        None,
+    )
+    if dispatch_node is None:
+        violations.append("dispatcher implementation _dispatch_once_locked disappeared")
+    else:
+        dispatch_source = ast.get_source_segment(dispatch_text, dispatch_node) or ""
+        for token in ("claim_review_task", "status = 'review'", "sdlc-review"):
+            if token in dispatch_source:
+                violations.append(f"retired review dispatch token {token!r}")
+
+    if violations:
+        raise SystemExit("upstream sync gate: " + "; ".join(sorted(set(violations))))
+
+    retired_assets = (
+        ROOT / "skills/devops/sdlc-review/SKILL.md",
+        ROOT / "tests/skills/test_sdlc_review_skill.py",
+        ROOT / "website/docs/user-guide/skills/bundled/devops/devops-sdlc-review.md",
+    )
+    present = [str(path.relative_to(ROOT)) for path in retired_assets if path.exists()]
+    if present:
+        raise SystemExit(
+            "upstream sync gate: retired review assets returned: "
+            + ", ".join(present)
+        )
+
+
 def main() -> int:
     required = (
         ROOT / ".github/workflows/upstream-sync.yml",
@@ -112,9 +208,9 @@ def main() -> int:
     _assert_retired_hosted_runtime_absent(
         ROOT / "plugins/collaboration/dashboard/plugin_api.py"
     )
+    _assert_retired_review_runtime_absent()
 
     from hermes_cli.commands import resolve_command
-    from hermes_cli.kanban_db import review_dispatch_enabled
     from plugins.collaboration.dashboard.plugin_api import (
         _REMOTE_RUN_PROFILES,
         _WORKER_TARGET_PROFILES,
@@ -126,8 +222,6 @@ def main() -> int:
             raise SystemExit(f"upstream sync gate: official /{name} command disappeared")
     if resolve_command("review") is not None:
         raise SystemExit("upstream sync gate: retired /review command was reintroduced")
-    if review_dispatch_enabled():
-        raise SystemExit("upstream sync gate: reviewer dispatch is enabled")
     expected_workers = frozenset(_WORKER_TARGET_PROFILES.values())
     if frozenset(_REMOTE_RUN_PROFILES) != expected_workers:
         raise SystemExit("upstream sync gate: remote run profiles drifted from DBB3/PC/HK workers")

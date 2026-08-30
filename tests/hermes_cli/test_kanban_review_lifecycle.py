@@ -375,10 +375,7 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
 def test_review_dispatch_gate_prevents_phantom_reviewer(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With ``kanban.review_dispatch=false`` the dispatcher must NOT claim a
-    task parked in ``review`` (this deployment explicitly waits for a human).
-    Flipping the knob back on proves the gate, not
-    something else, is what suppressed the claim."""
+    """Historical config cannot restore the retired reviewer runtime."""
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
 
@@ -404,27 +401,20 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
         assert tid not in [s[0] for s in res_off.spawned]
         assert kb.get_task(conn, tid).status == "review"
 
-        # Gate ON (the default; sdlc-review is bundled) -> the review task is
-        # picked up by the dispatcher.
+        # A stale opt-in from an older config remains inert.
         monkeypatch.setattr(
             cfgmod, "load_config",
             lambda *a, **k: {"kanban": {"review_dispatch": True}},
         )
         res_on = kb.dispatch_once(conn, dry_run=True)
-        assert tid in [s[0] for s in res_on.spawned]
+        assert tid not in [s[0] for s in res_on.spawned]
+        assert kb.get_task(conn, tid).status == "review"
 
 
-def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
+def test_retired_review_lane_is_never_dispatched_while_ready_guard_still_applies(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """B2 regression: a fresh PR-URL comment must not block reviewer spawns.
-
-    A task parked in ``review`` with a PR link younger than 24h is the
-    CANONICAL review handoff (worker opened a PR then requested review) —
-    the review-lane dispatch must still claim/spawn it. The same comment on
-    a ready-lane task is a duplicate-work signal and stays deferred.
-    Rate-limit cooldown still applies in the review lane.
-    """
+    """Legacy review rows stay inert while ready-lane guards keep working."""
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
 
@@ -455,7 +445,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         res = kb.dispatch_once(conn, dry_run=True)
         spawned_ids = [s[0] for s in res.spawned]
         guarded = dict(res.respawn_guarded)
-        assert review_id in spawned_ids
+        assert review_id not in spawned_ids
         assert ready_id not in spawned_ids
         assert guarded.get(ready_id) == "active_pr"
 
@@ -475,7 +465,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
-def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
+def test_retired_review_dispatch_never_spawns_or_injects_skills(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import hermes_cli.config as cfgmod
@@ -514,7 +504,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
             lambda _conn, _task_id, **_kw: "rate_limit_cooldown",
         )
         guarded = kb.dispatch_once(conn, spawn_fn=spawn)
-        assert guarded.respawn_guarded == [(task_id, "rate_limit_cooldown")]
+        assert guarded.respawn_guarded == []
         assert not guarded.spawned
         guarded_task = kb.get_task(conn, task_id)
         assert guarded_task is not None
@@ -523,11 +513,11 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         monkeypatch.setattr(kb, "check_respawn_guard", lambda _conn, _task_id, **_kw: None)
         result = kb.dispatch_once(conn, spawn_fn=spawn)
 
-    assert task_id in [task[0] for task in result.spawned]
-    assert captured == [["domain-specific-review", "sdlc-review"]]
+    assert task_id not in [task[0] for task in result.spawned]
+    assert captured == []
 
 
-def test_review_dispatch_honors_global_and_per_profile_caps(
+def test_retired_review_rows_do_not_consume_dispatch_capacity(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -580,7 +570,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
         )
         assert len([
             task for task in global_dry_run.spawned if task[0] in review_ids
-        ]) == 1
+        ]) == 0
 
         per_profile_capped = kb.dispatch_once(
             conn,
@@ -591,9 +581,8 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
         spawned_reviews = [
             task for task in per_profile_capped.spawned if task[0] in review_ids
         ]
-        assert len(spawned_reviews) == 1
-        assert len(per_profile_capped.skipped_per_profile_capped) == 1
-        assert per_profile_capped.skipped_per_profile_capped[0][0] in review_ids
+        assert len(spawned_reviews) == 0
+        assert len(per_profile_capped.skipped_per_profile_capped) == 0
 
 
 # ---------------------------------------------------------------------------

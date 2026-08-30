@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=oneshot
 EnvironmentFile=/etc/hermes-agent/fabric-update.env
 ExecStart=/usr/local/lib/hermes-agent/update-fabric-node.sh
-TimeoutStartSec=5min
+TimeoutStartSec=15min
 TimeoutStopSec=30s
 KillMode=control-group
 User=root
@@ -16,7 +16,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=-/opt/dbb3-team -/opt/pc-team -/opt/hk-team -/var/backups/hermes-agent -/var/lib/hermes-agent-fabric-update -/var/lib/systemd/linger -/etc/systemd/system -/etc/pc-team -/etc/hk-team -/usr/local/lib/hermes-agent -/mnt/d/Hermes/hermes-agent -/mnt/d/Hermes/home -/opt/hk-team/hermes-agent -/home/hermes/.hermes -/home/hermes/.config -/home/hermes/.local/state -/home/hermes/.ssh /run
+ReadWritePaths=-/opt/dbb3-team -/opt/pc-team -/opt/hk-team -/var/backups/hermes-agent -/var/lib/hermes-agent-fabric-update -/var/lib/systemd/linger -/etc/systemd/system -/etc/pc-team -/etc/hk-team -/usr/local/lib/hermes-agent -/mnt/d/Hermes/hermes-agent -/mnt/d/Hermes/home/profiles/pc-worker -/opt/hk-team/hermes-agent -/home/hermes/.hermes/profiles/dbb3-worker -/home/hermes/.hermes/profiles/hk-worker -/home/hermes/.config -/home/hermes/.local/state -/home/hermes/.ssh /run
 
 [Install]
 WantedBy=multi-user.target

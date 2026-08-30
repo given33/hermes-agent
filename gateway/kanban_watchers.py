@@ -1640,13 +1640,6 @@ class GatewayKanbanWatchersMixin:
             here keeps the stuck-warn fire only on real failures (broken
             PATH, missing venv, credential loss for a real Hermes profile).
             """
-            # Only probe the review column when autonomous review dispatch is
-            # actually on. With ``review_dispatch`` off (the default — no
-            # sdlc-review agent), a task parked in 'review' is "correctly idle"
-            # waiting for a human, not a stuck dispatcher; probing it here would
-            # fire a false "dispatcher stuck" warning that never clears. Shares
-            # the exact gate the dispatcher uses so the two can't drift.
-            _review_probe = _kb.review_dispatch_enabled()
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
@@ -1657,8 +1650,6 @@ class GatewayKanbanWatchersMixin:
                 try:
                     conn = _kb.connect(board=slug)
                     if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
                         return True
                 except Exception:
                     continue

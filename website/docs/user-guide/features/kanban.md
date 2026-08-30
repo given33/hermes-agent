@@ -14,7 +14,7 @@ Hermes Kanban is a durable task board, shared across all your Hermes profiles, t
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -226,9 +226,6 @@ up on the next tick (60s by default).
 kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
-  review_dispatch: true            # default: spawn the assigned profile with
-                                   # the bundled sdlc-review skill. Set false
-                                   # for human-only review boards.
 ```
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
@@ -269,11 +266,9 @@ hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
 :::note Where an unblocked task lands
-`unblock` restores the safe source phase: **`review`** for reviewer-origin work
-whose parents are complete, **`ready`** for implementation work whose parents
-are complete, or **`todo`** while any parent remains open. A `todo` task keeps
-its source-phase provenance and returns to `review` or `ready` automatically
-when the dependency gate clears. `unblock` never routes directly to `triage`.
+`unblock` restores work to **`ready`** when its parents are complete, or
+**`todo`** while any parent remains open. `unblock` never routes directly to
+`triage`.
 
 If you unblock a task and it later shows up in **`triage`**, the unblock is not
 what put it there. A subsequent *re-block for the same reason* did: after a task
@@ -296,9 +291,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 |---|---|---|
 | `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
-| `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
-| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
-| `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
+| `kanban_complete` | Finish after self-verification with a `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
@@ -307,7 +300,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_attachments` | List a task's attachments. | — |
 | `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
-| `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. | `task_id` |
+| `kanban_unblock` | (Orchestrators) restore a blocked task to `ready`, or `todo` while a parent remains open. | `task_id` |
 
 A typical worker turn looks like:
 
@@ -362,10 +355,10 @@ The auto-injected kanban guidance teaches the model which tool to call when and 
 
 `kanban_complete(summary=..., metadata={...})` is intentionally flexible:
 the summary is the human-readable closeout, and `metadata` is the
-machine-readable handoff that downstream agents, reviewers, or dashboards can
+machine-readable handoff that downstream workers, operators, or dashboards can
 reuse without scraping prose.
 
-For engineering and review tasks, prefer this optional metadata shape:
+For engineering and verification tasks, prefer this optional metadata shape:
 
 ```json
 {
@@ -428,7 +421,7 @@ The lifecycle plus the load-bearing reference details (workspace kinds, delivera
 
 ### Pinning extra skills to a specific task
 
-Sometimes a single task needs specialist context the assignee profile doesn't carry by default — a translation job that needs the `translation` skill, a review task that needs `github-code-review`, a security audit that needs `security-pr-audit`. Rather than editing the assignee's profile every time, attach the skills directly to the task.
+Sometimes a single task needs specialist context the assignee profile doesn't carry by default — a translation job that needs the `translation` skill, a pull-request analysis task that needs `github-code-review`, or a security audit that needs `security-pr-audit`. Rather than editing the assignee's profile every time, attach the skills directly to the task.
 
 **From an orchestrator agent** (the usual case — one agent routing work to another), use the `kanban_create` tool's `skills` array:
 
@@ -441,7 +434,7 @@ kanban_create(
 
 kanban_create(
     title="audit auth flow",
-    assignee="reviewer",
+    assignee="qa-worker",
     skills=["security-pr-audit", "github-code-review"],
 )
 ```
@@ -454,7 +447,7 @@ hermes kanban create "translate README to Japanese" \
     --skill translation
 
 hermes kanban create "audit auth flow" \
-    --assignee reviewer \
+    --assignee qa-worker \
     --skill security-pr-audit \
     --skill github-code-review
 ```
@@ -754,10 +747,6 @@ hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
-hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
-hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
-hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
-
 hermes kanban tail <id>                                # follow a single task's event stream
 hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events to the terminal
         [--kinds completed,blocked,…] [--interval SECS]
@@ -840,7 +829,7 @@ All of these are gated by the same dashboard plugin auth as the rest of the kanb
 ```bash
 hermes kanban swarm "Design a multi-region failover plan" \
   --workers researcher,architect,sre \
-  --verifier reviewer --synthesizer writer
+  --verifier qa-worker --synthesizer writer
 ```
 
 The resulting graph is committed atomically: dispatchers and dashboard readers see either no new swarm or the complete topology, never a partially linked root/worker/verifier graph. It then dispatches normally — workers run in parallel, the verifier wakes after they all finish, and the synthesizer wakes after the verifier marks the work clean.
@@ -887,7 +876,7 @@ bot> ✓ t_9fc1a3 completed by transcriber
      transcribed 42 minutes, saved to podcast/2026-05-04.md
 ```
 
-Subscriptions survive a task reaching `done` — completion is reversible (a reviewer or controller can reopen a done task), so the origin session keeps getting notified through reopen cycles. They auto-remove on `archived` (the irreversible end state). On boards that never archive, a GC sweep purges subscriptions for tasks that have sat in `done` with no new activity for `kanban.done_sub_retention_days` days (default 30; set 0 to disable), so stale rows don't accumulate forever. If you script a create with `--json` (machine output) the auto-subscribe is skipped — the assumption is that scripted callers want to manage subscriptions explicitly via `/kanban notify-subscribe`.
+Subscriptions survive a task reaching `done` — completion is reversible by an operator, so the origin session keeps getting notified through reopen cycles. They auto-remove on `archived` (the irreversible end state). On boards that never archive, a GC sweep purges subscriptions for tasks that have sat in `done` with no new activity for `kanban.done_sub_retention_days` days (default 30; set 0 to disable), so stale rows don't accumulate forever. If you script a create with `--json` (machine output) the auto-subscribe is skipped — the assumption is that scripted callers want to manage subscriptions explicitly via `/kanban notify-subscribe`.
 
 A chat-originated auto-subscribe is created in `notify+wake` mode: on a terminal event the destination agent both receives the passive message **and** takes a real turn, so it can read the board context and reply in its own voice. See [Delivery modes](#delivery-modes) below.
 
@@ -907,10 +896,10 @@ The board supports these eight patterns without any new primitives:
 |---|---|---|
 | **P1 Fan-out** | N siblings, same role | "research 5 angles in parallel" |
 | **P2 Pipeline** | role chain: scout → editor → writer | daily brief assembly |
-| **P3 Voting / quorum** | N siblings + 1 aggregator | 3 researchers → 1 reviewer picks |
+| **P3 Voting / quorum** | N siblings + 1 aggregator | 3 researchers → 1 aggregator picks |
 | **P4 Long-running journal** | same profile + shared dir + cron | Obsidian vault |
 | **P5 Human-in-the-loop** | worker blocks → user comments → unblock | ambiguous decisions |
-| **P6 `@mention`** | inline routing from prose | `@reviewer look at this` |
+| **P6 `@mention`** | inline routing from prose | `@qa-worker inspect this` |
 | **P7 Thread-scoped workspace** | `/kanban here` in a thread | per-project gateway threads |
 | **P8 Fleet farming** | one profile, N subjects | 50 social accounts |
 | **P9 Triage specifier** | rough idea → `triage` → `hermes kanban specify` expands body → `todo` | "turn this one-liner into a spec'd task" |
@@ -1035,7 +1024,7 @@ A subscription removes itself automatically once the task reaches `done` or `arc
 
 A "wake" forges a synthetic inbound message to the destination gateway agent so it takes a normal turn (reads the comment + result, reasons, replies) instead of getting a one-line passive notification. It only fires when the notifier runs inside a live gateway process; otherwise a `notify+wake` subscription still delivers its passive message, while a `wake`-only subscription does nothing in that process.
 
-**Which events wake.** The ones that hand a decision back to the origin: `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `review_requested` (a worker finished the implementation and handed off via `kanban_request_review`) and `block_loop_detected` (the task was routed to `triage` after repeated blocks). `status`, `archived` and `unblocked` are delivered but never wake — they are bookkeeping transitions, not decisions. When a `completed` or `review_requested` event carries a summary, that handoff rides the wake turn, so the woken agent sees what the worker actually did.
+**Which events wake.** The ones that hand a decision back to the origin: `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, and `block_loop_detected` (the task was routed to `triage` after repeated blocks). `status`, `archived` and `unblocked` are delivered but never wake — they are bookkeeping transitions, not decisions. When a `completed` event carries a summary, that handoff rides the wake turn, so the woken agent sees what the worker actually did.
 
 `--chat-type` (`dm` | `group` | `channel` | `thread`) records the originating chat's type so a woken turn resolves the operator's **real** session: `build_session_key` keys groups, channels, and threads differently from DMs, so an inaccurate `chat_type` would route the wake into a separate, context-less session. The `/kanban` auto-subscribe and slash-command paths capture this automatically — you only set it by hand when subscribing a chat from a script or cron. Omit it to leave an existing subscription unchanged (new subscriptions default to `dm`).
 
@@ -1067,7 +1056,7 @@ needed — each profile gateway simply delivers through its own adapters.
 
 A task is a logical unit of work; a **run** is one attempt to execute it. When the dispatcher claims a ready task it creates a row in `task_runs` and points `tasks.current_run_id` at it. When that attempt ends — completed, blocked, crashed, timed out, spawn-failed, reclaimed — the run row closes with an `outcome` and the task's pointer clears. A task that's been attempted three times has three `task_runs` rows.
 
-Why two tables instead of just mutating the task: you need **full attempt history** for real-world postmortems ("the second reviewer attempt got to approve, the third merged"), and you need a clean place to hang per-attempt metadata — which files changed, which tests ran, which findings a reviewer noted. Those are run facts, not task facts.
+Why two tables instead of just mutating the task: you need **full attempt history** for real-world postmortems ("the second worker attempt fixed the failure, the third completed"), and you need a clean place to hang per-attempt metadata — which files changed, which tests ran, and which defects the worker found. Those are run facts, not task facts.
 
 Runs are also where **structured handoff** lives. When a worker completes a task (via `kanban_complete(...)`) it can pass:
 

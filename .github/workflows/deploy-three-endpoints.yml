@@ -451,31 +451,138 @@ jobs:
           printf '%s\n' "$KNOWN_HOSTS" >"$RUNNER_TEMP/hk-ssh/known_hosts"
           chmod 0600 "$RUNNER_TEMP/hk-ssh/id_ed25519" "$RUNNER_TEMP/hk-ssh/known_hosts"
           ssh-keygen -y -f "$RUNNER_TEMP/hk-ssh/id_ed25519" >/dev/null
-      - name: Bootstrap HK source, profile, connector, and update timer
+      - name: Bootstrap HK source generation, profile, connector, gateway, and timer
         env:
           REMOTE: ${{ secrets.HERMES_HK_USER }}@${{ secrets.HERMES_HK_HOST }}
           RELEASE_COMMIT: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "${REMOTE%@*}" -a -n "${REMOTE#*@}"
+          [[ "$REMOTE" =~ ^[A-Za-z_][A-Za-z0-9._-]*@[A-Za-z0-9.-]+$ ]]
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           ssh -i "$RUNNER_TEMP/hk-ssh/id_ed25519" \
+            -o BatchMode=yes -o ConnectTimeout=15 \
             -o UserKnownHostsFile="$RUNNER_TEMP/hk-ssh/known_hosts" \
             -o StrictHostKeyChecking=yes "$REMOTE" \
             "sudo -n /bin/bash -s -- '$RELEASE_COMMIT'" < deploy/hk/install-hk-worker.sh
-      - name: Verify HK update timer and release evidence
+      - name: Verify HK gateway, connector generation, recovery, and target source SHA
         env:
           REMOTE: ${{ secrets.HERMES_HK_USER }}@${{ secrets.HERMES_HK_HOST }}
           EXPECTED_COMMIT: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          ssh -i "$RUNNER_TEMP/hk-ssh/id_ed25519" \
+          [[ "$REMOTE" =~ ^[A-Za-z_][A-Za-z0-9._-]*@[A-Za-z0-9.-]+$ ]]
+          [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          health="$(ssh -i "$RUNNER_TEMP/hk-ssh/id_ed25519" \
+            -o BatchMode=yes -o ConnectTimeout=15 \
             -o UserKnownHostsFile="$RUNNER_TEMP/hk-ssh/known_hosts" \
             -o StrictHostKeyChecking=yes "$REMOTE" \
-            'sudo -n systemctl is-active --quiet hermes-fabric-update.timer hermes-hk-managed-node-recovery.service hermes-hk-managed-node-recovery-tunnel.service'
-          evidence="$(ssh -i "$RUNNER_TEMP/hk-ssh/id_ed25519" \
-            -o UserKnownHostsFile="$RUNNER_TEMP/hk-ssh/known_hosts" \
-            -o StrictHostKeyChecking=yes "$REMOTE" \
-            'sudo -n cat /var/lib/hermes-agent-fabric-update/hk/release.json')"
-          EXPECTED_COMMIT="$EXPECTED_COMMIT" python3 -c 'import json,os,sys; d=json.load(sys.stdin); assert d["commit"]==os.environ["EXPECTED_COMMIT"]; assert d["node_id"]=="hk"' <<<"$evidence"
+            "sudo -n /bin/bash -s -- '$EXPECTED_COMMIT'" <<'REMOTE'
+          set -Eeuo pipefail
+          umask 077
+          expected_commit="$1"
+          state_root=/var/lib/hermes-agent-fabric-update/hk
+          runtime_root=/opt/hk-team/hermes-agent
+          current_link="${runtime_root}/.fabric-current"
+          release_file="${state_root}/release.json"
+          deployed_file="${state_root}/deployed-commit"
+          mirror="${state_root}/repository.git"
+          [[ "${expected_commit}" =~ ^[0-9a-f]{40}$ ]]
+          [[ -L "${current_link}" ]]
+          current_generation="$(readlink -f -- "${current_link}")"
+          [[ "${current_generation}" == "${runtime_root}/.fabric-generations/${expected_commit}" ]]
+          [[ "$(cat -- "${deployed_file}")" == "${expected_commit}" ]]
+          [[ "$(cat -- "${current_generation}/.hermes-source-commit")" == "${expected_commit}" ]]
+          [[ -f "${current_generation}/uv.lock" \
+              && -x "${current_generation}/.venv/bin/hermes" ]]
+          source_tree="$(git --git-dir="${mirror}" rev-parse "${expected_commit}^{tree}")"
+          [[ "$(cat -- "${current_generation}/.hermes-source-tree")" == "${source_tree}" ]]
+          verify_index="$(mktemp /run/hermes-hk-workflow-index.XXXXXX)"
+          trap 'rm -f -- "${verify_index}" "${health_cfg:-}" "${health_json:-}"' EXIT
+          rm -f -- "${verify_index}"
+          GIT_INDEX_FILE="${verify_index}" \
+            git --git-dir="${mirror}" --work-tree="${current_generation}" \
+              read-tree "${expected_commit}"
+          GIT_INDEX_FILE="${verify_index}" \
+            git -c core.fileMode=false --git-dir="${mirror}" \
+              --work-tree="${current_generation}" diff-files --quiet \
+              --ignore-submodules=none
+          python3 - "${release_file}" "${expected_commit}" \
+            "${source_tree}" "${current_generation}" <<'PY'
+          import json
+          import sys
+
+          release = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert release.get("schema") == "hermes.fabric-release.v1"
+          assert release.get("node_id") == "hk"
+          assert release.get("commit") == sys.argv[2]
+          source = release.get("source") or {}
+          assert source == {
+              "commit": sys.argv[2],
+              "generation": sys.argv[4],
+              "lock": "uv.lock",
+              "tree": sys.argv[3],
+          }
+          PY
+          systemctl is-active --quiet hermes-fabric-update.timer \
+            hermes-hk-managed-node-recovery.service \
+            hermes-hk-managed-node-recovery-tunnel.service
+          service_user=hermes
+          service_home="$(getent passwd "${service_user}" | cut -d: -f6)"
+          service_uid="$(id -u "${service_user}")"
+          user_runtime="/run/user/${service_uid}"
+          systemctl start "user@${service_uid}.service"
+          user_systemctl() {
+            runuser -u "${service_user}" -- env \
+              HOME="${service_home}" \
+              XDG_RUNTIME_DIR="${user_runtime}" \
+              DBUS_SESSION_BUS_ADDRESS="unix:path=${user_runtime}/bus" \
+              systemctl --user "$@"
+          }
+          user_systemctl is-active --quiet hk-cloud-connector.service \
+            hermes-gateway-hk-worker.service
+          for unit in hk-cloud-connector.service hermes-gateway-hk-worker.service; do
+            main_pid="$(user_systemctl show "${unit}" -p MainPID --value)"
+            [[ "${main_pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${main_pid}/cmdline" ]]
+            command_line="$(tr '\0' ' ' <"/proc/${main_pid}/cmdline")"
+            [[ "${command_line}" == *"${current_generation}/.venv/bin/python"* \
+                || "${command_line}" == *"${current_link}/.venv/bin/python"* ]]
+          done
+          gateway_pid="$(user_systemctl show hermes-gateway-hk-worker.service -p MainPID --value)"
+          gateway_command="$(tr '\0' ' ' <"/proc/${gateway_pid}/cmdline")"
+          [[ "${gateway_command}" == *"gateway run"* \
+              && "${gateway_command}" == *"--profile hk-worker"* ]]
+          runuser -u "${service_user}" -- env -u HERMES_HOME \
+            HOME="${service_home}" \
+            PATH="${current_link}/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
+            XDG_RUNTIME_DIR="${user_runtime}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=${user_runtime}/bus" \
+            "${current_link}/.venv/bin/hermes" -p hk-worker gateway status \
+            >/dev/null
+          health_cfg="$(mktemp /run/hermes-hk-workflow-curl.XXXXXX)"
+          health_json="$(mktemp /run/hermes-hk-workflow-health.XXXXXX)"
+          chmod 0600 "${health_cfg}" "${health_json}"
+          printf 'header = "Authorization: Bearer %s"\nheader = "X-Connector-ID: hk-primary"\nheader = "Accept: application/json"\n' \
+            "$(cat /etc/hk-team/cloud_connector_token)" >"${health_cfg}"
+          curl --fail --silent --show-error --max-time 15 --noproxy '*' \
+            --config "${health_cfg}" -o "${health_json}" \
+            https://daxueshenmai.top/api/plugins/collaboration/connector/deployment-health
+          python3 - "${health_json}" "${expected_commit}" <<'PY'
+          import json
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          worker = payload.get("worker_channel") or {}
+          assert payload.get("ok") is True
+          assert payload.get("connector_id") == "hk-primary"
+          assert worker.get("online") is True and worker.get("fresh") is True
+          assert worker.get("node_id") == "hk-worker"
+          assert worker.get("managed_node_id") == "hk"
+          assert (worker.get("release") or {}).get("commit") == sys.argv[2]
+          PY
+          printf 'commit=%s\nsource_tree=%s\ngeneration=%s\nconnector=healthy\ngateway=healthy\nrecovery=healthy\n' \
+            "${expected_commit}" "${source_tree}" "${current_generation}"
+          REMOTE
+          )"
+          printf '%s\n' "$health"

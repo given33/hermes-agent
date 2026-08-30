@@ -47,12 +47,6 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`popular-web-designs`](/docs/user-guide/skills/bundled/creative/creative-popular-web-designs) | 54 real design systems (Stripe, Linear, Vercel) as HTML/CSS. | `creative\popular-web-designs` |
 | [`songwriting-and-ai-music`](/docs/user-guide/skills/bundled/creative/creative-songwriting-and-ai-music) | Songwriting craft and Suno AI music prompts. | `creative\songwriting-and-ai-music` |
 
-## devops
-
-| Skill | Description | Path |
-|-------|-------------|------|
-| [`sdlc-review`](/docs/user-guide/skills/bundled/devops/devops-sdlc-review) | Review Kanban handoffs and route verified outcomes. | `devops\sdlc-review` |
-
 ## email
 
 | Skill | Description | Path |

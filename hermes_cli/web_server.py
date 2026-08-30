@@ -45,10 +45,11 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+import urllib.request
 import zipfile
 
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
-import urllib.request
+from hermes_cli.route_identity import normalize_route_base_url
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -69,6 +70,7 @@ from hermes_cli.config import (
     get_env_path,
     get_hermes_home,
     get_process_hermes_home,
+    get_env_value_prefer_dotenv,
     load_config,
     load_env,
     read_raw_config,
@@ -8614,17 +8616,17 @@ def _api_key_display(entry: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     honest either way — reading only ``api_key`` reported "no API key" for
     every endpoint whose key had been moved to ``.env``.
     """
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if key_env:
+        return True, f"${{{key_env}}}"
     plaintext = str(entry.get("api_key") or "").strip()
     if plaintext:
         return True, redact_key(plaintext)
-    key_env = str(entry.get("key_env") or "").strip()
-    if key_env:
-        return True, f"${{{key_env}}}"
     return False, None
 
 
-def _config_api_key_is_env_ref(endpoint_id: str) -> bool:
-    """True when this endpoint's on-disk ``api_key`` is a ``${VAR}`` template.
+def _config_api_key_template(endpoint_id: str) -> Optional[str]:
+    """Return an endpoint's on-disk ``api_key`` template, if present.
 
     ``load_config()`` expands env refs, so a hand-written
     ``api_key: ${MY_KEY}`` is indistinguishable from a literal secret by the
@@ -8634,14 +8636,89 @@ def _config_api_key_is_env_ref(endpoint_id: str) -> bool:
     """
     _stored, entry = find_provider_entry(read_raw_config().get("providers"), endpoint_id)
     raw_key = entry.get("api_key") if isinstance(entry, dict) else None
-    return bool(isinstance(raw_key, str) and re.search(r"\$\{[^}]+\}", raw_key))
+    if isinstance(raw_key, str) and re.search(r"\$\{[^}]+\}", raw_key):
+        return raw_key
+    return None
+
+
+def _validated_custom_endpoint_base_url(
+    value: str,
+) -> Tuple[str, bool]:
+    """Parse a custom endpoint URL before a server-side network probe.
+
+    Plaintext HTTP is limited to an unambiguous loopback target. Components
+    that have no valid meaning in a model API base URL are rejected before
+    the URL reaches either the DNS policy or httpx parser.
+    """
+    base_url = str(value or "").strip().rstrip("/")
+    if any(ord(char) <= 0x20 for char in base_url):
+        raise ValueError("base_url must not contain whitespace or control characters")
+
+    parsed = urllib.parse.urlsplit(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "base_url must be an HTTP(S) URL without userinfo, query, or fragment"
+        )
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("base_url contains an invalid port") from exc
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    loopback = hostname == "localhost" or hostname.endswith(".localhost")
+    if not loopback:
+        try:
+            loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            loopback = False
+    if parsed.scheme == "http" and not loopback:
+        raise ValueError("HTTP model endpoints are limited to loopback; use HTTPS otherwise")
+    return base_url, loopback
+
+
+def _apply_custom_endpoint_credentials(
+    model_cfg: Dict[str, Any], entry: Dict[str, Any], endpoint_id: str
+) -> None:
+    """Replace the active model's credential mirror with this endpoint's.
+
+    A model switch must clear all credential aliases first. Otherwise a
+    ``key_env`` copied from the previously active endpoint can outrank the new
+    endpoint's legacy ``api_key`` at runtime. Raw ``${VAR}`` templates are
+    copied as templates so activating an older hand-written entry never adds
+    expanded plaintext to ``config.yaml``.
+    """
+    model_cfg.pop("api_key", None)
+    model_cfg.pop("api", None)
+    model_cfg.pop("key_env", None)
+    model_cfg.pop("api_key_env", None)
+
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if key_env:
+        model_cfg["key_env"] = key_env
+        return
+
+    api_key = str(entry.get("api_key") or "").strip()
+    if api_key:
+        model_cfg["api_key"] = _config_api_key_template(endpoint_id) or api_key
 
 
 def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
+    agent_cfg = cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
     current_provider = str(model_cfg.get("provider", "") or "")
     current_model = str(model_cfg.get("default", model_cfg.get("name", "")) or "")
     current_base_url = str(model_cfg.get("base_url", "") or "")
+    current_api_mode = str(model_cfg.get("api_mode") or "chat_completions").strip()
+    current_reasoning_effort = str(
+        agent_cfg.get("reasoning_effort") or "medium"
+    ).strip()
 
     endpoints: List[Dict[str, Any]] = []
     providers = cfg.get("providers")
@@ -8656,17 +8733,27 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             models = _models_from_custom_endpoint_entry(raw_entry)
             endpoint_model = str(raw_entry.get("model") or raw_entry.get("default_model") or (models[0] if models else ""))
             has_api_key, api_key_preview = _api_key_display(raw_entry)
+            is_current = endpoint_id == current_provider
             endpoints.append({
                 "id": endpoint_id,
                 "name": str(raw_entry.get("name") or endpoint_id),
                 "base_url": base_url,
                 "model": endpoint_model,
                 "models": models,
+                "api_mode": str(
+                    raw_entry.get("api_mode")
+                    or raw_entry.get("transport")
+                    or (current_api_mode if is_current else "chat_completions")
+                ).strip(),
+                "reasoning_effort": str(
+                    raw_entry.get("reasoning_effort")
+                    or (current_reasoning_effort if is_current else "medium")
+                ).strip(),
                 "context_length": raw_entry.get("context_length"),
                 "discover_models": bool(raw_entry.get("discover_models", True)),
                 "has_api_key": has_api_key,
                 "api_key_preview": api_key_preview,
-                "is_current": endpoint_id == current_provider,
+                "is_current": is_current,
                 "source": "providers",
             })
 
@@ -8678,6 +8765,8 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "base_url": current_base_url,
             "model": current_model,
             "models": [current_model] if current_model else [],
+            "api_mode": current_api_mode,
+            "reasoning_effort": current_reasoning_effort,
             "context_length": model_cfg.get("context_length"),
             "discover_models": True,
             "has_api_key": has_api_key,
@@ -8692,6 +8781,8 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "provider": current_provider,
             "model": current_model,
             "base_url": current_base_url,
+            "api_mode": current_api_mode,
+            "reasoning_effort": current_reasoning_effort,
         },
     }
 
@@ -8714,7 +8805,15 @@ def _detach_main_model_from_provider(cfg: Dict[str, Any], provider_key: str) -> 
         return
     if str(model_cfg.get("provider") or "").strip().lower() != provider_key:
         return
-    for field in ("provider", "base_url", "api_key", "key_env"):
+    for field in (
+        "provider",
+        "base_url",
+        "api_key",
+        "api",
+        "key_env",
+        "api_key_env",
+        "api_mode",
+    ):
         model_cfg.pop(field, None)
     cfg["model"] = model_cfg
 
@@ -8722,16 +8821,18 @@ def _detach_main_model_from_provider(cfg: Dict[str, Any], provider_key: str) -> 
 def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> Tuple[str, Dict[str, Any]]:
     endpoint_id = _custom_endpoint_id(body.id or body.name)
     name = (body.name or "").strip()
-    base_url = (body.base_url or "").strip().rstrip("/")
     model = (body.model or "").strip()
 
     if not name:
         raise HTTPException(status_code=400, detail="name required")
-    if not base_url:
+    if not str(body.base_url or "").strip():
         raise HTTPException(status_code=400, detail="base_url required")
+    base_url = str(body.base_url or "").strip().rstrip("/")
     parsed = urllib.parse.urlparse(base_url)
-    if not parsed.scheme or not parsed.netloc:
-        raise HTTPException(status_code=400, detail="base_url must include scheme and host")
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(
+            status_code=400, detail="base_url must include an HTTP(S) scheme and host"
+        )
     if not model:
         raise HTTPException(status_code=400, detail="model required")
 
@@ -8756,6 +8857,10 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
         "model": model,
         "discover_models": bool(body.discover_models),
     })
+    if body.api_mode is not None:
+        entry["api_mode"] = body.api_mode
+    if body.reasoning_effort is not None:
+        entry["reasoning_effort"] = body.reasoning_effort
     # Same for the model map: merge rather than replace, so existing models
     # keep their context lengths. ``body.models`` is the catalogue the panel's
     # Test button already discovered — without it only the one hand-typed
@@ -8783,19 +8888,22 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     if submitted_key:
         save_env_value(env_var, submitted_key)
         entry["key_env"] = env_var
+        entry.pop("api_key_env", None)
         entry.pop("api_key", None)
     elif submitted_key is not None:
         # Blank field means "clear the key", not "leave it alone".
         remove_env_value(env_var)
         entry.pop("key_env", None)
+        entry.pop("api_key_env", None)
         entry.pop("api_key", None)
-    elif str(entry.get("api_key") or "").strip() and not _config_api_key_is_env_ref(endpoint_id):
+    elif str(entry.get("api_key") or "").strip() and not _config_api_key_template(endpoint_id):
         # No new key submitted, but this entry still carries one an earlier
         # release wrote in plaintext. Migrate it on the next save so endpoints
         # configured before the fix get cleaned up too, without the user
         # having to re-enter the key.
         save_env_value(env_var, entry["api_key"].strip())
         entry["key_env"] = env_var
+        entry.pop("api_key_env", None)
         entry.pop("api_key", None)
 
     if stored_key is not None and stored_key != endpoint_id:
@@ -8807,9 +8915,22 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
         cfg["model"] = _apply_main_model_assignment(
             cfg.get("model", {}), endpoint_id, model, base_url
         )
-        if entry.get("key_env") and isinstance(cfg["model"], dict):
-            cfg["model"]["key_env"] = entry["key_env"]
-            cfg["model"].pop("api_key", None)
+        api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip()
+        if api_mode and isinstance(cfg["model"], dict):
+            cfg["model"]["api_mode"] = api_mode
+        elif isinstance(cfg["model"], dict):
+            cfg["model"].pop("api_mode", None)
+        if isinstance(cfg["model"], dict):
+            _apply_custom_endpoint_credentials(
+                cfg["model"], entry, endpoint_id
+            )
+        reasoning_effort = str(entry.get("reasoning_effort") or "").strip()
+        if reasoning_effort:
+            agent_cfg = cfg.get("agent")
+            if not isinstance(agent_cfg, dict):
+                agent_cfg = {}
+            agent_cfg["reasoning_effort"] = reasoning_effort
+            cfg["agent"] = agent_cfg
 
     return endpoint_id, entry
 
@@ -8833,22 +8954,63 @@ def list_custom_endpoints(profile: Optional[str] = None):
         raise HTTPException(status_code=500, detail="Failed to list custom endpoints")
 
 
+def _upsert_custom_endpoint_response(
+    body: CustomEndpointUpdate, profile: Optional[str]
+) -> Dict[str, Any]:
+    with _config_profile_scope(profile):
+        cfg = load_config()
+        endpoint_id, _entry = _write_custom_endpoint(cfg, body)
+        save_config(cfg)
+        response = _custom_endpoint_response(cfg)
+    response["ok"] = True
+    response["id"] = endpoint_id
+    return response
+
+
 @app.post("/api/providers/custom-endpoints")
 def upsert_custom_endpoint(body: CustomEndpointUpdate, profile: Optional[str] = None):
     """Create or update a v12+ ``providers`` custom endpoint entry."""
     try:
-        with _config_profile_scope(profile):
-            cfg = load_config()
-            endpoint_id, _entry = _write_custom_endpoint(cfg, body)
-            save_config(cfg)
-            response = _custom_endpoint_response(cfg)
-        response["ok"] = True
-        response["id"] = endpoint_id
-        return response
+        return _upsert_custom_endpoint_response(body, profile)
     except HTTPException:
         raise
     except Exception:
         _log.exception("POST /api/providers/custom-endpoints failed")
+        raise HTTPException(status_code=500, detail="Failed to save custom endpoint")
+
+
+@app.put("/api/providers/custom-endpoints")
+def replace_custom_endpoint(body: CustomEndpointUpdate, profile: Optional[str] = None):
+    """Update a custom endpoint using the collection upsert contract."""
+    try:
+        return _upsert_custom_endpoint_response(body, profile)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("PUT /api/providers/custom-endpoints failed")
+        raise HTTPException(status_code=500, detail="Failed to save custom endpoint")
+
+
+@app.put("/api/providers/custom-endpoints/{endpoint_id}")
+def replace_custom_endpoint_by_id(
+    endpoint_id: str,
+    body: CustomEndpointUpdate,
+    profile: Optional[str] = None,
+):
+    """Update a custom endpoint whose identity is supplied by the route."""
+    provider_key = _custom_endpoint_id(endpoint_id)
+    if body.id and _custom_endpoint_id(body.id) != provider_key:
+        raise HTTPException(status_code=400, detail="body id must match endpoint id")
+    try:
+        return _upsert_custom_endpoint_response(
+            body.model_copy(update={"id": provider_key}), profile
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception(
+            "PUT /api/providers/custom-endpoints/%s failed", endpoint_id
+        )
         raise HTTPException(status_code=500, detail="Failed to save custom endpoint")
 
 
@@ -8870,12 +9032,20 @@ def activate_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
                 raise HTTPException(status_code=400, detail="custom endpoint is incomplete")
 
             model_cfg = _apply_main_model_assignment(cfg.get("model", {}), provider_key, model, base_url)
-            if entry.get("key_env"):
-                model_cfg["key_env"] = entry["key_env"]
-                model_cfg.pop("api_key", None)
-            elif entry.get("api_key"):
-                model_cfg["api_key"] = entry["api_key"]
+            api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip()
+            if api_mode:
+                model_cfg["api_mode"] = api_mode
+            else:
+                model_cfg.pop("api_mode", None)
+            _apply_custom_endpoint_credentials(model_cfg, entry, provider_key)
             cfg["model"] = model_cfg
+            reasoning_effort = str(entry.get("reasoning_effort") or "").strip()
+            if reasoning_effort:
+                agent_cfg = cfg.get("agent")
+                if not isinstance(agent_cfg, dict):
+                    agent_cfg = {}
+                agent_cfg["reasoning_effort"] = reasoning_effort
+                cfg["agent"] = agent_cfg
             save_config(cfg)
         return {"ok": True, "provider": provider_key, "model": model}
     except HTTPException:
@@ -8911,32 +9081,217 @@ def delete_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
         raise HTTPException(status_code=500, detail="Failed to delete custom endpoint")
 
 
+def _custom_endpoint_entry_for_validation(
+    cfg: Dict[str, Any], body: CustomEndpointUpdate
+) -> Optional[Dict[str, Any]]:
+    providers = cfg.get("providers")
+    wanted_base_url = normalize_route_base_url(str(body.base_url or "").strip())
+    identity = str(body.id or body.name or "").strip()
+    if identity:
+        endpoint_id = _custom_endpoint_id(identity)
+        _stored, entry = find_provider_entry(providers, endpoint_id)
+        if entry is None:
+            return None
+        stored_base_url = normalize_route_base_url(entry.get("base_url"))
+        if stored_base_url == wanted_base_url:
+            return entry
+        return None
+
+    matches: List[Dict[str, Any]] = []
+    if isinstance(providers, dict) and wanted_base_url:
+        for candidate in providers.values():
+            if not isinstance(candidate, dict):
+                continue
+            candidate_url = normalize_route_base_url(candidate.get("base_url"))
+            if candidate_url == wanted_base_url:
+                matches.append(candidate)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _custom_endpoint_api_key_for_validation(
+    entry: Optional[Dict[str, Any]], submitted_key: Optional[str]
+) -> str:
+    api_key = str(submitted_key or "").strip()
+    if api_key or entry is None:
+        return api_key
+
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if key_env:
+        from agent.secret_scope import UnscopedSecretError
+
+        try:
+            resolved = get_env_value_prefer_dotenv(key_env)
+        except UnscopedSecretError:
+            # The requested profile's .env was already checked first. Under
+            # multiplexing, an unscoped process-env fallback could only be a
+            # different profile's credential, so a miss is authoritative.
+            return ""
+        return str(resolved or "").strip()
+    api_key = str(entry.get("api_key") or "").strip()
+    return "" if re.search(r"\$\{[^}]+\}", api_key) else api_key
+
+
+def _custom_endpoint_probe_error(status_code: int) -> str:
+    if status_code in {401, 403}:
+        return "The endpoint rejected the API key."
+    if status_code == 404:
+        return "The selected protocol path is not available at this Base URL."
+    if status_code == 429:
+        return "The endpoint is reachable but currently rate limited."
+    return f"The endpoint rejected the test request with HTTP {status_code}."
+
+
 @app.post("/api/providers/custom-endpoints/validate")
-async def validate_custom_endpoint(body: CustomEndpointUpdate):
-    """Probe a custom endpoint by calling its OpenAI-compatible /models URL."""
+async def validate_custom_endpoint(
+    body: CustomEndpointUpdate, profile: Optional[str] = None
+):
+    """Probe a custom endpoint's model catalog or selected inference protocol."""
     import httpx
 
-    base_url = (body.base_url or "").strip().rstrip("/")
-    if not base_url:
-        return {"ok": False, "reachable": True, "message": "Enter an endpoint URL first.", "models": []}
-
-    url = base_url + "/models"
-    headers = {"Accept": "application/json"}
-    if body.api_key and body.api_key.strip():
-        headers["Authorization"] = f"Bearer {body.api_key.strip()}"
+    if not str(body.base_url or "").strip():
+        return {
+            "ok": False,
+            "reachable": True,
+            "status": 0,
+            "latency_ms": 0,
+            "message": "Enter an endpoint URL first.",
+            "models": [],
+        }
+    if body.validation_mode == "inference" and not str(body.model or "").strip():
+        raise HTTPException(status_code=400, detail="model required for inference validation")
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
-            resp = await client.get(url, headers=headers)
-    except Exception:
-        return {"ok": False, "reachable": False, "message": f"Could not reach {url}.", "models": []}
+        base_url, loopback = _validated_custom_endpoint_base_url(body.base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if resp.status_code in (401, 403):
-        return {"ok": False, "reachable": True, "message": "The endpoint rejected the API key.", "models": []}
-    if not resp.is_success:
-        return {"ok": False, "reachable": True, "message": f"Endpoint returned HTTP {resp.status_code}.", "models": []}
+    with _config_profile_scope(profile):
+        cfg = load_config()
+        entry = _custom_endpoint_entry_for_validation(cfg, body)
+        api_key = _custom_endpoint_api_key_for_validation(entry, body.api_key)
+        api_mode = str(
+            body.api_mode
+            or (entry or {}).get("api_mode")
+            or (entry or {}).get("transport")
+            or "chat_completions"
+        ).strip()
+        if body.validation_mode == "inference" and api_mode not in {
+            "chat_completions",
+            "codex_responses",
+            "anthropic_messages",
+        }:
+            raise HTTPException(status_code=400, detail="unsupported api_mode")
 
-    return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
+        headers = {"Accept": "application/json"}
+        payload: Optional[Dict[str, Any]] = None
+        if body.validation_mode == "catalog":
+            endpoint = f"{base_url}/models"
+            if api_mode == "anthropic_messages":
+                headers["anthropic-version"] = "2023-06-01"
+                if api_key:
+                    headers["x-api-key"] = api_key
+            elif api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            headers["Content-Type"] = "application/json"
+            model = body.model.strip()
+            if api_mode == "anthropic_messages":
+                endpoint = f"{base_url}/messages"
+                if api_key:
+                    headers["x-api-key"] = api_key
+                headers["anthropic-version"] = "2023-06-01"
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Reply OK"}],
+                    "max_tokens": 1,
+                }
+            elif api_mode == "codex_responses":
+                endpoint = f"{base_url}/responses"
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                payload = {
+                    "model": model,
+                    "input": "Reply OK",
+                    "max_output_tokens": 16,
+                }
+            else:
+                endpoint = f"{base_url}/chat/completions"
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Reply OK"}],
+                    "max_tokens": 1,
+                    "stream": False,
+                }
+
+        if not loopback:
+            from tools.url_safety import async_is_safe_url
+
+            if not await async_is_safe_url(endpoint):
+                raise HTTPException(
+                    status_code=400,
+                    detail="base_url resolves to a blocked private or metadata address",
+                )
+
+        started = time.perf_counter()
+        try:
+            client_kwargs = {
+                "timeout": httpx.Timeout(15.0),
+                "follow_redirects": False,
+            }
+            if loopback:
+                # Loopback probes must never honor process proxy variables:
+                # otherwise a local URL and its Authorization header can leave
+                # the host through HTTP_PROXY/ALL_PROXY.
+                client_kwargs["trust_env"] = False
+                client_context = httpx.AsyncClient(**client_kwargs)
+            else:
+                from tools.url_safety import create_ssrf_safe_async_client
+
+                client_context = create_ssrf_safe_async_client(**client_kwargs)
+            async with client_context as client:
+                if body.validation_mode == "catalog":
+                    response = await client.get(endpoint, headers=headers)
+                else:
+                    response = await client.post(
+                        endpoint, headers=headers, json=payload
+                    )
+        except Exception:
+            return {
+                "ok": False,
+                "reachable": False,
+                "status": 0,
+                "latency_ms": round((time.perf_counter() - started) * 1000),
+                "message": "Endpoint is unreachable.",
+                "models": [],
+            }
+
+    latency_ms = round((time.perf_counter() - started) * 1000)
+    if response.is_success:
+        return {
+            "ok": True,
+            "reachable": True,
+            "status": response.status_code,
+            "latency_ms": latency_ms,
+            "message": (
+                "" if body.validation_mode == "catalog"
+                else "Connection and model protocol verified."
+            ),
+            "models": (
+                _parse_model_ids(response)
+                if body.validation_mode == "catalog"
+                else []
+            ),
+        }
+    return {
+        "ok": False,
+        "reachable": True,
+        "status": response.status_code,
+        "latency_ms": latency_ms,
+        "message": _custom_endpoint_probe_error(response.status_code),
+        "models": [],
+    }
 
 
 @app.post("/api/providers/validate")
@@ -8961,18 +9316,61 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
     # ids the endpoint advertises (OpenAI ``/v1/models`` shape) so the GUI can
     # auto-pick a default without asking the user to type a model name.
     if key == "OPENAI_BASE_URL":
-        url = value.rstrip("/") + "/models"
+        try:
+            base_url, loopback = _validated_custom_endpoint_base_url(value)
+        except ValueError:
+            # Preserve the legacy soft-validation response while refusing to
+            # send malformed or non-HTTP(S) input to the network client.
+            return {
+                "ok": False,
+                "reachable": False,
+                "message": "Could not reach the endpoint.",
+                "models": [],
+            }
+        url = f"{base_url}/models"
         # Send the optional API key so endpoints that require auth on
         # ``/v1/models`` (many hosted OpenAI-compatible servers) still enumerate
         # their models instead of returning an empty list behind a 401.
         api_key = (body.api_key or "").strip()
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        if not loopback:
+            try:
+                from tools.url_safety import async_is_safe_url
+
+                safe = await async_is_safe_url(url)
+            except Exception:
+                safe = False
+            if not safe:
+                return {
+                    "ok": False,
+                    "reachable": False,
+                    "message": "Could not reach the endpoint.",
+                    "models": [],
+                }
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            client_kwargs = {
+                "timeout": httpx.Timeout(8.0),
+                "follow_redirects": False,
+            }
+            if loopback:
+                # Keep local credentials on the local host; proxy environment
+                # variables are not part of the endpoint's trust boundary.
+                client_kwargs["trust_env"] = False
+                client_context = httpx.AsyncClient(**client_kwargs)
+            else:
+                from tools.url_safety import create_ssrf_safe_async_client
+
+                client_context = create_ssrf_safe_async_client(**client_kwargs)
+            async with client_context as client:
                 resp = await client.get(url, headers=headers)
             return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
         except Exception:
-            return {"ok": False, "reachable": False, "message": f"Could not reach {url}."}
+            return {
+                "ok": False,
+                "reachable": False,
+                "message": "Could not reach the endpoint.",
+                "models": [],
+            }
 
     probe = _CREDENTIAL_PROBES.get(key)
     if not probe:

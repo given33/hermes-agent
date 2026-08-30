@@ -25,7 +25,7 @@ done
 
 receiver_user="${HERMES_HK_RECOVERY_USER:-hermes}"
 [[ "${receiver_user}" == hermes ]] || die "HK recovery user must be hermes"
-agent_root="${HERMES_HK_AGENT_ROOT:-/opt/hk-team/hermes-agent}"
+agent_root="${HERMES_HK_AGENT_ROOT:-/opt/hk-team/hermes-agent/.fabric-current}"
 runtime_python="${HERMES_HK_RUNTIME_PYTHON:-${agent_root}/.venv/bin/python}"
 config_source="${repo}/deploy/recovery/managed-nodes.hk.json"
 recover_source="${repo}/deploy/recovery/recover-hk.sh"

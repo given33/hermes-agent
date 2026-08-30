@@ -141,6 +141,47 @@ async def test_post_turn_loop_completion_noop_without_inflight_tick(loop_env):
     assert reloaded.ticks_fired == 0
 
 
+@pytest.mark.asyncio
+async def test_post_turn_loop_completion_preserves_profile_secret_scope(
+    loop_env, monkeypatch
+):
+    """The synchronous --until judge must stay inside the active worker profile."""
+    import agent.secret_scope as secret_scope
+
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(
+        runner, _make_event("/loop 5m poll CI --until the secondary CI is green")
+    )
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    assert mgr.fire_tick() is not None
+
+    observed = {}
+
+    def _judge(condition, response):
+        observed["scope"] = secret_scope.current_secret_scope()
+        observed["key"] = secret_scope.get_secret("OPENAI_API_KEY")
+        return "done", "secondary CI is green", None, False, False
+
+    monkeypatch.setattr(goals, "judge_goal", _judge)
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({"OPENAI_API_KEY": "secondary-key"})
+    try:
+        await GatewayRunner._post_turn_loop_completion(
+            runner,
+            session_entry=_FakeSessionEntry(),
+            source=None,
+            final_response="secondary result",
+        )
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+    assert observed["scope"] == {"OPENAI_API_KEY": "secondary-key"}
+    assert observed["key"] == "secondary-key"
+
+
 def test_streamed_already_sent_none_recovers_text_for_hooks():
     """Streamed turns return None. Hooks must still see the delivered reply."""
     event = _make_event("wakeup")

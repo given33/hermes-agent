@@ -87,7 +87,7 @@
   }
 
   // Board column display order; any backend status not listed here renders after these.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
@@ -97,7 +97,6 @@
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
-    review: "Review",
     done: "Done",
     archived: "Archived",
   };
@@ -107,7 +106,6 @@
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
-    review: "Implementation complete — awaiting review",
     done: "Completed",
     archived: "Archived",
   };
@@ -175,7 +173,6 @@
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
-    review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
   };
@@ -3278,7 +3275,7 @@
     // Goal-mode: when on, the dispatched worker runs the Ralph-style /goal
     // loop — a judge re-checks the card after each turn and the worker keeps
     // going in the same session until done, or the turn budget runs out
-    // (which blocks the card for review). goalMaxTurns is optional; blank
+    // (which blocks the card for human input). goalMaxTurns is optional; blank
     // = backend default.
     const [goalMode, setGoalMode] = useState(false);
     const [goalMaxTurns, setGoalMaxTurns] = useState("");
@@ -3453,7 +3450,7 @@
           h("div", { className: "flex gap-2 items-center" },
             h("label", {
               className: "flex items-center gap-1.5 text-xs cursor-pointer select-none",
-              title: "Goal mode: the worker keeps going in the same session until a judge agrees the card is done (or the turn budget runs out, which blocks it for review). Best for open-ended cards one shot rarely finishes.",
+              title: "Goal mode: the worker keeps going in the same session until the completion criteria are met (or the turn budget runs out, which blocks it for human input). Best for open-ended cards one shot rarely finishes.",
             },
               h("input", {
                 type: "checkbox",

@@ -40,6 +40,9 @@ def _server_topology(tmp_path: Path) -> Path:
     node = payload["nodes"][0]
     node["token_file"] = str(status)
     node["installation_token_file"] = str(installation)
+    node["recovery_token_files"]["hk"] = str(
+        _private_token(tmp_path / "hk-recovery.token", "h" * 48)
+    )
     path = tmp_path / "managed-nodes.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path

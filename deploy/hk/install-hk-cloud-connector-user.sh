@@ -12,29 +12,37 @@ unit_template="${here}/hk-cloud-connector.service"
 
 die() { printf 'install-hk-cloud-connector-user: %s\n' "$*" >&2; exit 1; }
 [[ "$(id -u)" == 0 ]] || die "must run as root"
+
+assert_canonical_path() {
+  local path="$1" label="${2:-path}" probe parent resolved
+  [[ "${path}" == /* ]] || die "${label} must be absolute"
+  probe="${path}"
+  while [[ ! -e "${probe}" && ! -L "${probe}" ]]; do
+    parent="$(dirname -- "${probe}")"
+    [[ "${parent}" != "${probe}" ]] || die "${label} has no existing ancestor"
+    probe="${parent}"
+  done
+  [[ ! -L "${probe}" ]] || die "${label} has a symlink ancestor"
+  resolved="$(realpath -e -- "${probe}")" \
+    || die "${label} ancestor cannot be resolved"
+  [[ "${resolved}" == "${probe}" ]] \
+    || die "${label} ancestor resolves outside its lexical path"
+}
+
 for required in "${shared_installer}" "${shared_source}" "${unit_template}"; do
+  assert_canonical_path "${required}" "HK deployment asset"
   [[ -f "${required}" && ! -L "${required}" ]] || die "required asset is missing: ${required}"
 done
 
 connector_user="${HK_CONNECTOR_USER:-hermes}"
 user_home="$(getent passwd "${connector_user}" | cut -d: -f6)"
 [[ -n "${user_home}" && -d "${user_home}" ]] || die "connector user home is missing"
-hermes_home="${HK_CONNECTOR_HERMES_HOME:-${user_home}/.hermes}"
-artifact_roots="${HK_CONNECTOR_ARTIFACT_ROOTS:-${hermes_home}:${user_home}/.hermes}"
-profile_root="${hermes_home}/profiles/hk-worker"
-install -d -o "${connector_user}" -g "${connector_user}" -m 0700 \
-  "${hermes_home}" "${hermes_home}/profiles" "${profile_root}" \
-  "${profile_root}/skills"
-for template in config.yaml.example SOUL.md; do
-  source_template="${here}/profile/${template}"
-  target_template="${profile_root}/${template}"
-  [[ -f "${source_template}" && ! -L "${source_template}" ]] \
-    || die "HK profile template is missing: ${source_template}"
-  if [[ ! -e "${target_template}" && ! -L "${target_template}" ]]; then
-    install -o "${connector_user}" -g "${connector_user}" -m 0600 \
-      "${source_template}" "${target_template}"
-  fi
-done
+hermes_home="${HK_CONNECTOR_HERMES_HOME:-${user_home}/.hermes/profiles/hk-worker}"
+artifact_roots="${HK_CONNECTOR_ARTIFACT_ROOTS:-${hermes_home}}"
+[[ "${hermes_home}" == /* && ! -L "${hermes_home}" ]] \
+  || die "HK worker Hermes home must be an absolute non-symlink path"
+assert_canonical_path "${hermes_home}" "HK worker Hermes home"
+assert_canonical_path "$(dirname -- "${artifact_roots%%:*}")" "HK artifact root parent"
 
 exec env \
   DBB3_CONNECTOR_USER="${connector_user}" \
@@ -45,9 +53,10 @@ exec env \
   DBB3_CONNECTOR_UNIT_TEMPLATE="${unit_template}" \
   DBB3_CONNECTOR_BACKUP_ROOT="${HK_CONNECTOR_BACKUP_ROOT:-/opt/hk-team/backups}" \
   DBB3_CONNECTOR_ARTIFACT_ROOTS="${artifact_roots}" \
-  HERMES_CONNECTOR_RUNTIME_PYTHON="${HERMES_HK_RUNTIME_PYTHON:-/opt/hk-team/hermes-agent/.venv/bin/python}" \
+  HERMES_CONNECTOR_RUNTIME_PYTHON="${HERMES_HK_RUNTIME_PYTHON:-/opt/hk-team/hermes-agent/.fabric-current/.venv/bin/python}" \
   HERMES_CONNECTOR_UNIT_NAME="hk-cloud-connector.service" \
   HERMES_CONNECTOR_CONFIG_DIR="${user_home}/.config/hk-team" \
   HERMES_CONNECTOR_STATE_DIR="${user_home}/.local/state/hk-cloud-connector" \
   HERMES_CONNECTOR_HERMES_HOME="${hermes_home}" \
+  HERMES_CONNECTOR_PROFILE_TEMPLATE_ROOT="${here}/profile" \
   bash "${shared_installer}" "${shared_source}" "${1:-}"

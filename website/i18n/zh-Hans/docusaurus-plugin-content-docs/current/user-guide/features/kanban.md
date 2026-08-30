@@ -14,7 +14,7 @@ Hermes Kanban 是一个持久化任务看板，在所有 Hermes 配置文件之�
 
 看板有两个入口，均由同一个 `~/.hermes/kanban.db` 支撑：
 
-- **Agent 通过专用 `kanban_*` 工具集驱动看板** —— `kanban_show`、`kanban_list`、`kanban_complete`、`kanban_block`、`kanban_request_review`、`kanban_request_changes`、`kanban_heartbeat`、`kanban_comment`、`kanban_create`、`kanban_link`、`kanban_unblock`。调度器在 schema 中已内置这些工具来启动每个 worker；编排器（orchestrator）配置文件也可以通过 `kanban` 工具集显式启用。模型通过直接调用工具来读取和路由任务，*而不是*通过 shell 执行 `hermes kanban`。详见下方[Worker 如何与看板交互](#how-workers-interact-with-the-board)。
+- **Agent 通过专用 `kanban_*` 工具集驱动看板** —— `kanban_show`、`kanban_list`、`kanban_complete`、`kanban_block`、`kanban_heartbeat`、`kanban_comment`、`kanban_create`、`kanban_link`、`kanban_unblock`。调度器在 schema 中已内置这些工具来启动每个 worker；编排器（orchestrator）配置文件也可以通过 `kanban` 工具集显式启用。模型通过直接调用工具来读取和路由任务，*而不是*通过 shell 执行 `hermes kanban`。详见下方[Worker 如何与看板交互](#how-workers-interact-with-the-board)。
 - **你（以及脚本和 cron）通过 CLI 上的 `hermes kanban …`、斜杠命令 `/kanban …` 或仪表盘驱动看板。** 这些界面面向人类和自动化场景——即没有工具调用模型的场合。
 
 两个界面都通过同一个 `kanban_db` 层路由，因此读取视图一致，写入不会产生偏差。本页其余部分展示 CLI 示例，因为它们便于复制粘贴，但每个 CLI 动词都有模型使用的等效工具调用。
@@ -161,8 +161,6 @@ hermes kanban stats
 kanban:
   dispatch_in_gateway: true        # 默认
   dispatch_interval_seconds: 60    # 默认
-  review_dispatch: true            # 默认：使用内置 sdlc-review skill 自动启动 reviewer。
-                                   # 纯人工审查看板可设为 false。
 ```
 
 通过 `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0` 在运行时覆盖配置标志以进行调试。标准 gateway 监督适用：直接运行 `hermes gateway start`，或将 gateway 配置为 systemd 用户单元（参见 gateway 文档）。没有运行中的 gateway，`ready` 任务会保持原状，直到 gateway 启动 —— `hermes kanban create` 在创建时会对此发出警告。
@@ -199,15 +197,13 @@ hermes kanban block    t_abc "need input" --ids t_def t_hij
 |---|---|---|
 | `kanban_show` | 读取当前任务（标题、正文、先前尝试、父级交接、评论、完整预格式化的 `worker_context`）。默认使用环境变量中的任务 id。 | — |
 | `kanban_list` | 列出带有 `assignee`、`status`、`tenant`、归档可见性和限制过滤器的任务摘要。供编排器发现看板工作使用。 | — |
-| `kanban_complete` | 以 `summary` + `metadata` 结构化交接完成任务。 | `summary` / `result` 至少一个 |
-| `kanban_request_review` | 启动同卡审查，携带 `summary`、可选 `metadata` 和 reviewer profile；任务移入 `review`，且不计入 block 循环。 | `summary` |
-| `kanban_request_changes` | reviewer 在活动审查 run 中要求修改：关闭审查 run，重新检查父依赖，并把任务交还原 implementer。 | `reason` |
+| `kanban_complete` | worker 自验后，以 `summary` + `metadata` 结构化交接完成任务。 | `summary` / `result` 至少一个 |
 | `kanban_block` | 以 `reason` 上报需要人工输入。 | `reason` |
 | `kanban_heartbeat` | 在长时间操作期间发出存活信号。纯副作用。 | — |
 | `kanban_comment` | 向任务线程追加持久化备注。 | `task_id`、`body` |
 | `kanban_create` | （编排器）将任务扇出为带有 `assignee`、可选 `parents`、`skills` 等的子任务。 | `title`、`assignee` |
 | `kanban_link` | （编排器）事后添加 `parent_id → child_id` 依赖边。 | `parent_id`、`child_id` |
-| `kanban_unblock` | （编排器）将阻塞任务恢复到来源阶段（`review` 或 `ready`）；父任务仍开放时进入 `todo`。 | `task_id` |
+| `kanban_unblock` | （编排器）将阻塞任务恢复到 `ready`；父任务仍开放时进入 `todo`。 | `task_id` |
 
 典型的 worker 轮次如下所示：
 
@@ -260,9 +256,9 @@ kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dep
 
 ### 推荐的交接证据
 
-`kanban_complete(summary=..., metadata={...})` 是有意灵活的：summary 是人类可读的收尾说明，`metadata` 是机器可读的交接信息，下游 agent、审查者或仪表盘可以直接复用，无需从文本中提取。
+`kanban_complete(summary=..., metadata={...})` 是有意灵活的：summary 是人类可读的收尾说明，`metadata` 是机器可读的交接信息，下游 worker、操作员或仪表盘可以直接复用，无需从文本中提取。
 
-对于工程和审查任务，推荐使用以下可选 metadata 格式：
+对于工程和验证任务，推荐使用以下可选 metadata 格式：
 
 ```json
 {
@@ -310,7 +306,7 @@ kanban_create(
 
 kanban_create(
     title="audit auth flow",
-    assignee="reviewer",
+    assignee="qa-worker",
     skills=["security-pr-audit", "github-code-review"],
 )
 ```
@@ -323,7 +319,7 @@ hermes kanban create "translate README to Japanese" \
     --skill translation
 
 hermes kanban create "audit auth flow" \
-    --assignee reviewer \
+    --assignee qa-worker \
     --skill security-pr-audit \
     --skill github-code-review
 ```
@@ -565,10 +561,6 @@ hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
-hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
-hermes kanban request-changes <id> "<所需修改>"                       # reviewer -> implementer
-hermes kanban reopen-review  <id>... [--reason "..."]                 # 请求修改：'review' -> ready/todo
-
 hermes kanban tail <id>                                # 跟踪单个任务的事件流
 hermes kanban watch [--assignee P] [--tenant T]        # 将所有事件实时流式传输到终端
         [--kinds completed,blocked,…] [--interval SECS]
@@ -657,10 +649,10 @@ Gateway 平台有实际的消息长度限制。如果 `/kanban list`、`/kanban 
 |---|---|---|
 | **P1 扇出** | N 个同级，相同角色 | "并行研究 5 个角度" |
 | **P2 流水线** | 角色链：侦察 → 编辑 → 写作 | 每日简报组装 |
-| **P3 投票 / 法定人数** | N 个同级 + 1 个聚合器 | 3 个研究员 → 1 个审查者选择 |
+| **P3 投票 / 法定人数** | N 个同级 + 1 个聚合器 | 3 个研究员 → 1 个聚合 worker 选择 |
 | **P4 长期运行日志** | 相同配置文件 + 共享目录 + cron | Obsidian vault |
 | **P5 人工介入** | worker 阻塞 → 用户评论 → 解除阻塞 | 模糊决策 |
-| **P6 `@mention`** | 从文本内联路由 | `@reviewer look at this` |
+| **P6 `@mention`** | 从文本内联路由 | `@qa-worker inspect this` |
 | **P7 线程范围工作区** | 线程中的 `/kanban here` | 每项目 gateway 线程 |
 | **P8 批量任务** | 一个配置文件，N 个对象 | 50 个社交账号 |
 | **P9 分诊规格器** | 粗略想法 → `triage` → `hermes kanban specify` 扩展正文 → `todo` | "将这个一行描述变成规格化任务" |
@@ -768,7 +760,7 @@ board 数据库中的原子化逐事件认领可防止跨 gateway 的重复投�
 
 任务是一个逻辑工作单元；**运行**是执行它的一次尝试。当调度器认领一个就绪任务时，它在 `task_runs` 中创建一行，并将 `tasks.current_run_id` 指向它。当该尝试结束时 —— 完成、阻塞、崩溃、超时、启动失败、回收 —— 运行行以 `outcome` 关闭，任务的指针清除。被尝试三次的任务有三行 `task_runs`。
 
-为什么用两张表而不是直接修改任务：你需要**完整的尝试历史**用于真实世界的事后分析（"第二次审查尝试到达批准，第三次合并"），你需要一个干净的地方挂载每次尝试的元数据 —— 哪些文件改变了、哪些测试运行了、审查者注意到了哪些发现。这些是运行事实，不是任务事实。
+为什么用两张表而不是直接修改任务：你需要**完整的尝试历史**用于真实世界的事后分析（"第二次 worker 尝试修复失败，第三次完成"），你需要一个干净的地方挂载每次尝试的元数据 —— 哪些文件改变了、哪些测试运行了、worker 注意到了哪些缺陷。这些是运行事实，不是任务事实。
 
 运行也是**结构化交接**所在的地方。当 worker 完成任务（通过 `kanban_complete(...)`）时，它可以传递：
 

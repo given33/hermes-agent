@@ -1,0 +1,3 @@
+# DBB3 worker-local Hermes configuration. Secrets are injected by the service.
+gateway:
+  platforms: {}

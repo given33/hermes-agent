@@ -39,7 +39,7 @@ def test_hk_recovery_has_one_fixed_worker_action():
 def test_hk_recovery_receiver_and_tunnel_use_fixed_runtime_and_ports():
     receiver = _read("deploy/recovery/hermes-hk-managed-node-recovery.service")
     tunnel = _read("deploy/recovery/hermes-hk-managed-node-recovery-tunnel.service")
-    assert "/opt/hk-team/hermes-agent/.venv/bin/python" in receiver
+    assert "/opt/hk-team/hermes-agent/.fabric-current/.venv/bin/python" in receiver
     assert "--host 127.0.0.1 --port 9121" in receiver
     assert "--config /etc/hk-team/managed-nodes.json" in receiver
     assert "User=root" in receiver
@@ -78,14 +78,15 @@ def test_public_hk_recovery_route_uses_independent_token_and_loopback_tunnel():
 def test_fabric_updater_installs_and_rolls_back_hk_recovery_transaction():
     updater = _read("deploy/automation/update-fabric-node.sh")
     installer = "deploy/recovery/install-hk-managed-recovery.sh"
-    for asset in (
-        installer,
-        "deploy/recovery/hermes-hk-managed-node-recovery.service",
-        "deploy/recovery/hermes-hk-managed-node-recovery-tunnel.service",
-        "deploy/recovery/managed-nodes.hk.json",
-        "deploy/recovery/recover-hk.sh",
+    assert 'archive --format=tar "${release_commit}"' in updater
+    assert '| tar -xf - -C "${candidate_generation}"' in updater
+    assert 'archive_paths=(' not in updater
+    assert f'bash "${{preflight_root}}/{installer}"' in updater
+    for service in (
+        "hermes-hk-managed-node-recovery.service",
+        "hermes-hk-managed-node-recovery-tunnel.service",
     ):
-        assert f'"{asset}"' in updater
+        assert service in updater
     assert '"--handle-file=${receiver_handle}"' in updater
     assert '"--rollback-backup=${receiver_backup}"' in updater
 
@@ -94,3 +95,25 @@ def test_hk_github_deploy_verifies_recovery_services():
     workflow = _read(".github/workflows/deploy-three-endpoints.yml")
     assert "hermes-hk-managed-node-recovery.service" in workflow
     assert "hermes-hk-managed-node-recovery-tunnel.service" in workflow
+    assert "hermes-gateway-hk-worker.service" in workflow
+    assert "hk-cloud-connector.service" in workflow
+    assert 'current_generation="$(readlink -f -- "${current_link}")"' in workflow
+    assert 'diff-files --quiet' in workflow
+    assert 'worker.get("release") or {}' in workflow
+
+
+def test_hk_profile_and_gateway_are_initialized_independently():
+    bootstrap = _read("deploy/hk/install-hk-worker.sh")
+    connector = _read("deploy/hk/install-hk-cloud-connector-user.sh")
+    updater = _read("deploy/automation/update-fabric-node.sh")
+
+    assert 'hermes_home="${service_home}/.hermes/profiles/hk-worker"' in bootstrap
+    assert 'profile_root="${hermes_home}"' in bootstrap
+    assert 'hermes_home="${HK_CONNECTOR_HERMES_HOME:-${user_home}/.hermes/profiles/hk-worker}"' in connector
+    assert 'HERMES_CONNECTOR_PROFILE_TEMPLATE_ROOT="${here}/profile"' in connector
+    assert 'external_hermes_home="${HERMES_HK_HOME:-${service_home}/.hermes/profiles/hk-worker}"' in updater
+    assert 'HERMES_CONNECTOR_HERMES_HOME="${external_hermes_home}"' in updater
+    assert '"${external_hermes_home}/skills"' in updater
+    assert '"${current_link}/.venv/bin/hermes" -p hk-worker gateway install' in updater
+    assert "--force --start-now --start-on-login" in updater
+    assert '"${current_link}/.venv/bin/hermes" -p hk-worker gateway status' in updater

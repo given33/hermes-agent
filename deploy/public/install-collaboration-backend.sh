@@ -546,9 +546,22 @@ systemd_runtime_home="$(
 )"
 systemd_runtime_home="${systemd_runtime_home#\"}"; systemd_runtime_home="${systemd_runtime_home%\"}"
 systemd_runtime_home="${systemd_runtime_home#\'}"; systemd_runtime_home="${systemd_runtime_home%\'}"
-runtime_home="${HERMES_HOME_DIR:-${systemd_runtime_home:-${env_runtime_home:-${service_home}/.hermes}}}"
+dispatcher_home_default="${service_home}/.hermes/profiles/dispatcher"
+runtime_home="${HERMES_HOME_DIR:-${systemd_runtime_home:-${env_runtime_home:-${dispatcher_home_default}}}}"
 [[ -n "${runtime_home}" && "${runtime_home}" == /* ]] \
   || die "Hermes runtime home must be an absolute path"
+runtime_home="${runtime_home%/}"
+path_overlaps() {
+  local left="${1%/}" right="${2%/}"
+  [[ "${left}" == "${right}" || "${left}" == "${right}/"* \
+      || "${right}" == "${left}/"* ]]
+}
+for worker_home in "${service_home}/.hermes/profiles/dbb3-worker" \
+  "${service_home}/.hermes/profiles/hk-worker" \
+  "/mnt/d/Hermes/home/profiles/pc-worker"; do
+  ! path_overlaps "${runtime_home}" "${worker_home}" \
+    || die "dispatcher runtime home cannot overlap worker profile: ${worker_home}"
+done
 state_target="${HERMES_COLLABORATION_STATE_FILE:-${runtime_home}/collaboration/single.json}"
 config_target="${HERMES_CONFIG_FILE:-${runtime_home}/config.yaml}"
 ios_supervisor_target="${runtime_home}/ios-mcp-supervisor.db"

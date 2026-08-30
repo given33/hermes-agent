@@ -149,7 +149,7 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "done",
 ]
 
 
@@ -876,14 +876,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
-        review_assignee_deferred = (
-            payload.status == "review" and payload.assignee is not None
-        )
-
         # --- assignee ----------------------------------------------------
-        # For a combined assignee+review patch, request_review must capture
-        # the current implementer before routing the task to the reviewer.
-        if payload.assignee is not None and not review_assignee_deferred:
+        if payload.assignee is not None:
             try:
                 ok = kanban_db.assign_task(
                     conn, task_id, payload.assignee or None,
@@ -908,25 +902,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
-            elif s == "review":
-                # Manual "request review" from the board. Routes through
-                # request_review so it is NOT a
-                # block (never trips unblock-loop detection). Only valid from
-                # running/ready — a False return becomes the 409 toast below.
-                ok = kanban_db.request_review(
-                    conn, task_id, summary=payload.summary,
-                    metadata=payload.metadata,
-                    reviewer=(payload.assignee or None),
-                    # Dashboard PATCH is an explicit human action — allowed
-                    # to override a live worker claim (M1 guard).
-                    force=True,
-                )
-                if ok and review_assignee_deferred and not payload.assignee:
-                    ok = kanban_db.assign_task(conn, task_id, None)
             elif s == "ready":
-                # Re-open a blocked/scheduled/review task, or just an explicit
-                # status set. "Changes requested" (review -> ready) goes through
-                # reopen_review_task via _reopen_if_review.
+                # Re-open a blocked/scheduled task, recover a historical review
+                # row, or apply an explicit status set.
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
                     ok = kanban_db.unblock_task(conn, task_id)
@@ -1148,10 +1126,10 @@ def _set_status_direct(
                 conn, task_id, prev["current_run_id"]
             )
             if resume_status == "review":
+                # Review execution is retired. A reclaimed historical review
+                # run returns to the ordinary worker queue.
                 effective_status = (
-                    "review"
-                    if kanban_db._parents_satisfied(conn, task_id)
-                    else "todo"
+                    "ready" if kanban_db._parents_satisfied(conn, task_id) else "todo"
                 )
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.
@@ -1223,7 +1201,7 @@ def _set_status_direct(
     for pid, claim_lock in terminations:
         kanban_db._terminate_reclaimed_worker(pid, claim_lock)
     # If we re-opened something, children may have gone stale.
-    if effective_status in {"done", "ready", "review"}:
+    if effective_status in {"done", "ready"}:
         kanban_db.recompute_ready(conn)
     return True
 
@@ -1350,15 +1328,6 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         )
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
-                    elif s == "review":
-                        # Non-block review handoff (mirror of PATCH /tasks/{id}).
-                        ok = kanban_db.request_review(
-                            conn, tid, summary=payload.summary,
-                            metadata=payload.metadata,
-                            reviewer=(payload.assignee or None),
-                            # Bulk dashboard action: explicit human override.
-                            force=True,
-                        )
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):

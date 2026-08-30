@@ -693,50 +693,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
-    p_request_review = sub.add_parser(
-        "request-review",
-        help="Move a task to 'review' (implementation done, awaiting review) — NOT a block",
-    )
-    p_request_review.add_argument("task_id")
-    p_request_review.add_argument(
-        "--summary", default=None,
-        help="What was implemented and how it was verified — shown to the reviewer.",
-    )
-    p_request_review.add_argument(
-        "--reviewer", default=None,
-        help="Optional reviewer profile; reassigns the task before review dispatch.",
-    )
-    p_request_review.add_argument(
-        "--metadata", default=None,
-        help="JSON object with structured reviewer handoff facts.",
-    )
-    p_request_review.add_argument(
-        "--force", action="store_true",
-        help=(
-            "Override the live-claim guard: move a running, claimed task to "
-            "review even without owning its run (clears the worker's claim)."
-        ),
-    )
-
-    p_request_changes = sub.add_parser(
-        "request-changes",
-        help="Reviewer verdict: return the active review run to its implementer",
-    )
-    p_request_changes.add_argument("task_id")
-    p_request_changes.add_argument(
-        "reason", nargs="+", help="Concrete changes required before re-review",
-    )
-
-    p_reopen_review = sub.add_parser(
-        "reopen-review",
-        help="Send one or more review tasks back for changes (review -> ready/todo)",
-    )
-    p_reopen_review.add_argument("task_ids", nargs="+")
-    p_reopen_review.add_argument(
-        "--reason", default=None,
-        help="Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons.",
-    )
-
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -1168,9 +1124,6 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
-            "request-review": _cmd_request_review,
-            "request-changes": _cmd_request_changes,
-            "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -2376,8 +2329,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
-            # to every terminal handoff so request-review cannot bypass the
-            # acceptance contract that protects complete.
+            # to every completion so alternate execution surfaces cannot
+            # bypass the acceptance contract.
             task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(
                 task,
@@ -2512,110 +2465,6 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
-    return 0 if not failed else 1
-
-
-def _cmd_request_review(args: argparse.Namespace) -> int:
-    tid = args.task_id
-    summary = getattr(args, "summary", None)
-    if summary is not None:
-        summary = summary.strip() or None
-    raw_metadata = getattr(args, "metadata", None)
-    metadata = None
-    if raw_metadata:
-        try:
-            metadata = json.loads(raw_metadata)
-            if not isinstance(metadata, dict):
-                raise ValueError("must be a JSON object")
-        except (ValueError, json.JSONDecodeError) as exc:
-            print(f"kanban: --metadata: {exc}", file=sys.stderr)
-            return 2
-    reviewer = getattr(args, "reviewer", None)
-    with kb.connect_closing() as conn:
-        rejection = _goal_mode_handoff_rejection(
-            kb.get_task(conn, tid),
-            summary or "",
-        )
-        if rejection is not None:
-            print(
-                f"kanban: goal review handoff of {tid} rejected by judge: "
-                f"{rejection}. Provide acceptance evidence matching the task.",
-                file=sys.stderr,
-            )
-            return 1
-        ok, reason = kb.request_review(
-            conn,
-            tid,
-            summary=summary,
-            metadata=metadata,
-            reviewer=reviewer,
-            expected_run_id=_worker_run_id_for(tid),
-            force=bool(getattr(args, "force", False)),
-            with_reason=True,
-        )
-        if not ok:
-            detail = reason or "not running/ready?"
-            print(
-                f"cannot request review for {tid}: {detail}",
-                file=sys.stderr,
-            )
-            return 1
-        persisted_run = kb.latest_run(conn, tid)
-        display_summary = persisted_run.summary if persisted_run else None
-        print(
-            f"Requested review for {tid}"
-            + (f": {display_summary}" if display_summary else "")
-        )
-    return 0
-
-
-def _cmd_request_changes(args: argparse.Namespace) -> int:
-    tid = args.task_id
-    reason = " ".join(args.reason).strip()
-    with kb.connect_closing() as conn:
-        ok, detail = kb.request_changes(
-            conn,
-            tid,
-            reason=reason,
-            expected_run_id=_worker_run_id_for(tid),
-        )
-        if not ok:
-            print(
-                f"cannot request changes for {tid}: {detail or 'invalid review state'}",
-                file=sys.stderr,
-            )
-            return 1
-        print(
-            f"Requested changes for {tid}"
-            + (f"; routed to {detail}" if detail else "")
-        )
-    return 0
-
-
-def _cmd_reopen_review(args: argparse.Namespace) -> int:
-    ids = list(args.task_ids or [])
-    if not ids:
-        print("at least one task_id is required", file=sys.stderr)
-        return 1
-    reason = getattr(args, "reason", None)
-    if reason is not None:
-        reason = str(kb.redact_review_value(reason.strip())).strip() or None
-    author = _profile_author() if reason else None
-    failed: list[str] = []
-    with kb.connect_closing() as conn:
-        for tid in ids:
-            if not kb.reopen_review_task(conn, tid):
-                failed.append(tid)
-                print(f"cannot reopen {tid} (not in review?)", file=sys.stderr)
-            else:
-                if reason:
-                    kb.add_comment(
-                        conn,
-                        tid,
-                        author or "operator",
-                        f"CHANGES REQUESTED: {reason}",
-                    )
-                print(f"Reopened {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
 
@@ -3450,7 +3299,6 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
-  `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards

@@ -18,7 +18,7 @@ fi
 runtime_root="${HERMES_DBB3_AGENT_ROOT:-/usr/local/lib/hermes-agent}"
 runtime_python="${HERMES_DBB3_RUNTIME_PYTHON:-${runtime_root}/venv/bin/python}"
 receiver_user="${HERMES_DBB3_RECEIVER_USER:-hermes}"
-receiver_home="${HERMES_DBB3_HOME:-/home/hermes/.hermes}"
+receiver_home="${HERMES_DBB3_HOME:-/home/hermes/.hermes/profiles/dbb3-worker}"
 config_source="${repo}/deploy/recovery/managed-installations.dbb3.json"
 unit_source="${repo}/deploy/recovery/hermes-managed-installation-receiver.service"
 config_target="${receiver_home}/managed-installations.json"

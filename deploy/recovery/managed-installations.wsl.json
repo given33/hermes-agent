@@ -2,8 +2,8 @@
   "installation_receiver": {
     "node_id": "wsl",
     "token_file": "/etc/pc-team/managed-installation-token",
-    "state_file": "/mnt/d/Hermes/home/managed-installations.db",
-    "project_root": "/mnt/d/Hermes/home/managed-projects",
+    "state_file": "/mnt/d/Hermes/home/profiles/pc-worker/managed-installations.db",
+    "project_root": "/mnt/d/Hermes/home/profiles/pc-worker/managed-projects",
     "release_evidence_file": "/var/lib/hermes-agent-fabric-update/wsl/release.json"
   }
 }

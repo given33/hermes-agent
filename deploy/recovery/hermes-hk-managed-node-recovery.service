@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/hk-team/hermes-agent/.venv/bin/python -m hermes_cli.managed_node_recovery_service --host 127.0.0.1 --port 9121 --config /etc/hk-team/managed-nodes.json
+ExecStart=/opt/hk-team/hermes-agent/.fabric-current/.venv/bin/python -m hermes_cli.managed_node_recovery_service --host 127.0.0.1 --port 9121 --config /etc/hk-team/managed-nodes.json
 Restart=always
 RestartSec=5
 User=root

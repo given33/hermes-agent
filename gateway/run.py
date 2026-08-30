@@ -22858,8 +22858,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         # The --until judge is a sync aux-LLM call — keep it off the event loop.
-        decision = await asyncio.get_running_loop().run_in_executor(
-            None, mgr.complete_tick, final_response or ""
+        # Preserve the active profile home and secret scope across the
+        # executor hop.  ``complete_tick`` may run the synchronous --until
+        # judge; a bare executor would make a secondary profile unscoped and
+        # allow auxiliary provider resolution to borrow the default profile.
+        decision = await self._run_in_executor_with_context(
+            mgr.complete_tick, final_response or ""
         )
         msg = decision.get("message") or ""
         if msg and source is not None:

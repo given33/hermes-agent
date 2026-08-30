@@ -142,65 +142,46 @@ hermes gateway start
 
 ## 场景三 — 角色流水线与重试
 
-这正是 Kanban 相比普通 TODO 列表的价值所在。PM 编写规格说明，工程师实现，审查者拒绝第一次尝试，工程师修改后再次尝试，审查者批准。
+这正是 Kanban 相比普通 TODO 列表的价值所在。调度员把规格拆成有依赖关系的任务卡；每个 worker 实现并自验自己的任务，下游 QA 或发布 worker 再消费结构化交接。
 
 dashboard 视图，按 `auth-project` 筛选：
 
 ![Pipeline view for a multi-role feature](/img/kanban-tutorial/08-pipeline-auth.png)
 
-此截图使用**预创建下游审查卡**模型：实现卡有一个专用 reviewer 子卡。在该模型中，实现完成后工程师必须调用 `kanban_complete`，这样 reviewer 子卡才能离开 `todo`。不要为了请求审查而阻塞实现父卡。
+此截图展示预创建下游卡。每条通道都只是普通 worker 任务：implementation worker 仅在检查通过后调用 `kanban_complete`，随后依赖它的 QA 卡才能离开 `todo`。不要为了制造批准阶段而阻塞实现父卡。
 
-如果同一张卡同时承载实现和审查，请改用一等 review lifecycle。完整的实现 → 审查 → 修改 → 再审流程如下：
+完整的实现与下游验证流程如下：
 
 ```python
-# --- 工程师：第一次实现 ---
+# --- Implementation worker ---
 kanban_show()
-# （编写代码、运行测试、准备候选版本）
-kanban_request_review(
-    summary="implemented reset flow; candidate is ready for review",
-    metadata={"changed_files": ["auth/reset.py"], "tests_run": 8},
-    reviewer="reviewer",
-)
-# → 同一张卡进入 review；实现 run 以 outcome='review_requested' 关闭
-
-# --- Reviewer：请求修改 ---
-kanban_show()
-# （检查 handoff 和候选版本）
-kanban_request_changes(
-    reason="Add password-strength validation and make reset tokens single-use."
-)
-# → review run 以 outcome='changes_requested' 关闭；卡片返回 backend-dev
-#   的 ready/todo，且不会触碰 block-loop 计数
-
-# --- 工程师：第二次实现 ---
-kanban_show()  # worker_context 中包含之前的审查证据
-# （应用反馈并重新运行测试）
-kanban_request_review(
-    summary="added zxcvbn validation and single-use reset tokens",
+# （编写代码、运行测试、修复失败并重新检查）
+kanban_complete(
+    summary="implemented reset flow and verified reset-token behavior",
     metadata={
-        "changed_files": [
-            "auth/reset.py",
-            "auth/tests/test_reset.py",
-            "migrations/003_single_use_reset_tokens.sql",
-        ],
+        "changed_files": ["auth/reset.py", "auth/tests/test_reset.py"],
         "tests_run": 11,
-        "review_iteration": 2,
     },
-    reviewer="reviewer",
 )
+# -> implementation 卡完成，依赖它的下游卡进入 ready
 
-# --- Reviewer：批准 ---
-kanban_complete(summary="review passed; acceptance criteria verified")
-# → done
+# --- 下游 QA worker ---
+kanban_show()
+# （读取父级交接，运行集成检查并发布结果）
+kanban_complete(
+    summary="integration checks passed; reset tokens are single-use",
+    metadata={"tests_run": 6, "suite": "auth-integration"},
+)
+# -> done
 ```
 
-任务的 run 历史现在记录 `review_requested → changes_requested → review_requested → completed`。每次尝试都有独立的 actor、summary、metadata 和 outcome，因此第二次工程师运行能准确看到被拒绝的原因，最终批准也可审计。`kanban_block` 只用于真正的外部升级（缺少访问权限、产品决策、基础设施不可用），而不是普通审查反馈。
+任务图现在记录两个普通 worker 的完成结果和验证证据。worker 遇到可修复缺陷时继续在自己的任务卡中处理；`kanban_block` 只用于真正的外部依赖（缺少访问权限、产品决策、基础设施不可用）。
 
-如果你有意使用截图中的下游卡模型，reviewer 会在实现父卡完成后打开 `Review password reset PR`：
+实现父卡完成后，下游 worker 会打开自己的任务卡：
 
-![Reviewer's drawer view of the pipeline](/img/kanban-tutorial/09-drawer-pipeline-review.png)
+![Downstream worker drawer view of the pipeline](/img/kanban-tutorial/09-drawer-pipeline-review.png)
 
-reviewer 卡的 `worker_context` 包含已完成实现的 handoff。这是独立卡工作流；不要再与同卡 `kanban_request_review` 混用，否则会重复创建审查通道。
+下游卡的 `worker_context` 包含已完成实现的 handoff，因此可以验证准确产物，而无需引入额外角色或隐藏批准循环。
 
 ## 场景四 — 熔断器与崩溃恢复
 
@@ -266,7 +247,7 @@ Run 1 — `crashed`，错误为 `OOM kill at row 2.3M (process 99999 gone)`。Ru
 - B 的**先前尝试**（之前的 run：outcome、summary、error、metadata），让重试的 worker 不会重蹈失败的路径。
 - **父任务结果** — 对于每个父任务，最近一次已完成 run 的 summary 和 metadata——让下游 worker 能看到上游工作的原因和方式。
 
-这取代了平面 kanban 系统中"翻查评论和工作输出"的繁琐流程。PM 在规格说明的 metadata 中编写验收标准，工程师的 worker 在父任务交接中以结构化形式看到它们。工程师记录运行了哪些测试以及通过了多少，审查者的 worker 在打开 diff 之前就已掌握该列表。
+这取代了平面 kanban 系统中"翻查评论和工作输出"的繁琐流程。调度员在规格说明的 metadata 中编写验收标准，implementation worker 在父任务交接中以结构化形式看到它们。该 worker 记录运行了哪些测试以及通过了多少，下游 QA worker 在验证集成结果前就已掌握该列表。
 
 批量关闭保护的存在正是因为这些数据是按 run 存储的。`hermes kanban complete a b c --summary X`（你，从 CLI 执行）会被拒绝——将相同的 summary 复制粘贴到三个任务几乎总是错误的。不带交接标志的批量关闭仍然适用于常见的"我完成了一堆行政任务"场景。工具界面根本不提供批量变体；`kanban_complete` 始终是单任务操作，原因相同。
 

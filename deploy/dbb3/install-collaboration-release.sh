@@ -28,7 +28,12 @@ if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
-expected_stage="/home/hermes/.hermes/deploy/collaboration-${version}"
+dbb3_home="${HERMES_DBB3_HOME:-/home/hermes/.hermes/profiles/dbb3-worker}"
+[[ "${dbb3_home}" =~ ^/[A-Za-z0-9._/-]+$ && ! -L "${dbb3_home}" ]] || {
+  echo "DBB3 worker Hermes home is unsafe." >&2
+  exit 1
+}
+expected_stage="${dbb3_home}/deploy/collaboration-${version}"
 if [[ "${stage}" != "${expected_stage}" ]]; then
   echo "Release stage must be ${expected_stage}." >&2
   exit 1
@@ -109,7 +114,7 @@ plugin_target="/usr/local/lib/hermes-agent/plugins/collaboration/dashboard"
 cloud_file_target="/usr/local/lib/hermes-agent/hermes_cli/cloud_file_library.py"
 web_target="/usr/local/lib/hermes-agent/hermes_cli/web_dist"
 stamp="$(date +%Y%m%d-%H%M%S)"
-backup="/home/hermes/.hermes/backups/collaboration-${version}-${stamp}"
+backup="${dbb3_home}/backups/collaboration-${version}-${stamp}"
 
 mkdir -p "${backup}"
 cp -a "${plugin_target}" "${backup}/dashboard"

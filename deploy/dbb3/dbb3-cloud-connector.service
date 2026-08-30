@@ -18,7 +18,7 @@ RestartPreventExitStatus=65 78
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=%h/.hermes %h/.local/state/dbb3-cloud-connector
+ReadWritePaths=%h/.hermes/profiles/dbb3-worker %h/.local/state/dbb3-cloud-connector
 
 [Install]
 WantedBy=default.target

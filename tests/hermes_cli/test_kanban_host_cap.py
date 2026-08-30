@@ -206,7 +206,7 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 
 
 # ---------------------------------------------------------------------------
-# 3. Review lane cannot be starved by a sustained ready backlog (P2)
+# 3. Retired review rows never consume worker dispatch capacity
 # ---------------------------------------------------------------------------
 
 
@@ -216,7 +216,7 @@ def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
     return tid
 
 
-def test_review_lane_gets_reserved_slot_under_ready_backlog(
+def test_review_lane_gets_no_reserved_slot_under_ready_backlog(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     import hermes_cli.config as cfgmod
@@ -235,9 +235,9 @@ def test_review_lane_gets_reserved_slot_under_ready_backlog(
         )
 
     spawned_ids = [s[0] for s in res.spawned]
-    # Budget 2: one ready + the reserved review slot — never 2×ready.
+    # Budget 2 is entirely available to ordinary workers.
     assert len(spawned_ids) == 2
-    assert review_id in spawned_ids
+    assert review_id not in spawned_ids
 
 
 def test_review_reservation_released_when_no_review_work(
@@ -290,10 +290,10 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     assert len(res.spawned) == 2
 
 
-def test_review_budget_still_bounded_by_shared_cap(
+def test_retired_review_rows_are_not_spawned_under_shared_cap(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    """The reservation caps the ready lane; it grants review no extra slots."""
+    """Only the ready worker is eligible when old review rows remain."""
     import hermes_cli.config as cfgmod
     monkeypatch.setattr(
         cfgmod, "load_config",
@@ -303,11 +303,12 @@ def test_review_budget_still_bounded_by_shared_cap(
     spawns: list = []
     with kb.connect() as conn:
         kb.create_task(conn, title="ready-1", assignee="alice")
+        review_ids: list[str] = []
         for i in range(3):
-            _park_in_review(conn, f"review-{i}", "reviewer")
+            review_ids.append(_park_in_review(conn, f"review-{i}", "reviewer"))
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
-    # Budget 2 total across both lanes, reservation notwithstanding.
-    assert len(res.spawned) == 2
+    assert len(res.spawned) == 1
+    assert all(task_id not in review_ids for task_id, *_ in res.spawned)

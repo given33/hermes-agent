@@ -50,32 +50,30 @@ Hermes Kanban 拥有生命周期的真实状态——`ready` → `running` → `
 
 每次 claim 必须以以下之一结束：
 
-- `kanban_complete(summary=..., metadata=...)` — 任务成功，状态切换为 `done`。
-- `kanban_request_review(summary=..., metadata=..., reviewer=...)` — 同卡实现进入一等审查。默认由内置 `sdlc-review` skill 启动 reviewer；reviewer 可用 `kanban_complete` 批准、用 `kanban_request_changes` 退回原 implementer，或仅在真正需要外部介入时 block。
+- `kanban_complete(summary=..., metadata=...)` — worker 完成实现和自验后，任务状态切换为 `done`。
 - `kanban_block(reason=...)` — 任务等待人工输入，状态切换为 `blocked`。调度器在 `kanban_unblock` 运行时重新生成。
 - worker 进程退出而未调用任何工具。内核回收该进程并发出 `crashed`（PID 已消亡）、`gave_up`（连续失败断路器触发）或 `timed_out`（超过 max_runtime）。这是失败路径；健康的 worker 不会在此结束。
 
 kanban 内核强制要求每次运行恰好由其中一项终止。既未调用任何终止工具又正常退出的 worker 将被视为崩溃。
 
-## 输出与审查交接
+## 输出与下游交接
 
-代码变更任务必须按照任务图选择审查模型：
+代码变更任务由 worker 先运行验收检查，再把证据写入完成交接：
 
-- **同卡审查：**调用 `kanban_request_review(summary=..., metadata=..., reviewer=...)`。任务进入 `review`，不会触碰 block 循环计数。默认情况下，调度器使用内置 `sdlc-review` skill 启动 reviewer。Reviewer 用 `kanban_complete` 批准，用 `kanban_request_changes(reason=...)` 关闭审查 run 并将任务退回原 implementer，或只在真正需要外部决策时 block。
-- **预先创建的下游 review/QA/release 卡：**`kanban_show` 会列出 child ID；选择终止动作前，先用 `kanban_show(task_id=...)` 检查这些卡。如果 child 是下游 review/QA/release 阶段，implementation 阶段必须调用 `kanban_complete`。子卡只有在父卡为 `done`/`archived` 后才能启动。不要再请求同卡审查，也不要用 `review-required:` sticky-block 父卡，否则会让下游通道卡死或重复。
-- **纯人工审查看板：**设置 `kanban.review_dispatch: false`。任务会停在 `review`，直到人工批准，或通过 `reopen-review`/仪表盘退回 `ready`/`todo`。
+- **同一任务：**实现、运行验收检查，然后调用 `kanban_complete` 并附带结果与验证元数据。
+- **预先创建的下游 QA/release 卡：**`kanban_show` 会列出 child ID；implementation worker 自验并完成父卡后，下游 worker 才能启动。不要仅为制造批准阶段而 sticky-block 父卡。
 
-两种审查模型都在生命周期转换本身携带结构化 `summary` 和 `metadata`。这些字段会持久保存，因此不得写入 secret、token 或原始 PII。
+完成转换本身携带结构化 `summary` 和 `metadata`。这些字段会持久保存，因此不得写入 secret、token 或原始 PII。
 
-自动注入的 `KANBAN_GUIDANCE` 同时说明两种任务图、同卡审查循环、`kanban_complete` 和真正外部阻塞所用的 `kanban_block`。
+自动注入的 `KANBAN_GUIDANCE` 同时说明两种任务图、`kanban_complete` 和真正外部阻塞所用的 `kanban_block`。
 
 ## 日志与审计追踪
 
 调度器将每个任务的 worker stdout/stderr 写入 `<board-root>/logs/<task_id>.log`。日志可通过 kanban 元数据进行审计：
 
 - `task_runs` 行携带 `log_path`、退出码（如有）、摘要和元数据。
-- `task_events` 行携带每次状态转换（`promoted`、`claimed`、`heartbeat`、`completed`、`blocked`、`review_requested`、`changes_requested`、`review_reopened`、`gave_up`、`crashed`、`timed_out`、`reclaimed`、`claim_extended`）。
-- `kanban_show` 同时返回两者，因此 reviewer（或后续 worker）读取任务时无需访问仪表板即可获得完整历史。
+- `task_events` 行携带当前状态转换（`promoted`、`claimed`、`heartbeat`、`completed`、`blocked`、`gave_up`、`crashed`、`timed_out`、`reclaimed`、`claim_extended`）以及历史迁移事件。
+- `kanban_show` 同时返回两者，因此后续 worker 读取任务时无需访问仪表板即可获得完整历史。
 
 仪表板以摘要、元数据块和退出状态徽章渲染运行历史。CLI 用户可运行 `hermes kanban tail <task_id>` 实时跟踪，或运行 `hermes kanban runs <task_id>` 查看历史尝试列表。
 

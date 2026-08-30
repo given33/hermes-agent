@@ -52,10 +52,17 @@ class MemoryProviderSetupRequest(BaseModel):
 
 class CustomEndpointUpdate(BaseModel):
     id: str = ""
-    name: str
-    base_url: str
-    model: str
+    name: str = ""
+    base_url: str = ""
+    model: str = ""
     api_key: Optional[str] = None
+    api_mode: Optional[
+        Literal["chat_completions", "codex_responses", "anthropic_messages"]
+    ] = None
+    reasoning_effort: Optional[
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+    ] = None
+    validation_mode: Literal["catalog", "inference"] = "catalog"
     context_length: Optional[int] = None
     discover_models: bool = True
     make_default: bool = False

@@ -2076,7 +2076,7 @@ class DBB3CloudConnector:
         self.attachment_root.mkdir(parents=True, exist_ok=True)
         roots = artifact_roots or os.environ.get(
             "DBB3_CONNECTOR_ARTIFACT_ROOTS",
-            "/home/hermes/.hermes:/opt/dbb3-team",
+            "/home/hermes/.hermes/profiles/dbb3-worker:/opt/dbb3-team",
         ).split(os.pathsep)
         self.artifact_roots = [Path(root).expanduser().resolve() for root in roots if str(root).strip()]
         self._wake_event = threading.Event()
@@ -2086,7 +2086,11 @@ class DBB3CloudConnector:
         self._heartbeat_thread: threading.Thread | None = None
         self._drain_file = Path(
             os.environ.get("HERMES_CONNECTOR_DRAIN_FILE", "")
-            or Path.home() / ".hermes" / ".drain_request.json"
+            or Path.home()
+            / ".local"
+            / "state"
+            / "dbb3-cloud-connector"
+            / "drain_request.json"
         )
         private_artifact_root = self.attachment_root.resolve()
         if private_artifact_root not in self.artifact_roots:
@@ -2802,9 +2806,9 @@ class DBB3CloudConnector:
             else:
                 summary = "等待人工输入：worker 请求人工决策后暂停。"
         runs = detail.get("runs") if isinstance(detail.get("runs"), list) else []
-        # Structured handoffs (manager plans, supervisor verdicts, reviewer
-        # verdicts) are delivered via the terminal run's metadata when the
-        # worker follows the handoff protocol. Prefer that JSON over the
+        # Structured dispatcher plans and worker completion payloads are
+        # delivered via the terminal run's metadata when the worker follows
+        # the handoff protocol. Prefer that JSON over the
         # free-text summary so the server-side strict parsers see the exact
         # schema instead of a natural-language paraphrase.
         terminal_handoff = ""
@@ -2890,7 +2894,7 @@ class DBB3CloudConnector:
             "summary": summary,
             # Workers hand off via ``task_runs.summary``; ``tasks.result``
             # stays NULL unless explicitly passed. Prefer the structured
-            # handoff JSON (manager plans / supervisor verdicts), then any
+            # handoff JSON (dispatcher plans / worker results), then any
             # JSON embedded in the narrative summary (format drift wraps the
             # required schema in prose), then the surfaced latest summary, so
             # terminal checkpoints never report an empty or paraphrased result

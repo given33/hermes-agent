@@ -72,7 +72,7 @@ def test_board_empty(client):
     data = r.json()
     # All canonical columns present (triage + the rest), each empty.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
+    assert set(names) == kb.VALID_STATUSES - {"archived", "review"}
     for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
@@ -225,50 +225,24 @@ def test_task_detail_includes_links_and_events(client):
 # ---------------------------------------------------------------------------
 
 
-def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
-    secret = "ghp_" + "D" * 40
+def test_patch_review_status_is_retired(client):
     task = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "review me", "assignee": "builder"},
+        "/api/plugins/kanban/tasks", json={"title": "worker task", "assignee": "builder"},
     ).json()["task"]
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
-        json={
-            "status": "review",
-            "assignee": "reviewer",
-            "summary": f"Implementation ready. {secret}",
-            "metadata": {"tests_run": 4, "token": secret},
-        },
+        json={"status": "review"},
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["task"]["status"] == "review"
+    assert response.status_code == 400
+    assert response.json()["detail"] == "unknown status: review"
     with kb.connect() as conn:
-        run = kb.latest_run(conn, task["id"])
-        assert run is not None
-        assert run.outcome == "review_requested"
-        assert run.metadata is not None
-        assert run.metadata["tests_run"] == 4
-        assert secret not in str(run.summary)
-        assert secret not in json.dumps(run.metadata)
-        review_event = [
-            event for event in kb.list_events(conn, task["id"])
-            if event.kind == "review_requested"
-        ][-1]
-        assert secret not in json.dumps(review_event.payload)
-        assert review_event.payload is not None
-        assert review_event.payload["implementer"] == "builder"
-        assert review_event.payload["reviewer"] == "reviewer"
-
-    response = client.patch(
-        f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"status": "ready"},
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["task"]["status"] == "ready"
-    assert response.json()["task"]["assignee"] == "builder"
-    with kb.connect() as conn:
-        assert any(
-            event.kind == "review_reopened"
+        current = kb.get_task(conn, task["id"])
+        assert current is not None
+        assert current.status == "ready"
+        assert current.assignee == "builder"
+        assert not any(
+            event.kind == "review_requested"
             for event in kb.list_events(conn, task["id"])
         )
 
@@ -310,7 +284,7 @@ def test_reopening_parent_demotes_ready_child(client):
     assert child_after_reopen["status"] == "todo"
 
 
-def test_reopening_parent_retracts_review_and_blocks_approval(client):
+def test_reopening_parent_retracts_legacy_review_and_requires_worker_rerun(client):
     with kb.connect() as conn:
         parent_id = kb.create_task(conn, title="parent", assignee="planner")
         assert kb.complete_task(conn, parent_id)
@@ -365,14 +339,14 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kb.connect() as conn:
         child = kb.get_task(conn, child_id)
         assert child is not None
-        assert child.status == "review"
-        review = kb.claim_review_task(conn, child_id)
-        assert review is not None
+        assert child.status == "ready"
+        rerun = kb.claim_task(conn, child_id)
+        assert rerun is not None
         assert kb.complete_task(
             conn,
             child_id,
-            summary="approved after parent stabilized",
-            expected_run_id=review.current_run_id,
+            summary="self-verified after parent stabilized",
+            expected_run_id=rerun.current_run_id,
         )
         grandchild = kb.get_task(conn, grandchild_id)
         assert grandchild is not None
@@ -428,7 +402,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         assert grandchild is not None and grandchild.status == "todo"
 
 
-def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
+def test_dashboard_recovers_historical_review_into_worker_queue(client):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="active review", assignee="reviewer")
         implementation = kb.claim_task(conn, task_id)
@@ -447,14 +421,14 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         json={"status": "ready"},
     )
     assert response.status_code == 200, response.text
-    assert response.json()["task"]["status"] == "review"
+    assert response.json()["task"]["status"] == "ready"
     assert response.json()["task"]["assignee"] == "reviewer"
     with kb.connect() as conn:
         run = kb.latest_run(conn, task_id)
         assert run is not None
         assert run.outcome == "reclaimed"
         next_review = kb.claim_review_task(conn, task_id)
-        assert next_review is not None
+        assert next_review is None
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +595,7 @@ def test_bulk_status_ready(client):
     assert {a["id"], b["id"], c2["id"]}.issubset(ids)
 
 
-def test_bulk_review_assignment_preserves_implementer_provenance(client):
+def test_bulk_review_status_is_retired(client):
     tasks = [
         client.post(
             "/api/plugins/kanban/tasks",
@@ -634,25 +608,22 @@ def test_bulk_review_assignment_preserves_implementer_provenance(client):
         json={
             "ids": [task["id"] for task in tasks],
             "status": "review",
-            "assignee": "reviewer",
-            "summary": "ready",
         },
     )
     assert response.status_code == 200, response.text
-    assert all(item["ok"] for item in response.json()["results"])
+    results = response.json()["results"]
+    assert all(not item["ok"] for item in results)
+    assert all(item["error"] == "unknown status 'review'" for item in results)
     with kb.connect() as conn:
         for task in tasks:
             current = kb.get_task(conn, task["id"])
             assert current is not None
-            assert current.status == "review"
-            assert current.assignee == "reviewer"
-            event = [
-                item for item in kb.list_events(conn, task["id"])
-                if item.kind == "review_requested"
-            ][-1]
-            assert event.payload is not None
-            assert event.payload["implementer"] == "builder"
-            assert event.payload["reviewer"] == "reviewer"
+            assert current.status == "ready"
+            assert current.assignee == "builder"
+            assert not any(
+                item.kind == "review_requested"
+                for item in kb.list_events(conn, task["id"])
+            )
 
 
 def test_bulk_status_done_forwards_completion_summary(client):
@@ -736,7 +707,9 @@ def test_dashboard_done_actions_prompt_for_completion_summary():
     """
 
     repo_root = Path(__file__).resolve().parents[2]
-    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    js = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text(encoding="utf-8")
 
     import re
 
@@ -831,7 +804,7 @@ def test_dashboard_surfaces_ready_blocked_error_inline():
     repo_root = Path(__file__).resolve().parents[2]
     bundle = (
         repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    ).read_text()
+    ).read_text(encoding="utf-8")
 
     # Helper that strips ``"409: {\"detail\":\"…\"}"`` down to the
     # human-readable message before it lands in any banner.
@@ -859,7 +832,7 @@ def test_dashboard_dependency_selects_use_value_change_handler():
     repo_root = Path(__file__).resolve().parents[2]
     bundle = (
         repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    ).read_text()
+    ).read_text(encoding="utf-8")
 
     parent_select = (
         'value: newParent,\n'
@@ -1228,5 +1201,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-

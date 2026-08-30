@@ -75,7 +75,7 @@ def test_connector_units_use_each_roles_project_runtime():
             "/mnt/d/Hermes/hermes-agent/venv/bin/python"
         ),
         "deploy/hk/hk-cloud-connector.service": (
-            "/opt/hk-team/hermes-agent/.venv/bin/python"
+            "/opt/hk-team/hermes-agent/.fabric-current/.venv/bin/python"
         ),
     }
     for relative, runtime in expected.items():
@@ -98,7 +98,12 @@ def test_connector_installers_gate_on_project_runtime_websockets():
     assert "websockets.sync.client" in shared
     assert '"${runtime_python}" "${source_file}" --probe' in shared
     assert "/mnt/d/Hermes/hermes-agent/venv/bin/python" in pc
-    assert "/opt/hk-team/hermes-agent/.venv/bin/python" in hk
+    assert "/opt/hk-team/hermes-agent/.fabric-current/.venv/bin/python" in hk
+    assert 'pc_home="${PC_CONNECTOR_HERMES_HOME:-/mnt/d/Hermes/home/profiles/pc-worker}"' in pc
+    assert 'hermes_home="${HK_CONNECTOR_HERMES_HOME:-${user_home}/.hermes/profiles/hk-worker}"' in hk
+    assert 'hermes_home="${HERMES_CONNECTOR_HERMES_HOME:-${user_home}/.hermes/profiles/dbb3-worker}"' in shared
+    assert "HERMES_HOME=${hermes_home}" in shared
+    assert "DBB3_CONNECTOR_ARTIFACT_ROOTS=${DBB3_CONNECTOR_ARTIFACT_ROOTS:-${hermes_home}" in shared
 
 
 def test_fabric_updater_requires_new_online_worker_generation_and_release():
@@ -112,4 +117,12 @@ def test_fabric_updater_requires_new_online_worker_generation_and_release():
     assert 'worker.get("fresh") is True' in updater
     assert 'release.get("commit")' in updater
     assert 'release.get("version")' in updater
+    assert 'payload.get("connector_id")' in updater
+    assert 'worker.get("managed_node_id")' in updater
     assert "target worker WebSocket generation/release did not become healthy" in updater
+    health_gate = updater.index(
+        "target worker WebSocket generation/release did not become healthy"
+    )
+    deployed_sha = updater.index('mv -f -- "${deployed_file}.new.$$"')
+    assert health_gate < deployed_sha
+    assert 'hermes" -p hk-worker gateway status' in updater

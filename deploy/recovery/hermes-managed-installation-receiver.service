@@ -9,16 +9,16 @@ User=hermes
 Group=hermes
 WorkingDirectory=/usr/local/lib/hermes-agent
 Environment=HOME=/home/hermes
-Environment=HERMES_HOME=/home/hermes/.hermes
+Environment=HERMES_HOME=/home/hermes/.hermes/profiles/dbb3-worker
 Environment=PYTHONPATH=/usr/local/lib/hermes-agent
-ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m hermes_cli.managed_node_recovery_service --host 10.66.0.2 --port 9122 --config /home/hermes/.hermes/managed-installations.json
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m hermes_cli.managed_node_recovery_service --host 10.66.0.2 --port 9122 --config /home/hermes/.hermes/profiles/dbb3-worker/managed-installations.json
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/hermes/.hermes
+ReadWritePaths=/home/hermes/.hermes/profiles/dbb3-worker
 
 [Install]
 WantedBy=multi-user.target

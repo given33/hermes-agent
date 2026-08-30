@@ -29,7 +29,7 @@ printf '%s\n' "${token_source_value}" | cmp -s -- - "${token_source}" \
   || die "managed installation token must have one newline-terminated line"
 
 receiver_user="${HERMES_WSL_RECEIVER_USER:-hermes}"
-receiver_home="${HERMES_WSL_HOME:-/mnt/d/Hermes/home}"
+receiver_home="${HERMES_WSL_HOME:-/mnt/d/Hermes/home/profiles/pc-worker}"
 runtime_root="${HERMES_WSL_AGENT_ROOT:-/mnt/d/Hermes/hermes-agent}"
 runtime_python="${HERMES_WSL_RUNTIME_PYTHON:-${runtime_root}/venv/bin/python}"
 config_source="${repo}/deploy/recovery/managed-installations.wsl.json"

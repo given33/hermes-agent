@@ -50,32 +50,30 @@ For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spa
 
 Every claim must end in exactly one of:
 
-- `kanban_complete(summary=..., metadata=...)` — task succeeds, status flips to `done`.
-- `kanban_request_review(summary=..., metadata=..., reviewer=...)` — same-card implementation is complete and enters first-class review; status flips to `review`. The dispatcher loads the bundled `sdlc-review` skill unless `kanban.review_dispatch` is disabled. A reviewer approves with `kanban_complete`, returns actionable rework with `kanban_request_changes`, or escalates a genuine external blocker with `kanban_block`.
+- `kanban_complete(summary=..., metadata=...)` — the worker has implemented and self-verified the task; status flips to `done`.
 - `kanban_block(reason=...)` — task waits for human input, status flips to `blocked`. The dispatcher respawns when `kanban_unblock` runs.
 - The worker process exits without a tool call. The kernel reaps it and emits `crashed` (PID died) or `gave_up` (consecutive-failure breaker tripped) or `timed_out` (max_runtime exceeded). This is the failure path; healthy workers don't end here.
 
 The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
 
-## Outputs and the review handoff
+## Outputs and downstream handoff
 
-For code-changing tasks, pick the review model encoded by the task graph:
+For code-changing tasks, the worker runs the relevant checks before completing and records that evidence in the handoff:
 
-- **Same-card review:** call `kanban_request_review(summary=..., metadata=..., reviewer=...)`. The task enters `review` without touching block recurrence accounting. The dispatcher claims it with the bundled `sdlc-review` skill by default. The reviewer approves with `kanban_complete`, calls `kanban_request_changes(reason=...)` to close the review run and route the task back to its original implementer, or blocks only for a genuine external escalation.
-- **Pre-created downstream review/QA/release card:** `kanban_show` lists child IDs; inspect those cards with `kanban_show(task_id=...)` before choosing the terminal action. When a child is the downstream review/QA/release phase, call `kanban_complete` on the implementation phase. It cannot promote until this parent is `done`/`archived`. Do not additionally request same-card review and never sticky-block the parent with `review-required:` — either choice strands or duplicates the downstream lane.
-- **Human-only boards:** set `kanban.review_dispatch: false`. A task can then remain in `review` until a human approves it or uses `reopen-review`/the dashboard to return it to `ready`/`todo`.
+- **Same task:** implement, run the acceptance checks, then call `kanban_complete` with the result and verification metadata.
+- **Pre-created downstream QA/release card:** `kanban_show` lists child IDs; inspect those cards with `kanban_show(task_id=...)`. Complete the implementation parent after self-verification so the downstream worker can promote. Never sticky-block the parent merely to create an approval phase.
 
-Both review models carry their structured handoff on the lifecycle transition itself. Do not place secrets, tokens, or raw PII in `summary` or `metadata`; run rows are durable.
+The structured handoff lives on the completion transition. Do not place secrets, tokens, or raw PII in `summary` or `metadata`; run rows are durable.
 
-The injected `KANBAN_GUIDANCE` covers both graph shapes, `kanban_complete`, the same-card review loop, and `kanban_block` for genuine blockers.
+The injected `KANBAN_GUIDANCE` covers both graph shapes, `kanban_complete`, and `kanban_block` for genuine blockers.
 
 ## Logs and audit trail
 
 The dispatcher writes per-task worker stdout/stderr to `<board-root>/logs/<task_id>.log`. Logs are auditable from kanban metadata:
 
 - `task_runs` rows carry the `log_path`, exit code (where available), summary, and metadata.
-- `task_events` rows carry every state transition (`promoted`, `claimed`, `heartbeat`, `completed`, `blocked`, `review_requested`, `changes_requested`, `review_reopened`, `gave_up`, `crashed`, `timed_out`, `reclaimed`, `claim_extended`).
-- `kanban_show` returns both, so a reviewer (or a follow-up worker) reading the task gets the full history without needing dashboard access.
+- `task_events` rows carry every active state transition (`promoted`, `claimed`, `heartbeat`, `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `reclaimed`, `claim_extended`) plus any historical migration events.
+- `kanban_show` returns both, so a follow-up worker reading the task gets the full history without needing dashboard access.
 
 The dashboard renders run history with summaries, metadata blocks, and exit-status badges. CLI users can run `hermes kanban tail <task_id>` to follow live, or `hermes kanban runs <task_id>` for the historical attempt list.
 
