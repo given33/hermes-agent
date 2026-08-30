@@ -469,7 +469,7 @@ if [[ "${url}" == */api/status ]]; then
   payload='{"status":"ok"}'
 elif [[ "${url}" == */api/mobile/v1/handshake ]]; then
   [[ "${FAKE_HANDSHAKE_FAIL:-0}" != 1 ]] || exit 22
-  payload='{"api_version":1,"hermes_version":"test","profiles":[],"capabilities":[],"server_time":"2026-07-19T12:00:00Z"}'
+  payload='{"api_version":1,"hermes_version":"test","profiles":[],"capabilities":[],"server_time":1784443200}'
 elif [[ "${url}" == */api/plugins/ios-intelligence/health ]]; then
   payload="$(IOS_CAPABILITIES_COUNT="${ios_capabilities_count}" python3 - <<'PY'
 import json
