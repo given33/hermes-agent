@@ -273,7 +273,25 @@ printf '%s' "connector-test-token" >"${token_file}"
 printf '%s\n' "status-test-token-00000000000000000001" >"${status_token_file}"
 printf '%s\n' "installation-test-token-000000000000001" >"${installation_token_file}"
 printf '%s\n' "hk-recovery-test-token-0000000000000001" >"${hk_recovery_token_file}"
-chmod 0640 "${status_token_file}" "${installation_token_file}" \
+credential_service_user="$(awk -F: '$3 != 0 { print $1; exit }' /etc/passwd)"
+credential_primary_group="$(id -gn "${credential_service_user}")"
+credential_service_group="$(awk -F: -v primary="${credential_primary_group}" \
+  '$1 != "root" && $1 != primary { print $1; exit }' /etc/group)"
+[[ -n "${credential_service_user}" && -n "${credential_service_group}" ]] || {
+  printf '%s\n' "test-install-collaboration-backend: no distinct service group fixture is available" >&2
+  exit 1
+}
+credential_source_group="$(awk -F: -v target="${credential_service_group}" \
+  '$1 != "root" && $1 != target { print $1; exit }' /etc/group)"
+[[ -n "${credential_source_group}" ]] || {
+  printf '%s\n' "test-install-collaboration-backend: no distinct source group is available" >&2
+  exit 1
+}
+chown "root:${credential_service_group}" "${work}"
+chmod 0710 "${work}"
+chown "root:${credential_source_group}" "${status_token_file}" \
+  "${installation_token_file}" "${hk_recovery_token_file}"
+chmod 0600 "${status_token_file}" "${installation_token_file}" \
   "${hk_recovery_token_file}"
 printf '%s\n' '{"conversations":[{"id":"old-state"}]}' >"${state_file}"
 printf '%s\n' '{"nodes":[]}' >"${managed_nodes_file}"
@@ -671,8 +689,8 @@ run_installer() {
     HERMES_AGENT_ROOT="${target}" \
     HERMES_RUNTIME_PYTHON="${runtime_python}" \
     HERMES_AGENT_SERVICE="hermes-agent-test.service" \
-    HERMES_AGENT_USER="root" \
-    HERMES_AGENT_GROUP="root" \
+    HERMES_AGENT_USER="${credential_service_user}" \
+    HERMES_AGENT_GROUP="${credential_service_group}" \
     HERMES_STAGE_OWNER="root" \
     HERMES_BACKUP_ROOT="${backup}" \
     HERMES_INSTALL_LOCK_FILE="${work}/collaboration-install.lock" \
@@ -694,6 +712,75 @@ run_installer() {
       0000000000000000000000000000000000000001
 }
 
+assert_fixture_credentials_unchanged() {
+  for credential_file in "${status_token_file}" "${installation_token_file}" \
+    "${hk_recovery_token_file}"; do
+    [[ "$(stat -c '%U:%G:%a' "${credential_file}")" == \
+      "root:${credential_source_group}:600" ]] || {
+      printf 'credential preflight mutated a rejected file: %s\n' \
+        "${credential_file}" >&2
+      exit 1
+    }
+  done
+}
+
+expect_credential_preflight_failure() {
+  local label="$1" expected="$2"
+  : >"${work}/systemctl.log"
+  set +e
+  run_installer 0 0 >"${work}/${label}.stdout" 2>"${work}/${label}.stderr"
+  local status=$?
+  set -e
+  [[ "${status}" -ne 0 ]] || {
+    printf 'unsafe credential fixture unexpectedly succeeded: %s\n' "${label}" >&2
+    exit 1
+  }
+  grep -Fq "${expected}" "${work}/${label}.stderr"
+  [[ ! -s "${work}/systemctl.log" ]] || {
+    printf 'service was touched before credential rejection: %s\n' "${label}" >&2
+    exit 1
+  }
+}
+
+status_fixture_backup="${work}/dbb3-status.original"
+mv -- "${status_token_file}" "${status_fixture_backup}"
+ln -s -- "${installation_token_file}" "${status_token_file}"
+expect_credential_preflight_failure \
+  credential-symlink "status credential must be a regular file"
+rm -- "${status_token_file}"
+mv -- "${status_fixture_backup}" "${status_token_file}"
+assert_fixture_credentials_unchanged
+
+mv -- "${status_token_file}" "${status_fixture_backup}"
+ln -- "${status_fixture_backup}" "${status_token_file}"
+expect_credential_preflight_failure \
+  credential-hardlink "status credential must have exactly one hard link"
+rm -- "${status_token_file}"
+mv -- "${status_fixture_backup}" "${status_token_file}"
+assert_fixture_credentials_unchanged
+
+cp --preserve=mode,ownership -- "${status_token_file}" "${status_fixture_backup}"
+cp -- "${installation_token_file}" "${status_token_file}"
+expect_credential_preflight_failure \
+  credential-duplicate "installation credential must use a dedicated value"
+rm -- "${status_token_file}"
+mv -- "${status_fixture_backup}" "${status_token_file}"
+assert_fixture_credentials_unchanged
+
+unsafe_credential_dir="${work}/unsafe-credential-parent"
+unsafe_status_token_file="${unsafe_credential_dir}/status.token"
+install -d -o root -g root -m 0770 "${unsafe_credential_dir}"
+printf '%s\n' "unsafe-status-test-token-000000000000001" \
+  >"${unsafe_status_token_file}"
+chown "root:${credential_source_group}" "${unsafe_status_token_file}"
+chmod 0600 "${unsafe_status_token_file}"
+safe_status_token_file="${status_token_file}"
+status_token_file="${unsafe_status_token_file}"
+expect_credential_preflight_failure credential-parent \
+  "status credential parent directories must not be writable by other users"
+status_token_file="${safe_status_token_file}"
+assert_fixture_credentials_unchanged
+
 set +e
 run_installer 1 0 >"${work}/failure.stdout" 2>"${work}/failure.stderr"
 failure_status=$?
@@ -702,6 +789,15 @@ set -e
   printf '%s\n' "forced post-start failure unexpectedly succeeded" >&2
   exit 1
 }
+for credential_file in "${status_token_file}" "${installation_token_file}" \
+  "${hk_recovery_token_file}"; do
+  [[ "$(stat -c '%U:%G:%a' "${credential_file}")" == \
+    "root:${credential_service_group}:640" ]] || {
+    printf 'managed credential permissions were not normalized: %s\n' \
+      "${credential_file}" >&2
+    exit 1
+  }
+done
 grep -Fq "service_diagnostics_begin" "${work}/failure.stderr"
 grep -Fq "SubState=auto-restart" "${work}/failure.stderr"
 grep -Fq "Traceback: RuntimeError: failed before bind" "${work}/failure.stderr"

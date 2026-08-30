@@ -572,44 +572,175 @@ managed_installation_token_file="${HERMES_MANAGED_INSTALLATION_TOKEN_FILE:-/etc/
 hk_recovery_token_file="${HERMES_HK_RECOVERY_TOKEN_FILE:-/etc/hermes-agent/hk-recovery-token}"
 [[ "${managed_node_token_file}" != "${managed_installation_token_file}" ]] \
   || die "status and installation credentials must use different files"
-validate_managed_token_file() {
-  local credential_file="$1" label="$2"
-  [[ "${credential_file}" == /* && -f "${credential_file}" && ! -L "${credential_file}" ]] \
-    || die "${label} credential path is missing or unsafe"
-  [[ "$(stat -c '%U' "${credential_file}")" == root ]] \
-    || die "${label} credential must be root-owned"
-  [[ "$(stat -c '%G' "${credential_file}")" == "${service_group}" ]] \
-    || die "${label} credential group must be ${service_group}"
-  [[ "$(stat -c '%a' "${credential_file}")" == 640 ]] \
-    || die "${label} credential mode must be 0640"
-  local credential_value
-  credential_value="$(cat -- "${credential_file}")"
-  (( ${#credential_value} >= 32 && ${#credential_value} <= 4096 )) \
-    || die "${label} credential length must be 32..4096 characters"
-  [[ "${credential_value}" != *$'\n'* && "${credential_value}" != *$'\r'* ]] \
-    || die "${label} credential must contain exactly one line"
-  printf '%s\n' "${credential_value}" | cmp -s -- - "${credential_file}" \
-    || die "${label} credential must have one newline-terminated line"
-  unset credential_value
-}
+# Bind validation and metadata changes to already-open inodes. This prevents a
+# custom credential path or a replaced path component from redirecting root's
+# permission changes to an unrelated file.
+"${runtime_python}" - "${service_group}" "${token_file}" \
+  status "${managed_node_token_file}" \
+  installation "${managed_installation_token_file}" \
+  "HK recovery" "${hk_recovery_token_file}" <<'PY' \
+  || die "managed credential validation failed"
+import errno
+import grp
+import os
+import stat
+import sys
+
+service_group = sys.argv[1]
+connector_path = sys.argv[2]
+raw_credentials = sys.argv[3:]
+if len(raw_credentials) != 6:
+    raise SystemExit("exactly three managed credentials are required")
+try:
+    service_gid = grp.getgrnam(service_group).gr_gid
+except KeyError:
+    raise SystemExit(f"service group does not exist: {service_group}") from None
+
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+path_flags = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+reopen_flags = os.O_RDONLY | os.O_CLOEXEC
+opened = []
+handles = []
+
+
+def fail(label, message):
+    raise SystemExit(f"{label} credential {message}")
+
+
+def open_parent(path, label):
+    if not os.path.isabs(path):
+        fail(label, "path must be absolute")
+    components = [part for part in path.split("/") if part]
+    if not components or any(part in {".", ".."} for part in components):
+        fail(label, "path is unsafe")
+    directory_fd = os.open("/", directory_flags)
+    try:
+        for component in components[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+            metadata = os.fstat(directory_fd)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0:
+                fail(label, "parent directories must be root-owned directories")
+            permissions = stat.S_IMODE(metadata.st_mode)
+            if permissions & 0o022 and not permissions & stat.S_ISVTX:
+                fail(label, "parent directories must not be writable by other users")
+        return directory_fd, components[-1]
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def open_regular(parent_fd, filename, label):
+    path_fd = os.open(filename, path_flags, dir_fd=parent_fd)
+    try:
+        path_metadata = os.fstat(path_fd)
+        if not stat.S_ISREG(path_metadata.st_mode):
+            fail(label, "must be a regular file")
+        credential_fd = os.open(f"/proc/self/fd/{path_fd}", reopen_flags)
+        metadata = os.fstat(credential_fd)
+        if (metadata.st_dev, metadata.st_ino) != (
+            path_metadata.st_dev,
+            path_metadata.st_ino,
+        ):
+            os.close(credential_fd)
+            fail(label, "inode changed while opening")
+        return credential_fd, metadata
+    finally:
+        os.close(path_fd)
+
+
+def reject_access_acl(credential_fd, label):
+    try:
+        names = os.listxattr(credential_fd)
+    except OSError as exc:
+        unsupported = {errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}
+        if exc.errno in unsupported:
+            return
+        raise
+    if "system.posix_acl_access" in names:
+        fail(label, "must not carry a POSIX access ACL")
+
+
+try:
+    seen_inodes = set()
+    seen_payloads = set()
+    for label, path in zip(raw_credentials[::2], raw_credentials[1::2]):
+        parent_fd, filename = open_parent(path, label)
+        try:
+            credential_fd, metadata = open_regular(parent_fd, filename, label)
+        except BaseException:
+            os.close(parent_fd)
+            raise
+        handles.append((parent_fd, credential_fd))
+        reject_access_acl(credential_fd, label)
+        if metadata.st_uid != 0:
+            fail(label, "must be root-owned")
+        if metadata.st_nlink != 1:
+            fail(label, "must have exactly one hard link")
+        permissions = stat.S_IMODE(metadata.st_mode)
+        if permissions not in {0o400, 0o440, 0o600, 0o640}:
+            fail(label, "mode must already be restricted to owner/group read")
+        if permissions & 0o040 and metadata.st_gid not in {0, service_gid}:
+            fail(label, "must not be readable by an unrelated group")
+        with os.fdopen(os.dup(credential_fd), "rb") as stream:
+            payload = stream.read(4098)
+        if not payload.endswith(b"\n") or b"\n" in payload[:-1] or b"\r" in payload:
+            fail(label, "must have one newline-terminated line")
+        if not 32 <= len(payload) - 1 <= 4096:
+            fail(label, "length must be 32..4096 characters")
+        inode = (metadata.st_dev, metadata.st_ino)
+        if inode in seen_inodes:
+            fail(label, "must use a dedicated file")
+        if payload in seen_payloads:
+            fail(label, "must use a dedicated value")
+        seen_inodes.add(inode)
+        seen_payloads.add(payload)
+        opened.append((label, parent_fd, filename, credential_fd, inode, payload))
+
+    connector_parent_fd, connector_filename = open_parent(connector_path, "connector")
+    try:
+        connector_fd, connector_metadata = open_regular(
+            connector_parent_fd, connector_filename, "connector"
+        )
+    except BaseException:
+        os.close(connector_parent_fd)
+        raise
+    handles.append((connector_parent_fd, connector_fd))
+    with os.fdopen(os.dup(connector_fd), "rb") as stream:
+        connector_payload = stream.read(4098)
+    connector_inode = (connector_metadata.st_dev, connector_metadata.st_ino)
+    if connector_inode in seen_inodes:
+        fail("connector", "must use a dedicated file")
+    if connector_payload.rstrip(b"\n") + b"\n" in seen_payloads:
+        fail("connector", "must use a dedicated value")
+
+    for label, parent_fd, filename, credential_fd, inode, _ in opened:
+        os.fchown(credential_fd, 0, service_gid)
+        os.fchmod(credential_fd, 0o640)
+        reject_access_acl(credential_fd, label)
+        metadata = os.fstat(credential_fd)
+        path_metadata = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+        if (metadata.st_dev, metadata.st_ino) != inode:
+            fail(label, "inode changed during normalization")
+        if (path_metadata.st_dev, path_metadata.st_ino) != inode:
+            fail(label, "path changed during normalization")
+        if (
+            not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_uid != 0
+            or path_metadata.st_gid != service_gid
+            or stat.S_IMODE(path_metadata.st_mode) != 0o640
+        ):
+            fail(label, "metadata normalization failed")
+finally:
+    for parent_fd, credential_fd in handles:
+        os.close(credential_fd)
+        os.close(parent_fd)
+PY
 for credential_file in "${managed_node_token_file}" "${managed_installation_token_file}" \
   "${hk_recovery_token_file}"; do
-  runuser -u "${service_user}" -- test -r "${credential_file}" \
+  runuser -u "${service_user}" -g "${service_group}" -- test -r "${credential_file}" \
     || die "managed-node credential is not readable by ${service_user}"
-done
-validate_managed_token_file "${managed_node_token_file}" status
-validate_managed_token_file "${managed_installation_token_file}" installation
-validate_managed_token_file "${hk_recovery_token_file}" "HK recovery"
-for existing_credential in "${managed_node_token_file}" "${managed_installation_token_file}" \
-  "${token_file}"; do
-  if cmp -s -- "${existing_credential}" "${hk_recovery_token_file}"; then
-    die "HK recovery credentials must be dedicated"
-  fi
-done
-for existing_credential in "${managed_node_token_file}" "${token_file}"; do
-  if cmp -s -- "${existing_credential}" "${managed_installation_token_file}"; then
-    die "managed installation credentials must be dedicated"
-  fi
 done
 if [[ "${ios_enabled}" == 1 ]]; then
   ios_database_target="$("${runtime_python}" - "${config_target}" "${runtime_home}" "${service_home}" <<'PY'

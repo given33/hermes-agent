@@ -1225,6 +1225,44 @@ def test_public_installer_uses_effective_systemd_hermes_home_before_env_fallback
     assert 'Hermes runtime home must be an absolute path' in installer
 
 
+def test_public_installer_normalizes_root_owned_managed_credentials_for_service():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    normalization = installer.index('service_group = sys.argv[1]')
+    credential_paths = installer.index('managed_node_token_file=')
+    no_follow = installer.index('os.O_NOFOLLOW', normalization)
+    descriptor_path = installer.index('os.O_PATH', no_follow)
+    acl_definition = installer.index('def reject_access_acl(', descriptor_path)
+    acl_before = installer.index(
+        'reject_access_acl(credential_fd, label)', acl_definition + 1
+    )
+    content = installer.index('payload = stream.read(4098)', no_follow)
+    hard_links = installer.index('metadata.st_nlink != 1', no_follow)
+    connector = installer.index('connector_payload = stream.read(4098)', content)
+    ownership = installer.index('os.fchown(credential_fd, 0, service_gid)', content)
+    mode = installer.index('os.fchmod(credential_fd, 0o640)', ownership)
+    acl_after = installer.index('reject_access_acl(credential_fd, label)', mode)
+    readability = installer.index(
+        'runuser -u "${service_user}" -g "${service_group}" -- test -r "${credential_file}"',
+        mode,
+    )
+    service_stop = installer.index('systemctl stop "${service}"', readability)
+
+    assert 'cmp -s --' not in installer[credential_paths:normalization]
+    assert normalization < no_follow < descriptor_path < acl_definition < acl_before
+    assert acl_before < hard_links < content < connector < ownership
+    assert ownership < mode < acl_after < readability < service_stop
+    assert 'follow_symlinks=False' in installer[normalization:readability]
+    assert 'path_metadata.st_gid != service_gid' in installer[normalization:readability]
+    assert 'if payload in seen_payloads:' in installer[normalization:readability]
+    assert 'if connector_inode in seen_inodes:' in installer[normalization:readability]
+    assert 'connector_payload.rstrip(b"\\n") + b"\\n" in seen_payloads' in installer[normalization:readability]
+    assert '"system.posix_acl_access" in names' in installer[normalization:readability]
+    assert "0o644" not in installer[normalization:readability]
+
+
 def test_public_installer_transactions_mcp_discovery_with_ios_release():
     installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
         encoding="utf-8"
