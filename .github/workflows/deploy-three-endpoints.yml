@@ -184,6 +184,7 @@ jobs:
           HERMES_SSH_KNOWN_HOSTS: ${{ runner.temp }}/ssh/known_hosts
           HERMES_REQUIRE_PINNED_SSH_HOST_KEY: '1'
           HERMES_RELEASE_COMMIT: ${{ github.sha }}
+          HERMES_HK_ENABLED: ${{ vars.HERMES_HK_ENABLED || '0' }}
         run: |
           bash deploy/public/deploy-collaboration-backend.sh
       - name: Verify the public and fabric release evidence

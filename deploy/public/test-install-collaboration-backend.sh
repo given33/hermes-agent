@@ -684,6 +684,7 @@ run_installer() {
     FAKE_HANDSHAKE_FAIL="${3:-0}" \
     FAKE_NGINX_FAIL="${4:-0}" \
     HERMES_DEPLOY_FAIL_PHASE="${5:-}" \
+    HERMES_HK_ENABLED="${6:-1}" \
     HERMES_RUNTIME_SOURCE_MIN_FILES=1 \
     IOS_CAPABILITIES_COUNT="${ios_capabilities_count}" \
     HERMES_AGENT_ROOT="${target}" \
@@ -983,6 +984,8 @@ node = payload["nodes"][0]
 assert node["token_file"] == sys.argv[2]
 assert node["installation_token_file"] == sys.argv[3]
 assert sorted(node["installation_urls"]) == ["dbb3", "wsl"]
+assert "hk" in node["recovery_urls"]
+assert node["recovery_token_files"]["hk"].endswith("hk-recovery.token")
 PY
 [[ "$(python3 - "${managed_installations_db}" <<'PY'
 import sqlite3
@@ -1019,4 +1022,23 @@ PY
 [[ "$(sed -n '2p' "${work}/systemctl.log")" == "start" ]]
 [[ "$(sed -n '3p' "${work}/systemctl.log")" == "is-active" ]]
 [[ "$(tail -n 1 "${work}/systemctl.log")" == "reload" ]]
+
+# HK recovery is opt-in because both hosts must be provisioned with the same
+# dedicated token. Disabled deployments must not require or advertise it.
+rm -- "${hk_recovery_token_file}"
+: >"${work}/systemctl.log"
+run_installer 0 0 0 0 "" 0 \
+  >"${work}/hk-disabled.stdout" 2>"${work}/hk-disabled.stderr" || {
+  cat "${work}/hk-disabled.stdout" >&2
+  cat "${work}/hk-disabled.stderr" >&2
+  exit 1
+}
+python3 - "${managed_nodes_file}" <<'PY'
+import json
+import sys
+
+node = json.load(open(sys.argv[1], encoding="utf-8"))["nodes"][0]
+assert "hk" not in node["recovery_urls"]
+assert "recovery_token_files" not in node
+PY
 printf '%s\n' "public installer transaction test passed"

@@ -312,6 +312,9 @@ if [[ "${ios_enabled}" == 1 ]]; then
     [[ -f "${source_file}" && ! -L "${source_file}" ]] || die "missing or unsafe iOS intelligence asset ${relative}"
   done
 fi
+hk_enabled="${4:-${HERMES_HK_ENABLED:-0}}"
+[[ "${hk_enabled}" == 0 || "${hk_enabled}" == 1 ]] \
+  || die "HERMES_HK_ENABLED must be 0 or 1"
 
 target_root="${HERMES_AGENT_ROOT:-/opt/hermes-agent}"
 runtime_python="${HERMES_RUNTIME_PYTHON:-${target_root}/.venv/bin/python}"
@@ -572,13 +575,18 @@ managed_installation_token_file="${HERMES_MANAGED_INSTALLATION_TOKEN_FILE:-/etc/
 hk_recovery_token_file="${HERMES_HK_RECOVERY_TOKEN_FILE:-/etc/hermes-agent/hk-recovery-token}"
 [[ "${managed_node_token_file}" != "${managed_installation_token_file}" ]] \
   || die "status and installation credentials must use different files"
+managed_credential_args=(
+  status "${managed_node_token_file}"
+  installation "${managed_installation_token_file}"
+)
+if [[ "${hk_enabled}" == 1 ]]; then
+  managed_credential_args+=("HK recovery" "${hk_recovery_token_file}")
+fi
 # Bind validation and metadata changes to already-open inodes. This prevents a
 # custom credential path or a replaced path component from redirecting root's
 # permission changes to an unrelated file.
 "${runtime_python}" - "${service_group}" "${token_file}" \
-  status "${managed_node_token_file}" \
-  installation "${managed_installation_token_file}" \
-  "HK recovery" "${hk_recovery_token_file}" <<'PY' \
+  "${managed_credential_args[@]}" <<'PY' \
   || die "managed credential validation failed"
 import errno
 import grp
@@ -589,8 +597,8 @@ import sys
 service_group = sys.argv[1]
 connector_path = sys.argv[2]
 raw_credentials = sys.argv[3:]
-if len(raw_credentials) != 6:
-    raise SystemExit("exactly three managed credentials are required")
+if len(raw_credentials) not in {4, 6}:
+    raise SystemExit("exactly two or three managed credentials are required")
 try:
     service_gid = grp.getgrnam(service_group).gr_gid
 except KeyError:
@@ -737,8 +745,14 @@ finally:
         os.close(credential_fd)
         os.close(parent_fd)
 PY
-for credential_file in "${managed_node_token_file}" "${managed_installation_token_file}" \
-  "${hk_recovery_token_file}"; do
+managed_credential_files=(
+  "${managed_node_token_file}"
+  "${managed_installation_token_file}"
+)
+if [[ "${hk_enabled}" == 1 ]]; then
+  managed_credential_files+=("${hk_recovery_token_file}")
+fi
+for credential_file in "${managed_credential_files[@]}"; do
   runuser -u "${service_user}" -g "${service_group}" -- test -r "${credential_file}" \
     || die "managed-node credential is not readable by ${service_user}"
 done
@@ -1746,14 +1760,16 @@ managed_nodes_rendered="${transaction}/managed-nodes.json"
   "${managed_nodes_rendered}" \
   "${managed_node_token_file}" \
   "${managed_installation_token_file}" \
-  "${hk_recovery_token_file}" <<'PY'
+  "${hk_recovery_token_file}" \
+  "${hk_enabled}" <<'PY'
 import json
 import pathlib
 import sys
 
 source, destination, status_token_file, installation_token_file, hk_recovery_token_file = map(
-    pathlib.Path, sys.argv[1:]
+    pathlib.Path, sys.argv[1:6]
 )
+hk_enabled = sys.argv[6] == "1"
 payload = json.loads(source.read_text(encoding="utf-8"))
 for node in payload.get("nodes", []):
     if node.get("token_file") != "/etc/hermes-agent/dbb3-status-token":
@@ -1765,8 +1781,17 @@ for node in payload.get("nodes", []):
         raise SystemExit("managed-nodes template has an unexpected HK recovery token path")
     node["token_file"] = str(status_token_file)
     node["installation_token_file"] = str(installation_token_file)
-    recovery_token_files["hk"] = str(hk_recovery_token_file)
-    node["recovery_token_files"] = recovery_token_files
+    recovery_urls = node.get("recovery_urls") or {}
+    if hk_enabled:
+        recovery_token_files["hk"] = str(hk_recovery_token_file)
+    else:
+        recovery_urls.pop("hk", None)
+        recovery_token_files.pop("hk", None)
+    node["recovery_urls"] = recovery_urls
+    if recovery_token_files:
+        node["recovery_token_files"] = recovery_token_files
+    else:
+        node.pop("recovery_token_files", None)
 destination.write_text(
     json.dumps(payload, indent=2, ensure_ascii=True) + "\n",
     encoding="utf-8",

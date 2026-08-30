@@ -10,6 +10,9 @@ die() { printf 'deploy-collaboration-backend: %s\n' "$*" >&2; exit 1; }
 repo="${HERMES_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 remote="${HERMES_PUBLIC_REMOTE:-admin@10.66.0.1}"
 version="${HERMES_COLLABORATION_VERSION:-}"
+hk_enabled="${HERMES_HK_ENABLED:-0}"
+[[ "${hk_enabled}" == 0 || "${hk_enabled}" == 1 ]] \
+  || die "HERMES_HK_ENABLED must be 0 or 1"
 
 resolve_git_head() {
   local gitdir head
@@ -444,7 +447,7 @@ recovery_attempts="${HERMES_PUBLIC_FABRIC_RECOVERY_ATTEMPTS:-2}"
 for attempt in $(seq 1 "${recovery_attempts}"); do
   installer_status=0
   if ssh "${ssh_args[@]}" "${remote}" \
-      "chmod 0700 '${stage}/install-collaboration-backend.sh'; sudo -n /bin/bash '${stage}/install-collaboration-backend.sh' '${version}' '${stage}' '${release_commit}'"; then
+      "chmod 0700 '${stage}/install-collaboration-backend.sh'; sudo -n /bin/bash '${stage}/install-collaboration-backend.sh' '${version}' '${stage}' '${release_commit}' '${hk_enabled}'"; then
     break
   else
     installer_status=$?

@@ -1263,6 +1263,29 @@ def test_public_installer_normalizes_root_owned_managed_credentials_for_service(
     assert "0o644" not in installer[normalization:readability]
 
 
+def test_hk_recovery_activation_is_propagated_and_fail_closed():
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    harness = (PUBLIC / "test-install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "HERMES_HK_ENABLED: ${{ vars.HERMES_HK_ENABLED || '0' }}" in workflow
+    assert 'hk_enabled="${HERMES_HK_ENABLED:-0}"' in deployer
+    assert "sudo -n /bin/bash '${stage}/install-collaboration-backend.sh'" in deployer
+    assert "'${release_commit}' '${hk_enabled}'" in deployer
+    assert 'hk_enabled="${4:-${HERMES_HK_ENABLED:-0}}"' in installer
+    assert 'managed_credential_args+=("HK recovery" "${hk_recovery_token_file}")' in installer
+    assert 'recovery_urls.pop("hk", None)' in installer
+    assert 'recovery_token_files.pop("hk", None)' in installer
+    assert 'run_installer 0 0 0 0 "" 0' in harness
+
+
 def test_public_installer_transactions_mcp_discovery_with_ios_release():
     installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
         encoding="utf-8"
