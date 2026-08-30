@@ -1559,7 +1559,10 @@ def skill_view(
                 # Scan for all readable files
                 for f in skill_dir.rglob("*"):
                     if f.is_file() and f.name != "SKILL.md":
-                        rel = str(f.relative_to(skill_dir))
+                        # Normalize the relative path for the wire contract;
+                        # pathlib uses backslashes on Windows, while skill
+                        # paths are always advertised with POSIX separators.
+                        rel = f.relative_to(skill_dir).as_posix()
                         if rel.startswith("references/"):
                             available_files["references"].append(rel)
                         elif rel.startswith("templates/"):
