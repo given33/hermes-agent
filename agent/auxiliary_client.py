@@ -9764,11 +9764,16 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
-    queue_started_at = time.monotonic()
+    # ``time.monotonic`` has a coarse (~15.6 ms) resolution on some Windows
+    # builds.  The auxiliary latency fields are observability data (not
+    # timeout decisions), so use the high-resolution performance counter to
+    # avoid reporting a zero queue wait for a real 10 ms semaphore delay.
+    latency_clock = time.perf_counter
+    queue_started_at = latency_clock()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
         semaphore.acquire()
-    request_started_at = time.monotonic()
+    request_started_at = latency_clock()
     if latency_info is not None:
         latency_info["queue_wait_ms"] = max(
             0, int((request_started_at - queue_started_at) * 1000)
@@ -9778,13 +9783,13 @@ def call_llm(
     def _timed_response() -> None:
         if latency_info is not None and "time_to_first_progress_ms" not in latency_info:
             latency_info["time_to_first_progress_ms"] = max(
-                0, int((time.monotonic() - request_started_at) * 1000)
+                0, int((latency_clock() - request_started_at) * 1000)
             )
 
     def _timed_dispatch() -> None:
         if latency_info is not None and "provider_dispatch_ms" not in latency_info:
             latency_info["provider_dispatch_ms"] = max(
-                0, int((time.monotonic() - request_started_at) * 1000)
+                0, int((latency_clock() - request_started_at) * 1000)
             )
 
     try:
@@ -9825,7 +9830,7 @@ def call_llm(
     finally:
         if latency_info is not None:
             latency_info["summary_generation_ms"] = max(
-                0, int((time.monotonic() - request_started_at) * 1000)
+                0, int((latency_clock() - request_started_at) * 1000)
             )
         if semaphore is not None:
             semaphore.release()
