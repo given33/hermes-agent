@@ -280,34 +280,42 @@ class HostedRoomRuntime:
         *,
         cancel_id: str,
     ) -> dict[str, Any]:
-        """Persist a stop intent, then commit cancellation after acknowledgement."""
-        before = state.get_task(self.db_path, identity)
-        if before["status"] in {"queued", "deferred"}:
-            cancelled = state.cancel_task(
-                self.db_path,
-                identity,
-                cancel_id=cancel_id,
-                expected_cancel_generation=before["cancel_generation"],
-                clock=self.clock,
-            )
-            self.wakeup()
-            return cancelled
+        """Persist a stop intent, then commit cancellation after acknowledgement.
 
-        stopping = state.begin_task_cancel(
-            self.db_path,
-            identity,
-            cancel_id=cancel_id,
-            expected_cancel_generation=before["cancel_generation"],
-            clock=self.clock,
-        )
-        binding = self._binding_for_room(identity.room_id)
-        try:
-            if binding is not None and self._interrupt_stopping_task(binding, stopping):
-                stopping = state.complete_task_cancel(
+        The worker thread transitions tasks concurrently with cancellation
+        (queued -> running -> terminal), so the status read below is only a
+        routing hint. Every fast-path failure caused by a concurrent
+        transition re-reads and re-routes instead of surfacing a transient
+        ``InvalidTaskTransitionError``/``StaleTaskError`` to the caller.
+        """
+        for _ in range(_CANCEL_ROUTE_RETRIES):
+            before = state.get_task(self.db_path, identity)
+            if before["status"] == "cancelled":
+                return before
+            if before["status"] in state.TERMINAL_STATUSES:
+                raise state.InvalidTaskTransitionError(
+                    f"cannot cancel task in state '{before['status']}'"
+                )
+            if before["status"] in {"queued", "deferred"}:
+                try:
+                    cancelled = state.cancel_task(
+                        self.db_path,
+                        identity,
+                        cancel_id=cancel_id,
+                        expected_cancel_generation=before["cancel_generation"],
+                        clock=self.clock,
+                    )
+                except (state.InvalidTaskTransitionError, state.StaleTaskError):
+                    # Lost the race with the worker; re-read and re-route.
+                    continue
+                self.wakeup()
+                return cancelled
+            try:
+                stopping = state.begin_task_cancel(
                     self.db_path,
                     identity,
                     cancel_id=cancel_id,
-                    expected_cancel_generation=stopping["cancel_generation"],
+                    expected_cancel_generation=before["cancel_generation"],
                     clock=self.clock,
                 )
             except (state.InvalidTaskTransitionError, state.StaleTaskError):
