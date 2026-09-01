@@ -31,6 +31,8 @@ from gateway import hosted_room_driver as state
 
 
 ROOM_SESSION_SOURCE = "bot_room"
+# Keep cancellation bounded when a peer gateway is slow or unavailable.
+_CANCEL_ROUTE_RETRIES = 8
 MAX_TERMINAL_TEXT_BYTES = 64 * 1024
 _TERMINAL_TRUNCATION_NOTICE = (
     "\n\n[Reply truncated. Ask the Bot to share the full result as a file.]"

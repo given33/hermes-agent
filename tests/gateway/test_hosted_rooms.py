@@ -499,6 +499,7 @@ def test_since_seq_returns_ordered_deltas_and_stable_cursor(tmp_path):
         "cursor": 2,
         "latest_seq": 4,
         "has_more": True,
+        "authority": {"gateway_id": "gateway-a", "epoch": 1},
     }
 
     second = rooms.read_events(
