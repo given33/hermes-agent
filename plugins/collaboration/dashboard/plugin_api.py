@@ -4132,6 +4132,10 @@ def delete_owner_account_data(
         normalized_owner,
         account_generation=normalized_generation,
     )
+    durable_group_rooms = _delete_mobile_group_chat_account_data(
+        normalized_owner,
+        account_generation=normalized_generation,
+    )
     with _STATE_LOCK:
         state = load_single_state()
         owned: list[dict[str, Any]] = []
@@ -4340,6 +4344,7 @@ def delete_owner_account_data(
     return {
         "conversations": len(conversation_ids),
         "rooms": removed_rooms,
+        "durable_group_rooms": durable_group_rooms,
         "runtime_sessions": len(runtime_sessions),
         "files": _file_library().delete_owner(
             normalized_owner,
@@ -25652,6 +25657,957 @@ class MobileRuntimeControlBody(BaseModel):
     action: str = Field(min_length=1, max_length=32)
     request_id: str = Field(default="", max_length=256)
     reason: str = Field(default="mobile task control", max_length=512)
+
+
+class MobileGroupChatCreateBody(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=256)
+    name: str = Field(min_length=1, max_length=256)
+    members: list[dict[str, Any]] = Field(min_length=2, max_length=6)
+
+
+class MobileGroupChatMessageBody(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=256)
+    text: str = Field(min_length=1, max_length=256 * 1024)
+    thread_id: str = Field(min_length=1, max_length=256)
+
+
+class MobileGroupChatRenameBody(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=256)
+    name: str = Field(min_length=1, max_length=256)
+
+
+class MobileGroupChatStopBody(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=256)
+
+
+class MobileGroupChatRetryBody(BaseModel):
+    task_id: str = Field(min_length=1, max_length=256)
+
+
+class MobileGroupChatApprovalBody(BaseModel):
+    member_id: str = Field(min_length=1, max_length=256)
+    task_id: str = Field(min_length=1, max_length=256)
+    execution_generation: int = Field(gt=0)
+    request_id: str = Field(min_length=1, max_length=256)
+    choice: str = Field(min_length=1, max_length=32)
+
+
+def _mobile_group_chat_service():
+    """Return the process-owned official durable Group Chat service.
+
+    The HTTP layer deliberately never constructs a second room scheduler. The
+    dashboard and messaging gateway both own this same service lifecycle;
+    starting it here only covers a request that arrives during backend boot.
+    """
+
+    from tui_gateway import methods_groups
+    import tui_gateway.server  # noqa: F401
+
+    service = methods_groups.get_hosted_room_service()
+    if service is None:
+        service = methods_groups.start_hosted_room_service()
+    if service is None:
+        raise HTTPException(status_code=503, detail="Group Chat worker is unavailable")
+    status = service.runtime.status()
+    if not status.get("running") or status.get("stopping"):
+        raise HTTPException(status_code=503, detail="Group Chat worker is unavailable")
+    return service
+
+
+def _mobile_group_chat_identity(request: Request) -> tuple[str, str]:
+    owner_id = _require_owner(request)
+    return owner_id, _account_generation_for_request(request, owner_id)
+
+
+def _mobile_group_chat_room_id(
+    *, owner_id: str, account_generation: str, idempotency_key: str
+) -> str:
+    """Derive a server-scoped official room id from an account retry key."""
+
+    digest = hashlib.sha256(
+        f"{owner_id}\x00{account_generation}\x00{idempotency_key}".encode("utf-8")
+    ).hexdigest()
+    return f"mobile-group-{digest[:40]}"
+
+
+def _mobile_group_chat_local_members(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate the mobile member fields before the official roster parser."""
+
+    allowed = {"member_id", "profile", "handle", "display_name"}
+    normalized: list[dict[str, Any]] = []
+    for index, member in enumerate(members):
+        unsupported = sorted(set(member) - allowed)
+        if unsupported:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Group Chat member {index} contains unsupported mobile fields: "
+                    f"{', '.join(unsupported)}"
+                ),
+            )
+        normalized.append(dict(member))
+    return normalized
+
+
+_MOBILE_GROUP_CHAT_GATEWAY_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$"
+)
+
+
+def _mobile_group_chat_peer_entries() -> dict[str, dict[str, Any]]:
+    """Load the operator-registered RoomLink peers without exposing secrets."""
+
+    from gateway.hosted_room_peer import validate_room_link_url
+    from hermes_cli.subcommands.peer import (
+        _base_url,
+        _load_peers,
+        _peer_secret,
+    )
+
+    try:
+        configured = _load_peers()
+    except Exception:
+        logger.warning("mobile Group Chat peer config is unavailable", exc_info=True)
+        return {}
+    if not isinstance(configured, Mapping):
+        return {}
+
+    entries: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_peer in configured.items():
+        name = str(raw_name or "").strip().lower()
+        if not _MOBILE_GROUP_CHAT_GATEWAY_ID_RE.fullmatch(name):
+            continue
+        if not isinstance(raw_peer, Mapping):
+            continue
+        url = str(raw_peer.get("url") or "").strip().rstrip("/")
+        key = str(_peer_secret(name) or "").strip()
+        raw_profiles = raw_peer.get("profiles")
+        if isinstance(raw_profiles, str):
+            profile_values = [raw_profiles]
+            profiles_declared = True
+        elif isinstance(raw_profiles, (list, tuple, set)):
+            profile_values = list(raw_profiles)
+            profiles_declared = True
+        else:
+            profile_values = ["default"]
+            profiles_declared = False
+        profiles = sorted({
+            str(profile).strip()
+            for profile in profile_values
+            if isinstance(profile, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", profile.strip())
+        }) or ["default"]
+
+        url_reason = ""
+        if not url:
+            url_reason = "url_not_configured"
+        else:
+            try:
+                validate_room_link_url(_base_url(dict(raw_peer), None))
+            except Exception:
+                url_reason = "room_link_requires_https"
+        key_ready = len(key) >= 16
+        ready = bool(url and key_ready and not url_reason)
+        reason = url_reason or ("api_key_not_configured" if not key_ready else "")
+        entries[name] = {
+            "gateway_id": name,
+            "label": str(raw_peer.get("note") or name).strip()[:128] or name,
+            "peer": dict(raw_peer),
+            "profiles": tuple(profiles),
+            "profiles_declared": profiles_declared,
+            "url": url,
+            "api_key": key,
+            "ready": ready,
+            "reason": reason,
+        }
+    return entries
+
+
+def _mobile_group_chat_gateway_catalog(service) -> dict[str, Any]:
+    """Return a secret-free catalog for the mobile room member picker."""
+
+    from gateway.hosted_room_peer import PROTOCOL_VERSION as ROOM_LINK_PROTOCOL_VERSION
+    from gateway.hosted_rooms import local_authority_gateway_id
+    from hermes_services.worker_channel import MANAGED_WORKER_LABELS
+
+    local_gateway_id = local_authority_gateway_id()
+    gateways: list[dict[str, Any]] = [{
+        "gateway_id": "local",
+        "authority_gateway_id": local_gateway_id,
+        "kind": "gateway",
+        "label": "This Hermes gateway",
+        "profiles": list(service.local_profiles()),
+        "profiles_declared": True,
+        "configured": True,
+        "room_member_supported": True,
+        "room_link_ready": True,
+        "reason": "",
+    }]
+    for entry in _mobile_group_chat_peer_entries().values():
+        gateways.append({
+            "gateway_id": entry["gateway_id"],
+            "kind": "peer_gateway",
+            "label": entry["label"],
+            "profiles": list(entry["profiles"]),
+            "profiles_declared": bool(entry["profiles_declared"]),
+            "configured": True,
+            "room_member_supported": True,
+            "room_link_ready": bool(entry["ready"]),
+            "reason": entry["reason"] or "probe_on_room_create",
+        })
+    execution_nodes = [
+        {
+            "node_id": node_id,
+            "label": label,
+            "kind": "connector_only",
+            "room_member_supported": False,
+            "reason": "managed worker connector is not a RoomLink gateway",
+        }
+        for node_id, label in MANAGED_WORKER_LABELS.items()
+    ]
+    return {
+        "local_gateway_id": local_gateway_id,
+        "gateways": gateways,
+        "execution_nodes": execution_nodes,
+        "credentials": "server-managed",
+        "room_link_protocol_version": ROOM_LINK_PROTOCOL_VERSION,
+    }
+
+
+def _mobile_group_chat_requested_members(
+    members: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Normalize mobile members while retaining only a gateway selector."""
+
+    from gateway import hosted_rooms
+
+    local_gateway_id = hosted_rooms.local_authority_gateway_id()
+    records: list[dict[str, Any]] = []
+    if not isinstance(members, list):
+        raise HTTPException(status_code=422, detail="members must be a list")
+    for index, raw in enumerate(members):
+        if not isinstance(raw, Mapping):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Group Chat member {index} must be an object",
+            )
+        unsupported = sorted(
+            set(raw) - {
+                "member_id",
+                "profile",
+                "handle",
+                "display_name",
+                "gateway_id",
+            }
+        )
+        if unsupported:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Group Chat member {index} contains unsupported mobile fields: "
+                    f"{', '.join(unsupported)}"
+                ),
+            )
+        gateway_id = raw.get("gateway_id", "local")
+        if not isinstance(gateway_id, str) or not gateway_id.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=f"Group Chat member {index} gateway_id is invalid",
+            )
+        gateway_id = gateway_id.strip()
+        if gateway_id in {"local", local_gateway_id}:
+            gateway_id = "local"
+        elif not _MOBILE_GROUP_CHAT_GATEWAY_ID_RE.fullmatch(gateway_id):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Group Chat member {index} gateway_id is invalid",
+            )
+        member = dict(raw)
+        member.pop("gateway_id", None)
+        normalized = _mobile_group_chat_local_members([member])[0]
+        for field in ("member_id", "profile", "handle"):
+            value = normalized.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Group Chat member {index} {field} is required",
+                )
+        records.append({
+            "member": normalized,
+            "gateway_id": gateway_id,
+            "profile": normalized["profile"].strip(),
+        })
+    return records
+
+
+def _mobile_group_chat_existing_matches(
+    room: Mapping[str, Any],
+    *,
+    name: str,
+    records: list[dict[str, Any]],
+) -> bool:
+    """Keep idempotent retries bound to the original roster and selectors."""
+
+    if str(room.get("name") or "") != name:
+        return False
+    stored_members = room.get("members")
+    if not isinstance(stored_members, list) or len(stored_members) != len(records):
+        return False
+    for record, stored in zip(records, stored_members):
+        if not isinstance(stored, Mapping):
+            return False
+        expected = record["member"]
+        for field in ("member_id", "profile", "handle"):
+            if str(stored.get(field) or "") != str(expected.get(field) or ""):
+                return False
+        if str(stored.get("display_name") or "") != str(expected.get("display_name") or ""):
+            return False
+        target = stored.get("target")
+        if not isinstance(target, Mapping):
+            return False
+        if record["gateway_id"] == "local":
+            if target.get("kind") != "local" or target.get("profile") != record["profile"]:
+                return False
+        elif (
+            target.get("kind") != "peer"
+            or target.get("peer_id") != record["gateway_id"]
+            or target.get("profile") != record["profile"]
+        ):
+            return False
+    return True
+
+
+def _mobile_group_chat_prepare_peer_routes(
+    service,
+    *,
+    room_id: str,
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Invite and probe configured peers using the official RoomLink API."""
+
+    from gateway.hosted_room_peer import (
+        GatewayRoomCatalog,
+        PROTOCOL_VERSION as ROOM_LINK_PROTOCOL_VERSION,
+    )
+    from gateway import hosted_rooms
+    from hermes_cli.subcommands.peer import _base_url
+    from tui_gateway.hosted_room_peer_http import PeerRunsHTTPClient
+    from tui_gateway.hosted_room_peer_transport import PeerMemberRoute
+
+    peers = _mobile_group_chat_peer_entries()
+    home_install_id = hosted_rooms.local_authority_gateway_id()
+    members = [dict(record["member"]) for record in records]
+    setups: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        gateway_id = record["gateway_id"]
+        if gateway_id == "local":
+            continue
+        entry = peers.get(gateway_id)
+        if entry is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Group Chat gateway '{gateway_id}' is not registered",
+            )
+        profile = record["profile"]
+        if entry["profiles_declared"] and profile not in entry["profiles"]:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Group Chat gateway '{gateway_id}' does not declare profile "
+                    f"'{profile}'"
+                ),
+            )
+        if not entry["ready"]:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Group Chat gateway '{gateway_id}' is not ready: "
+                    f"{entry['reason'] or 'configuration incomplete'}"
+                ),
+            )
+        member_id = str(record["member"]["member_id"]).strip()
+        profile_url = _base_url(
+            entry["peer"], None if profile == "default" else profile
+        )
+        try:
+            invitation_client = PeerRunsHTTPClient(
+                base_url=profile_url,
+                api_key=entry["api_key"],
+                receipt_db_path=service.db_path,
+            )
+            invitation = invitation_client.issue_invitation(
+                room_id=room_id,
+                home_install_id=home_install_id,
+                authority_gateway_id=home_install_id,
+                authority_epoch=1,
+                member_id=member_id,
+                grant_id=(
+                    "mobile-grant-"
+                    + hashlib.sha256(
+                        f"{room_id}\x00{member_id}".encode("utf-8")
+                    ).hexdigest()[:48]
+                ),
+                ttl_seconds=24 * 60 * 60,
+            )
+            catalog = GatewayRoomCatalog.from_mapping(invitation.get("catalog"))
+            grant = str(invitation.get("grant") or "")
+            if (
+                not grant
+                or ROOM_LINK_PROTOCOL_VERSION not in catalog.protocol_versions
+                or "direct" not in catalog.link_modes
+                or not catalog.text
+                or not catalog.endpoint_url
+            ):
+                raise RuntimeError("peer RoomLink endpoint is unavailable")
+            room_client = PeerRunsHTTPClient(
+                base_url=catalog.endpoint_url,
+                api_key="",
+                receipt_db_path=service.db_path,
+            )
+            probe = room_client.probe(grant=grant)
+            live_catalog = GatewayRoomCatalog.from_mapping(probe.get("catalog"))
+            if live_catalog != catalog:
+                raise RuntimeError("peer capability catalog changed during setup")
+            if (
+                probe.get("room_id") != room_id
+                or probe.get("home_install_id") != home_install_id
+                or probe.get("authority_gateway_id") != home_install_id
+                or int(probe.get("authority_epoch") or 0) != 1
+                or probe.get("member_id") != member_id
+                or probe.get("target_profile") != profile
+            ):
+                raise RuntimeError("peer RoomLink grant scope does not match this room")
+            target = {
+                "kind": "peer",
+                "peer_id": gateway_id,
+                "installation_id": catalog.installation_id,
+                "profile": profile,
+                "capability_digest": catalog.catalog_digest,
+            }
+            members[index]["target"] = target
+            route = PeerMemberRoute(
+                home_install_id=home_install_id,
+                member_id=member_id,
+                target_install_id=catalog.installation_id,
+                target_profile=profile,
+                capability_digest=catalog.catalog_digest,
+                execution_policy_digest=catalog.execution_policy.policy_digest,
+                cancellation_scope_id=(
+                    "mobile-cancel-"
+                    + hashlib.sha256(
+                        f"{room_id}\x00{member_id}".encode("utf-8")
+                    ).hexdigest()[:40]
+                ),
+                trace_id=(
+                    "mobile-trace-"
+                    + hashlib.sha256(
+                        f"{home_install_id}\x00{room_id}\x00{member_id}".encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()[:40]
+                ),
+                grant=grant,
+            )
+            setups.append({
+                "client": room_client,
+                "route": route,
+                "member_id": member_id,
+                "target_url": catalog.endpoint_url,
+                "catalog": catalog,
+                "grant": grant,
+            })
+        except HTTPException:
+            _mobile_group_chat_revoke_pending_peer_routes(setups)
+            raise
+        except Exception as exc:
+            _mobile_group_chat_revoke_pending_peer_routes(setups)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Group Chat gateway '{gateway_id}' could not be admitted: "
+                    f"{type(exc).__name__}"
+                ),
+            ) from exc
+    return members, setups
+
+
+def _mobile_group_chat_revoke_pending_peer_routes(
+    setups: list[dict[str, Any]],
+) -> None:
+    """Best-effort cleanup for invitations made before home-room publication."""
+
+    for setup in setups:
+        revoke = getattr(setup.get("client"), "revoke_grant", None)
+        if not callable(revoke):
+            continue
+        try:
+            revoke(grant=str(setup.get("grant") or ""))
+        except Exception as exc:
+            logger.warning(
+                "mobile Group Chat peer grant cleanup failed (%s)",
+                type(exc).__name__,
+            )
+
+
+def _mobile_group_chat_error(exc: Exception) -> HTTPException:
+    from gateway import hosted_room_discussion, hosted_rooms
+
+    if isinstance(exc, hosted_rooms.RoomNotFoundError):
+        return HTTPException(status_code=404, detail="Group Chat room not found")
+    if isinstance(exc, hosted_rooms.RoomHistoryExpiredError):
+        return HTTPException(status_code=410, detail="Group Chat history expired")
+    if isinstance(exc, hosted_rooms.AuthorityConflictError):
+        return HTTPException(status_code=409, detail="Group Chat authority changed")
+    if isinstance(exc, hosted_room_discussion.DiscussionValidationError):
+        return HTTPException(status_code=422, detail=str(exc))
+    if isinstance(exc, hosted_rooms.HostedRoomError):
+        return HTTPException(status_code=422, detail=str(exc))
+    return HTTPException(status_code=503, detail="Group Chat operation is unavailable")
+
+
+def _mobile_group_chat_owned_room(request: Request, room_id: str):
+    """Resolve an owner-mobile request to the exact current room generation."""
+
+    from gateway import hosted_rooms
+
+    owner_id, account_generation = _mobile_group_chat_identity(request)
+    service = _mobile_group_chat_service()
+    if not hosted_rooms.mobile_room_owned_by(
+        service.db_path,
+        room_id=room_id,
+        owner_id=owner_id,
+        account_generation=account_generation,
+    ):
+        raise HTTPException(status_code=404, detail="Group Chat room not found")
+    return service, owner_id, account_generation
+
+
+def _disband_mobile_group_chat_room(
+    service,
+    *,
+    room_id: str,
+    owner_id: str,
+    account_generation: str,
+    cancel_id: str,
+) -> dict[str, Any]:
+    """Finish one owner-mobile room deletion through the official service."""
+
+    from gateway import hosted_rooms
+
+    try:
+        state = hosted_rooms.room_state(
+            service.db_path,
+            room_id=room_id,
+            include_disbanded=True,
+        )
+    except (hosted_rooms.RoomNotFoundError, hosted_rooms.RoomHistoryExpiredError):
+        hosted_rooms.remove_mobile_room_owner(
+            service.db_path,
+            room_id=room_id,
+            owner_id=owner_id,
+            account_generation=account_generation,
+        )
+        return {"room_id": room_id, "disbanded": True, "already_missing": True}
+
+    if state.get("disbanded_at") is None:
+        service.stop_room(
+            room_id,
+            cancel_id=cancel_id,
+            require_acknowledged=True,
+        )
+        service.revoke_room_routes(room_id)
+        tombstone = hosted_rooms.disband_room(
+            service.db_path,
+            room_id=room_id,
+            expected_gateway_id=str(state["authority_gateway_id"]),
+            expected_epoch=int(state["authority_epoch"]),
+        )
+    else:
+        tombstone = state
+    hosted_rooms.remove_mobile_room_owner(
+        service.db_path,
+        room_id=room_id,
+        owner_id=owner_id,
+        account_generation=account_generation,
+    )
+    return {"room_id": room_id, "disbanded": True, "tombstone": tombstone}
+
+
+def _delete_mobile_group_chat_account_data(
+    owner_id: str,
+    *,
+    account_generation: str,
+) -> int:
+    """Disband account-owned durable rooms before releasing their bindings.
+
+    The owner index is an authorization fence, not a garbage collector. Keep
+    it in place until the official service has stopped work, revoked peer
+    routes, and written the durable disband tombstone for every room.
+    """
+
+    from gateway import hosted_rooms
+
+    db_path = hosted_rooms.default_db_path()
+    room_ids = hosted_rooms.list_mobile_room_ids(
+        db_path,
+        owner_id=owner_id,
+        account_generation=account_generation,
+    )
+    if not room_ids:
+        return 0
+    service = _mobile_group_chat_service()
+    # All production service instances use the gateway-wide state DB. Fail
+    # closed if a test seam or a future multiplexer points the worker elsewhere.
+    if Path(service.db_path) != Path(db_path):
+        raise RuntimeError("Group Chat worker uses an unexpected state database")
+    deleted = 0
+    for room_id in room_ids:
+        _disband_mobile_group_chat_room(
+            service,
+            room_id=room_id,
+            owner_id=owner_id,
+            account_generation=account_generation,
+            cancel_id=f"account-delete-{uuid.uuid4().hex}",
+        )
+        deleted += 1
+    return deleted
+
+
+@router.get("/mobile/group-chat/capabilities")
+def mobile_group_chat_capabilities(request: Request):
+    """Advertise the server-owned official durable Group Chat capability."""
+
+    _mobile_group_chat_identity(request)
+    service = _mobile_group_chat_service()
+    from gateway import hosted_rooms
+
+    return {
+        "protocol_version": hosted_rooms.PROTOCOL_VERSION,
+        "driver": service.status(),
+        "features": [
+            "authority_epoch",
+            "monotonic_log",
+            "idempotent_send",
+            "replayable_disband",
+            "typed_events",
+            "same_gateway_execution",
+            "cross_gateway_execution",
+            "server_managed_peer_credentials",
+            "pending_task_controls",
+        ],
+        "credentials": "server-managed",
+    }
+
+
+@router.get("/mobile/group-chat/gateways")
+def mobile_group_chat_gateways(request: Request):
+    """List selectable gateways without returning URLs, API keys, or grants."""
+
+    _mobile_group_chat_identity(request)
+    return _mobile_group_chat_gateway_catalog(_mobile_group_chat_service())
+
+
+@router.get("/mobile/group-chat/rooms")
+def mobile_group_chat_rooms(request: Request):
+    """List only durable rooms bound to the current mobile account era."""
+
+    from gateway import hosted_rooms
+
+    owner_id, account_generation = _mobile_group_chat_identity(request)
+    service = _mobile_group_chat_service()
+    room_ids = set(
+        hosted_rooms.list_mobile_room_ids(
+            service.db_path,
+            owner_id=owner_id,
+            account_generation=account_generation,
+        )
+    )
+    rooms = [
+        room
+        for room in hosted_rooms.list_rooms(service.db_path)
+        if str(room.get("room_id") or "") in room_ids
+    ]
+    return {"rooms": rooms}
+
+
+@router.post("/mobile/group-chat/rooms")
+def mobile_create_group_chat_room(
+    body: MobileGroupChatCreateBody,
+    request: Request,
+):
+    """Create an official durable room with optional server-admitted peers."""
+
+    owner_id, account_generation = _mobile_group_chat_identity(request)
+    service = _mobile_group_chat_service()
+    from gateway import hosted_rooms
+
+    room_id = _mobile_group_chat_room_id(
+        owner_id=owner_id,
+        account_generation=account_generation,
+        idempotency_key=body.idempotency_key,
+    )
+    records = _mobile_group_chat_requested_members(body.members)
+    try:
+        existing = hosted_rooms.room_state(service.db_path, room_id=room_id)
+    except hosted_rooms.RoomNotFoundError:
+        existing = None
+    except Exception as exc:
+        raise _mobile_group_chat_error(exc) from exc
+
+    if existing is not None:
+        if not hosted_rooms.mobile_room_owned_by(
+            service.db_path,
+            room_id=room_id,
+            owner_id=owner_id,
+            account_generation=account_generation,
+        ):
+            raise HTTPException(status_code=409, detail="Group Chat idempotency key is already in use")
+        if not _mobile_group_chat_existing_matches(
+            existing,
+            name=body.name.strip(),
+            records=records,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Group Chat idempotency key was reused with different room state",
+            )
+        return {"room": existing}
+
+    setups: list[dict[str, Any]] = []
+    # ``create_room`` is idempotent and may return a room created by a
+    # concurrent/retried request.  Only the request that actually inserted the
+    # room owns destructive rollback.  In particular, disbanding an
+    # idempotent result after a later route-registration failure could delete a
+    # room that another request has already made usable.
+    created = False
+    idempotent_existing = False
+    try:
+        members, setups = _mobile_group_chat_prepare_peer_routes(
+            service,
+            room_id=room_id,
+            records=records,
+        )
+        room = service.create_room(
+            room_id=room_id,
+            name=body.name,
+            members=members,
+            owner_id=owner_id,
+            account_generation=account_generation,
+        )
+        idempotent_existing = bool(room.get("idempotent"))
+        created = not idempotent_existing
+        for setup in setups:
+            service.register_peer_route(
+                room_id=room_id,
+                member_id=setup["member_id"],
+                route=setup["route"],
+                client=setup["client"],
+                target_url=setup["target_url"],
+                catalog=setup["catalog"],
+            )
+    except HTTPException:
+        if created:
+            try:
+                _disband_mobile_group_chat_room(
+                    service,
+                    room_id=room_id,
+                    owner_id=owner_id,
+                    account_generation=account_generation,
+                    cancel_id=f"mobile-create-failed-{uuid.uuid4().hex}",
+                )
+            except Exception:
+                logger.warning(
+                    "mobile Group Chat cleanup after create failure failed (%s)",
+                    type(sys.exc_info()[1]).__name__,
+                )
+        # An idempotent result may belong to another in-flight request.  The
+        # RoomLink revoke endpoint fences the whole room/home/target/profile
+        # scope, rather than just this token, so revoking pending setups here
+        # could invalidate the other request's live grant.  Leave those grants
+        # to their bounded expiry and let the idempotent retry repair any
+        # missing route instead.
+        if not idempotent_existing:
+            _mobile_group_chat_revoke_pending_peer_routes(setups)
+        raise
+    except Exception as exc:
+        if created:
+            try:
+                _disband_mobile_group_chat_room(
+                    service,
+                    room_id=room_id,
+                    owner_id=owner_id,
+                    account_generation=account_generation,
+                    cancel_id=f"mobile-create-failed-{uuid.uuid4().hex}",
+                )
+            except Exception:
+                logger.warning(
+                    "mobile Group Chat cleanup after create failure failed (%s)",
+                    type(sys.exc_info()[1]).__name__,
+                )
+        if not idempotent_existing:
+            _mobile_group_chat_revoke_pending_peer_routes(setups)
+        raise _mobile_group_chat_error(exc) from exc
+    return {"room": room}
+
+
+@router.get("/mobile/group-chat/rooms/{room_id}")
+def mobile_group_chat_room(room_id: str, request: Request):
+    from gateway import hosted_rooms
+
+    service, _owner_id, _account_generation = _mobile_group_chat_owned_room(
+        request, room_id
+    )
+    try:
+        return {
+            "room": hosted_rooms.room_state(service.db_path, room_id=room_id),
+            "driver_status": service.status(room_id),
+        }
+    except Exception as exc:
+        raise _mobile_group_chat_error(exc) from exc
+
+
+@router.get("/mobile/group-chat/rooms/{room_id}/events")
+def mobile_group_chat_events(
+    room_id: str,
+    request: Request,
+    since_seq: int = 0,
+    limit: int = 100,
+):
+    from gateway import hosted_rooms
+
+    service, _owner_id, _account_generation = _mobile_group_chat_owned_room(
+        request, room_id
+    )
+    try:
+        return hosted_rooms.read_events(
+            service.db_path,
+            room_id=room_id,
+            since_seq=since_seq,
+            limit=limit,
+        )
+    except Exception as exc:
+        raise _mobile_group_chat_error(exc) from exc
+
+
+@router.post("/mobile/group-chat/rooms/{room_id}/messages")
+def mobile_group_chat_send_message(
+    room_id: str,
+    body: MobileGroupChatMessageBody,
+    request: Request,
+):
+    from gateway import hosted_rooms
+
+    service, _owner_id, _account_generation = _mobile_group_chat_owned_room(
+        request, room_id
+    )
+    try:
+        event = service.send(
+            room_id=room_id,
+            event_id=hosted_rooms.user_event_id(body.idempotency_key),
+            payload={"text": body.text, "thread_id": body.thread_id},
+        )
+    except Exception as exc:
+        raise _mobile_group_chat_error(exc) from exc
+    return {"event": event, "accepted": True, "driver_started": True}
+
+
+@router.post("/mobile/group-chat/rooms/{room_id}/rename")
+def mobile_group_chat_rename(
+    room_id: str,
+    body: MobileGroupChatRenameBody,
+    request: Request,
+):
+    from gateway import hosted_rooms
+
+    service, _owner_id, _account_generation = _mobile_group_chat_owned_room(
+        request, room_id
+    )
+    try:
+        room = hosted_rooms.rename_room(
+            service.db_path,
+            room_id=room_id,
+            event_id=f"mobile-rename-{hashlib.sha256(body.idempotency_key.encode()).hexdigest()}",
+            name=body.name,
+        )
+    except Exception as exc:
+        raise _mobile_group_chat_error(exc) from exc
+    return {"room": room}
+
+
+@router.post("/mobile/group-chat/rooms/{room_id}/stop")
+def mobile_group_chat_stop(
+    room_id: str,
+    body: MobileGroupChatStopBody,
+    request: Request,
+):
+    service, _owner_id, _account_generation = _mobile_group_chat_owned_room(
+        request, room_id
+    )
+    try:
+        cancelled = service.stop_room(
+            room_id,
+            cancel_id=f"mobile-stop-{hashlib.sha256(body.idempotency_key.encode()).hexdigest()}",
+        )
+    except Exception as exc:
+        raise _mobile_group_chat_error(exc) from exc
+    return {"cancelled": cancelled}
+
+
+@router.delete("/mobile/group-chat/rooms/{room_id}")
+def mobile_group_chat_delete(room_id: str, request: Request):
+    """Disband one owner-mobile room and remove its access binding."""
+
+    service, owner_id, account_generation = _mobile_group_chat_owned_room(
+        request, room_id
+    )
+    try:
+        return _disband_mobile_group_chat_room(
+            service,
+            room_id=room_id,
+            owner_id=owner_id,
+            account_generation=account_generation,
+            cancel_id=f"mobile-delete-{uuid.uuid4().hex}",
+        )
+    except Exception as exc:
+        raise _mobile_group_chat_error(exc) from exc
+
+
+@router.post("/mobile/group-chat/rooms/{room_id}/tasks/retry")
+def mobile_group_chat_retry(
+    room_id: str,
+    body: MobileGroupChatRetryBody,
+    request: Request,
+):
+    service, _owner_id, _account_generation = _mobile_group_chat_owned_room(
+        request, room_id
+    )
+    try:
+        return {"task": service.retry_room_task(room_id, task_id=body.task_id)}
+    except Exception as exc:
+        raise _mobile_group_chat_error(exc) from exc
+
+
+@router.post("/mobile/group-chat/rooms/{room_id}/tasks/approval")
+def mobile_group_chat_approval(
+    room_id: str,
+    body: MobileGroupChatApprovalBody,
+    request: Request,
+):
+    service, _owner_id, _account_generation = _mobile_group_chat_owned_room(
+        request, room_id
+    )
+    try:
+        result = service.approve_room_task(
+            room_id,
+            member_id=body.member_id,
+            task_id=body.task_id,
+            execution_generation=body.execution_generation,
+            request_id=body.request_id,
+            choice=body.choice,
+        )
+    except Exception as exc:
+        raise _mobile_group_chat_error(exc) from exc
+    return {"approved": True, "result": result}
 
 
 def _mobile_profile_home(profile: str) -> tuple[str, Path]:

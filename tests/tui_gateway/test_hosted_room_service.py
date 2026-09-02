@@ -394,6 +394,33 @@ def test_create_send_drive_publish_and_replay_without_client_transport(tmp_path:
     assert service.status("room-1")["working"] is False
 
 
+def test_create_room_can_persist_mobile_owner_in_same_storage_transaction(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+
+    room = service.create_room(
+        room_id="mobile-room-1",
+        name="Mobile room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+        owner_id="owner-a",
+        account_generation="generation-a",
+    )
+
+    assert room["idempotent"] is False
+    assert hosted_rooms.mobile_room_owned_by(
+        db,
+        room_id="mobile-room-1",
+        owner_id="owner-a",
+        account_generation="generation-a",
+    ) is True
+
+
 def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path):
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)

@@ -665,7 +665,15 @@ class HostedRoomService:
         self.prepare_room(binding)
         self.runtime.wakeup()
 
-    def create_room(self, *, room_id: str, name: str, members: Any) -> dict[str, Any]:
+    def create_room(
+        self,
+        *,
+        room_id: str,
+        name: str,
+        members: Any,
+        owner_id: str | None = None,
+        account_generation: str | None = None,
+    ) -> dict[str, Any]:
         normalized = discussion.validate_roster(
             members,
             local_profiles=self.local_profiles(),
@@ -689,6 +697,8 @@ class HostedRoomService:
                 for member in normalized
             ],
             authority_gateway_id=hosted_rooms.local_authority_gateway_id(),
+            owner_id=owner_id,
+            account_generation=account_generation,
         )
         self.runtime.wakeup()
         return room

@@ -129,6 +129,12 @@ _PEER_RESERVATION_SCHEMA_COLUMNS = frozenset({
     "created_at",
     "updated_at",
 })
+_MOBILE_OWNER_SCHEMA_COLUMNS = frozenset({
+    "room_id",
+    "owner_id",
+    "account_generation",
+    "created_at",
+})
 
 _EVENT_KINDS_BY_ACTOR = {
     "user": frozenset({"message.user"}),
@@ -533,6 +539,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (room_id, member_id, target_profile)
         )"""
     )
+    # The official room log remains gateway-scoped. This small binding table
+    # is only the authenticated mobile BFF access boundary; it never changes
+    # room authority, membership, events, grants, or execution policy.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hosted_room_mobile_owners (
+            room_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            account_generation TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (room_id) REFERENCES hosted_rooms(room_id)
+        )"""
+    )
     room_columns = {row[1] for row in conn.execute("PRAGMA table_info(hosted_rooms)")}
     if "authority_gateway_id" not in room_columns:
         conn.execute(
@@ -599,6 +617,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         """CREATE INDEX IF NOT EXISTS idx_hosted_room_events_cursor
            ON hosted_room_events(room_id, seq)"""
     )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_hosted_room_mobile_owners_lookup
+           ON hosted_room_mobile_owners(owner_id, account_generation, room_id)"""
+    )
     if not _schema_is_current(conn):
         raise HostedRoomError("hosted room schema migration did not complete")
 
@@ -627,6 +649,9 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         row[1]
         for row in conn.execute("PRAGMA table_info(hosted_room_peer_reservations)")
     )
+    mobile_owner_columns = frozenset(
+        row[1] for row in conn.execute("PRAGMA table_info(hosted_room_mobile_owners)")
+    )
     if not _ROOM_SCHEMA_COLUMNS.issubset(room_columns):
         return False
     if not _EVENT_SCHEMA_COLUMNS.issubset(event_columns):
@@ -646,11 +671,198 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         return False
     if not _PEER_RESERVATION_SCHEMA_COLUMNS.issubset(peer_reservation_columns):
         return False
+    if not _MOBILE_OWNER_SCHEMA_COLUMNS.issubset(mobile_owner_columns):
+        return False
     index = conn.execute(
         """SELECT 1 FROM sqlite_master
            WHERE type='index' AND name='idx_hosted_room_events_cursor'"""
     ).fetchone()
-    return index is not None
+    mobile_owner_index = conn.execute(
+        """SELECT 1 FROM sqlite_master
+           WHERE type='index' AND name='idx_hosted_room_mobile_owners_lookup'"""
+    ).fetchone()
+    return index is not None and mobile_owner_index is not None
+
+
+def _mobile_owner_value(value: Any, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise HostedRoomError(f"{label} must be a string")
+    normalized = value.strip()
+    if not normalized or "\x00" in normalized or len(normalized) > 512:
+        raise HostedRoomError(f"invalid {label}")
+    return normalized
+
+
+def _mobile_owner_binding_values(
+    owner_id: Any,
+    account_generation: Any,
+) -> tuple[str, str] | None:
+    """Normalize an optional mobile owner binding for room creation.
+
+    A caller may omit both values for ordinary gateway-owned rooms, but a
+    mobile owner binding is only meaningful when its owner and account era are
+    supplied together. Validate before opening the room transaction so an
+    invalid binding can never leave a newly-created room behind.
+    """
+
+    if owner_id is None and account_generation is None:
+        return None
+    if owner_id is None or account_generation is None:
+        raise HostedRoomError(
+            "owner_id and account_generation must be supplied together"
+        )
+    return (
+        _mobile_owner_value(owner_id, label="owner_id"),
+        _mobile_owner_value(account_generation, label="account_generation"),
+    )
+
+
+def _bind_mobile_room_owner_locked(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+    owner_id: str,
+    account_generation: str,
+    now: float,
+) -> bool:
+    """Bind a mobile owner while the caller already owns the write transaction."""
+
+    room = conn.execute(
+        "SELECT 1 FROM hosted_rooms WHERE room_id=? AND disbanded_at IS NULL",
+        (room_id,),
+    ).fetchone()
+    if room is None:
+        _raise_room_not_found(conn, room_id)
+    existing = conn.execute(
+        """SELECT owner_id, account_generation
+             FROM hosted_room_mobile_owners WHERE room_id=?""",
+        (room_id,),
+    ).fetchone()
+    if existing is not None:
+        if (
+            str(existing["owner_id"]) != owner_id
+            or str(existing["account_generation"]) != account_generation
+        ):
+            raise HostedRoomError("hosted room is already bound to another account")
+        return True
+    conn.execute(
+        """INSERT INTO hosted_room_mobile_owners(
+               room_id, owner_id, account_generation, created_at
+           ) VALUES (?, ?, ?, ?)""",
+        (room_id, owner_id, account_generation, now),
+    )
+    return False
+
+
+def bind_mobile_room_owner(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    owner_id: Any,
+    account_generation: Any,
+    now: float | None = None,
+) -> bool:
+    """Bind one live official room to its authenticated mobile account.
+
+    This is deliberately an access-index operation, not a room mutation. The
+    BFF uses it to authorize owner-mobile requests without exposing any
+    gateway-wide API-server credential or room-scoped grant to the device.
+    """
+
+    room_id = _validate_identifier(
+        room_id, label="room_id", max_chars=MAX_ROOM_ID_CHARS
+    )
+    owner_id = _mobile_owner_value(owner_id, label="owner_id")
+    account_generation = _mobile_owner_value(
+        account_generation, label="account_generation"
+    )
+    timestamp = time.time() if now is None else float(now)
+    with _transaction(db_path, immediate=True) as conn:
+        return _bind_mobile_room_owner_locked(
+            conn,
+            room_id=room_id,
+            owner_id=owner_id,
+            account_generation=account_generation,
+            now=timestamp,
+        )
+
+
+def mobile_room_owned_by(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    owner_id: Any,
+    account_generation: Any,
+) -> bool:
+    """Return whether the exact active account generation owns this room."""
+
+    room_id = _validate_identifier(
+        room_id, label="room_id", max_chars=MAX_ROOM_ID_CHARS
+    )
+    owner_id = _mobile_owner_value(owner_id, label="owner_id")
+    account_generation = _mobile_owner_value(
+        account_generation, label="account_generation"
+    )
+    with _transaction(db_path) as conn:
+        row = conn.execute(
+            """SELECT 1
+                 FROM hosted_room_mobile_owners AS binding
+                 JOIN hosted_rooms AS room ON room.room_id=binding.room_id
+                WHERE binding.room_id=? AND binding.owner_id=?
+                  AND binding.account_generation=? AND room.disbanded_at IS NULL""",
+            (room_id, owner_id, account_generation),
+        ).fetchone()
+    return row is not None
+
+
+def list_mobile_room_ids(
+    db_path: Path | str,
+    *,
+    owner_id: Any,
+    account_generation: Any,
+) -> list[str]:
+    """List live durable room ids accessible to one mobile account era."""
+
+    owner_id = _mobile_owner_value(owner_id, label="owner_id")
+    account_generation = _mobile_owner_value(
+        account_generation, label="account_generation"
+    )
+    with _transaction(db_path) as conn:
+        rows = conn.execute(
+            """SELECT binding.room_id
+                 FROM hosted_room_mobile_owners AS binding
+                 JOIN hosted_rooms AS room ON room.room_id=binding.room_id
+                WHERE binding.owner_id=? AND binding.account_generation=?
+                  AND room.disbanded_at IS NULL
+             ORDER BY binding.created_at DESC, binding.room_id ASC""",
+            (owner_id, account_generation),
+        ).fetchall()
+    return [str(row["room_id"]) for row in rows]
+
+
+def remove_mobile_room_owner(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    owner_id: Any,
+    account_generation: Any,
+) -> bool:
+    """Detach one exact mobile owner binding after room cleanup."""
+
+    room_id = _validate_identifier(
+        room_id, label="room_id", max_chars=MAX_ROOM_ID_CHARS
+    )
+    owner_id = _mobile_owner_value(owner_id, label="owner_id")
+    account_generation = _mobile_owner_value(
+        account_generation, label="account_generation"
+    )
+    with _transaction(db_path, immediate=True) as conn:
+        deleted = conn.execute(
+            """DELETE FROM hosted_room_mobile_owners
+                 WHERE room_id=? AND owner_id=? AND account_generation=?""",
+            (room_id, owner_id, account_generation),
+        )
+    return deleted.rowcount == 1
 
 
 def list_room_link_records(db_path: Path | str) -> list[dict[str, Any]]:
@@ -1367,6 +1579,7 @@ def _prune_disbanded_rooms_locked(
         "hosted_room_driver_leases",
         "hosted_room_remote_runs",
         "hosted_room_links",
+        "hosted_room_mobile_owners",
         "hosted_room_peer_reservations",
         "hosted_room_events",
     )
@@ -1418,9 +1631,17 @@ def create_room(
     name: Any,
     members: Any,
     authority_gateway_id: Any,
+    owner_id: Any | None = None,
+    account_generation: Any | None = None,
     now: float | None = None,
 ) -> dict[str, Any]:
-    """Create a room, or return the identical existing room idempotently."""
+    """Create a room, or return the identical existing room idempotently.
+
+    When ``owner_id`` and ``account_generation`` are supplied, the mobile
+    access binding is inserted or verified in this same write transaction. The
+    optional binding is deliberately additive: ordinary gateway callers keep
+    the original room-only behavior.
+    """
     room_id = _validate_identifier(
         room_id,
         label="room_id",
@@ -1433,6 +1654,7 @@ def create_room(
         label="authority_gateway_id",
         max_chars=MAX_ACTOR_ID_CHARS,
     )
+    mobile_owner = _mobile_owner_binding_values(owner_id, account_generation)
     now = time.time() if now is None else float(now)
 
     with _transaction(db_path, immediate=True) as conn:
@@ -1547,10 +1769,26 @@ def create_room(
                 if claim_event is None:  # pragma: no cover - inserted above
                     raise RuntimeError("legacy adoption event could not be reloaded")
                 result["claim_event"] = _event_from_row(claim_event)
+                if mobile_owner is not None:
+                    _bind_mobile_room_owner_locked(
+                        conn,
+                        room_id=room_id,
+                        owner_id=mobile_owner[0],
+                        account_generation=mobile_owner[1],
+                        now=now,
+                    )
                 return result
             if existing["authority_gateway_id"] != authority_gateway_id:
                 raise RoomConflictError(
                     "room_id already belongs to a different authority"
+                )
+            if mobile_owner is not None:
+                _bind_mobile_room_owner_locked(
+                    conn,
+                    room_id=room_id,
+                    owner_id=mobile_owner[0],
+                    account_generation=mobile_owner[1],
+                    now=now,
                 )
             return _room_from_row(existing, idempotent=True)
 
@@ -1580,6 +1818,14 @@ def create_room(
         ).fetchone()
         if row is None:  # pragma: no cover - guarded by the insert above
             raise RuntimeError("created room could not be reloaded")
+        if mobile_owner is not None:
+            _bind_mobile_room_owner_locked(
+                conn,
+                room_id=room_id,
+                owner_id=mobile_owner[0],
+                account_generation=mobile_owner[1],
+                now=now,
+            )
     result = _room_from_row(row)
     result["members"] = normalized_members
     return result

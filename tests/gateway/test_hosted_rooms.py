@@ -534,6 +534,157 @@ def test_room_log_survives_store_reopen(tmp_path):
     assert replay["events"][0]["payload"] == {"text": "persist me"}
 
 
+def test_mobile_owner_binding_scopes_rooms_to_one_account_generation(tmp_path):
+    db = tmp_path / "state.db"
+    _create(db)
+
+    assert rooms.bind_mobile_room_owner(
+        db,
+        room_id="room-1",
+        owner_id="owner-a",
+        account_generation="generation-a",
+        now=10,
+    ) is False
+    assert rooms.bind_mobile_room_owner(
+        db,
+        room_id="room-1",
+        owner_id="owner-a",
+        account_generation="generation-a",
+        now=11,
+    ) is True
+    assert rooms.mobile_room_owned_by(
+        db,
+        room_id="room-1",
+        owner_id="owner-a",
+        account_generation="generation-a",
+    ) is True
+    assert rooms.mobile_room_owned_by(
+        db,
+        room_id="room-1",
+        owner_id="owner-a",
+        account_generation="generation-b",
+    ) is False
+    assert rooms.list_mobile_room_ids(
+        db,
+        owner_id="owner-a",
+        account_generation="generation-a",
+    ) == ["room-1"]
+    with pytest.raises(rooms.HostedRoomError, match="another account"):
+        rooms.bind_mobile_room_owner(
+            db,
+            room_id="room-1",
+            owner_id="owner-b",
+            account_generation="generation-b",
+        )
+
+    assert rooms.remove_mobile_room_owner(
+        db,
+        room_id="room-1",
+        owner_id="owner-a",
+        account_generation="generation-a",
+    ) is True
+    assert rooms.list_mobile_room_ids(
+        db,
+        owner_id="owner-a",
+        account_generation="generation-a",
+    ) == []
+
+
+def test_mobile_owner_binding_failure_rolls_back_new_room(monkeypatch, tmp_path):
+    db = tmp_path / "state.db"
+
+    def fail_binding(*_args, **_kwargs):
+        raise RuntimeError("simulated mobile owner binding failure")
+
+    monkeypatch.setattr(rooms, "_bind_mobile_room_owner_locked", fail_binding)
+    with pytest.raises(RuntimeError, match="simulated mobile owner binding failure"):
+        rooms.create_room(
+            db,
+            room_id="mobile-room-1",
+            name="Mobile room",
+            members=[
+                {"member_id": "default", "profile": "default", "handle": "hermes"},
+                {"member_id": "ops", "profile": "ops", "handle": "ops"},
+            ],
+            authority_gateway_id="gateway-a",
+            owner_id="owner-a",
+            account_generation="generation-a",
+        )
+
+    assert rooms.list_rooms(db) == []
+    assert rooms.list_mobile_room_ids(
+        db,
+        owner_id="owner-a",
+        account_generation="generation-a",
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("owner_id", "account_generation"),
+    [(None, "generation-a"), ("owner-a", "")],
+)
+def test_invalid_mobile_owner_binding_does_not_create_room(
+    owner_id,
+    account_generation,
+    tmp_path,
+):
+    db = tmp_path / "state.db"
+    with pytest.raises(rooms.HostedRoomError):
+        rooms.create_room(
+            db,
+            room_id="mobile-room-1",
+            name="Mobile room",
+            members=[
+                {"member_id": "default", "profile": "default", "handle": "hermes"},
+                {"member_id": "ops", "profile": "ops", "handle": "ops"},
+            ],
+            authority_gateway_id="gateway-a",
+            owner_id=owner_id,
+            account_generation=account_generation,
+        )
+
+    assert rooms.list_rooms(db) == []
+
+
+def test_idempotent_mobile_create_recovers_unbound_room_without_deleting_it(tmp_path):
+    db = tmp_path / "state.db"
+    room = rooms.create_room(
+        db,
+        room_id="mobile-room-1",
+        name="Mobile room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+        authority_gateway_id="gateway-a",
+        now=10,
+    )
+
+    recovered = rooms.create_room(
+        db,
+        room_id="mobile-room-1",
+        name="Mobile room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+        authority_gateway_id="gateway-a",
+        owner_id="owner-a",
+        account_generation="generation-a",
+        now=11,
+    )
+
+    assert room["idempotent"] is False
+    assert recovered["idempotent"] is True
+    assert len(rooms.list_rooms(db)) == 1
+    assert rooms.mobile_room_owned_by(
+        db,
+        room_id="mobile-room-1",
+        owner_id="owner-a",
+        account_generation="generation-a",
+    ) is True
+
+
 @pytest.mark.parametrize("session_first", [True, False])
 def test_room_tables_coexist_with_session_db_schema(tmp_path, session_first):
     db = tmp_path / "state.db"
