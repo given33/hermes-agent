@@ -19,6 +19,7 @@ from hermes_cli.dashboard_auth.base import (
     ProviderError,
     RefreshExpiredError,
     assert_protocol_compliance,
+    classify_jwks_lookup_error,
 )
 from hermes_cli.dashboard_auth.registry import (
     register_provider,
@@ -40,6 +41,7 @@ __all__ = [
     "ProviderError",
     "RefreshExpiredError",
     "assert_protocol_compliance",
+    "classify_jwks_lookup_error",
     "register_provider",
     "get_provider",
     "list_providers",
