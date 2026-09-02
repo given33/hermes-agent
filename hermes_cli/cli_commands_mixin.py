@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import threading
 import time
@@ -41,43 +40,35 @@ from hermes_cli.browser_connect import (
 )
 
 
-def _normalize_git_worktree_list_line(line: str) -> str:
-    """Convert the path token of a ``git worktree list`` line to the native
-    form the rest of the CLI displays.
+def _print_lightpanda_engine_status() -> None:
+    """One or two ``/browser status`` lines about ``browser.engine: lightpanda``.
 
-    Native Windows git emits drive-letter paths with forward slashes
-    (``C:/Users/...``), which don't match what ``os.getcwd()`` /
-    ``str(Path)`` show (``C:\\Users\\...``) and don't round-trip into the
-    same path the rest of the session uses; Git Bash / WSL-mounted repos
-    can additionally surface ``/c/Users/...``. No-op on POSIX, where git
-    already emits native separators, and no-op when the line carries no
-    path.
+    Silent unless the engine is set to lightpanda. Says whether it is in use
+    (and by which driver) or which setting shadows it — the engine is the
+    lowest-precedence browser knob and used to be ignored silently.
     """
-    if sys.platform != "win32" or not line:
-        return line
-    stripped = line.strip()
-    if not stripped:
-        return line
-    quoted = stripped.startswith('"')
-    body = stripped[1:-1] if quoted else stripped
-    tokens = body.split(None, 1)
-    if not tokens:
-        return line
-    path = tokens[0]
-    normalized = path
-    m = re.match(r"^([A-Za-z]):/(.*)$", path)
-    if m:
-        normalized = f"{m.group(1)}:\\{m.group(2).replace('/', chr(92))}"
+    try:
+        from tools.browser_tool import lightpanda_engine_status, _using_lightpanda_engine
+
+        if not _using_lightpanda_engine():
+            return
+        used, reason = lightpanda_engine_status()
+    except Exception:
+        return
+    if not used:
+        print(f"   ⚠ browser.engine is 'lightpanda' but it is NOT in use: {reason}")
+        return
+    print(f"   Engine: Lightpanda — {reason} (no screenshots)")
+    try:
+        from tools.browser_lightpanda import LIGHTPANDA_INSTALL_HINT, find_lightpanda_binary
+
+        lightpanda_bin = find_lightpanda_binary()
+    except Exception:
+        return
+    if lightpanda_bin:
+        print(f"   Binary: {lightpanda_bin}")
     else:
-        m = re.match(r"^/([A-Za-z])/(.*)$", path)
-        if m:
-            normalized = (
-                f"{m.group(1).upper()}:\\{m.group(2).replace('/', chr(92))}"
-            )
-    if normalized == path:
-        return line
-    rebuilt = normalized + (f" {tokens[1]}" if len(tokens) > 1 else "")
-    return f'"{rebuilt}"' if quoted else rebuilt
+        print(f"   ⚠ lightpanda binary not found — {LIGHTPANDA_INSTALL_HINT}")
 
 
 class CLICommandsMixin:
@@ -1437,7 +1428,7 @@ class CLICommandsMixin:
                 out = ""
             if out:
                 for line in out.splitlines():
-                    print(f"  {_normalize_git_worktree_list_line(line)}")
+                    print(f"  {line}")
             else:
                 print("  Could not list worktrees.")
             return
@@ -2837,6 +2828,7 @@ class CLICommandsMixin:
             if _bu_mode:
                 print("🌐 Browser: Browser Use mode (browser_exec via the Browser Use CLI 3.0)")
                 print("   Local Chrome via CDP, or Browser Use cloud browsers")
+                _print_lightpanda_engine_status()
                 print()
                 print("   /browser use off      — revert to the built-in browser tools")
                 print()
@@ -2844,6 +2836,7 @@ class CLICommandsMixin:
             if current:
                 print("🌐 Browser: connected to live Chromium-family browser via CDP")
                 print(f"   Endpoint: {current}")
+                _print_lightpanda_engine_status()
 
                 _port = 9222
                 try:
@@ -2868,6 +2861,7 @@ class CLICommandsMixin:
 
                 if provider is not None:
                     print(f"🌐 Browser: {provider.provider_name()} (cloud)")
+                    _print_lightpanda_engine_status()
                 else:
                     # Show engine info for local mode
                     try:
@@ -2879,6 +2873,7 @@ class CLICommandsMixin:
                         print("🌐 Browser: local Lightpanda (agent-browser --engine lightpanda)")
                         print("   ⚡ Lightpanda: faster navigation, no screenshot support")
                         print("   Automatic Chromium fallback for screenshots and failed commands")
+                        _print_lightpanda_engine_status()
                     elif engine == "chrome":
                         print("🌐 Browser: local headless Chromium (agent-browser --engine chrome)")
                     else:
@@ -3023,6 +3018,38 @@ class CLICommandsMixin:
             f"  ⚗ Reviewing this conversation in the background{tail} — "
             f"any memory/skill updates will be reported when done."
         )
+
+    def _handle_review_command(self, cmd: str) -> None:
+        """Dispatch /review — spawn an independent reviewer subagent.
+
+        Snapshots the last N chat messages, wraps them (plus any argument
+        text as extra instructions) in a reviewer briefing, and dispatches a
+        full-privilege background subagent via the async delegation rail.
+        The review re-enters this session as a normal async-delegation
+        completion, addressed to the primary agent.
+        """
+        from cli import _DIM, _RST, _cprint
+
+        parts = (cmd or "").strip().split(None, 1)
+        prompt = parts[1].strip() if len(parts) > 1 else ""
+
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            _cprint(f"  {_DIM}Nothing to review yet — send a message first.{_RST}")
+            return
+
+        snapshot = list(getattr(self, "conversation_history", None) or [])
+        try:
+            from agent.review_engine import format_dispatch_note, start_review
+
+            result = start_review(agent, snapshot, prompt)
+        except ValueError as exc:
+            _cprint(f"  {_DIM}{exc}{_RST}")
+            return
+        except Exception as exc:
+            _cprint(f"  /review failed to start: {exc}")
+            return
+        _cprint(f"  {format_dispatch_note(result, prompt)}")
 
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / draft / show / gate / status / pause / resume / clear."""

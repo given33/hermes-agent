@@ -8,12 +8,14 @@ own; methods access the host's attributes (``self._conn``, ``self.db_path``,
 module-level constants live in hermes_state_common.
 """
 
-import functools
+import datetime
 import logging
 import json
 import sqlite3
 import time
+import uuid
 from typing import Dict, Optional, Sequence
+
 
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
@@ -164,119 +166,6 @@ class SessionSchemaMixin:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:
                 pass
-
-    def _drop_corrupt_fts_schema(
-        self,
-        cursor: sqlite3.Cursor,
-        *,
-        include_trigram: bool = True,
-    ) -> None:
-        """Drop only the known FTS5 objects after normal DDL cannot do so.
-
-        A damaged FTS5 shadow table can make SQLite construct the virtual table
-        while executing ``DROP TABLE messages_fts`` and fail with
-        ``vtable constructor failed``.  Directly deleting ``sqlite_master``
-        rows is insufficient: the shadow B-trees remain attached to the file,
-        and the replacement virtual table then collides with those stale
-        roots.  Within one transaction, turn each *verified* FTS5 root into a
-        temporary ordinary table, drop it normally, then drop the exact shadow
-        table/view names.  The allowlist is deliberately explicit so unrelated
-        ``messages_fts_*`` objects are never touched; any failure rolls back
-        both the schema text surgery and the physical drops.
-        """
-        root_names = ("messages_fts",)
-        if include_trigram:
-            root_names += ("messages_fts_trigram",)
-        shadow_names = (
-            "messages_fts_config",
-            "messages_fts_content",
-            "messages_fts_data",
-            "messages_fts_docsize",
-            "messages_fts_idx",
-        )
-        if include_trigram:
-            shadow_names += (
-                "messages_fts_trigram_config",
-                "messages_fts_trigram_content",
-                "messages_fts_trigram_data",
-                "messages_fts_trigram_docsize",
-                "messages_fts_trigram_idx",
-            )
-        view_names = ("messages_fts_trigram_src",) if include_trigram else ()
-        all_names = root_names + shadow_names + view_names
-        placeholders = ",".join("?" for _ in all_names)
-
-        self._conn.execute("BEGIN IMMEDIATE")
-        writable_schema = False
-        try:
-            rows = cursor.execute(
-                "SELECT name, type, sql FROM sqlite_master "
-                f"WHERE name IN ({placeholders})",
-                all_names,
-            ).fetchall()
-            objects = {
-                row[0]: (row[1], row[2])
-                for row in rows
-            }
-
-            # Only rewrite an object whose stored DDL proves it is an FTS5
-            # virtual table. An ordinary table with a colliding name is not
-            # part of this recovery surface and must be left untouched.
-            virtual_roots = []
-            for name in root_names:
-                obj = objects.get(name)
-                if obj is None:
-                    continue
-                type_, sql = obj
-                if type_ != "table" or "using fts5" not in (sql or "").lower():
-                    raise sqlite3.DatabaseError(
-                        f"refusing FTS recovery for unexpected object {name!r}"
-                    )
-                virtual_roots.append(name)
-
-            schema_cookie = cursor.execute(
-                "PRAGMA schema_version"
-            ).fetchone()[0]
-            cursor.execute("PRAGMA writable_schema=ON")
-            writable_schema = True
-            for name in virtual_roots:
-                # Names come only from the literal allowlist above. Replacing
-                # the root definition lets ordinary DROP TABLE remove its
-                # root B-tree without asking the damaged FTS module to load.
-                cursor.execute(
-                    "UPDATE sqlite_master SET sql = ? "
-                    "WHERE type = 'table' AND name = ?",
-                    (f"CREATE TABLE {name} (_hermes_recovery BLOB)", name),
-                )
-            # Direct sqlite_master edits do not invalidate prepared schemas on
-            # their own. Bump the cookie before returning to ordinary DDL.
-            cursor.execute(
-                f"PRAGMA schema_version={(int(schema_cookie) + 1) & 0x7FFFFFFF}"
-            )
-            cursor.execute("PRAGMA writable_schema=OFF")
-            writable_schema = False
-
-            for name in root_names:
-                if name in virtual_roots:
-                    cursor.execute(f"DROP TABLE {name}")
-            for name in shadow_names:
-                if objects.get(name, (None, None))[0] == "table":
-                    cursor.execute(f"DROP TABLE {name}")
-            for name in view_names:
-                if objects.get(name, (None, None))[0] == "view":
-                    cursor.execute(f"DROP VIEW {name}")
-            self._conn.commit()
-        except BaseException:
-            if writable_schema:
-                try:
-                    cursor.execute("PRAGMA writable_schema=OFF")
-                except sqlite3.Error:
-                    pass
-            try:
-                self._conn.rollback()
-            except sqlite3.Error:
-                pass
-            raise
 
     @staticmethod
     def _fts_trigger_count(
@@ -499,18 +388,38 @@ class SessionSchemaMixin:
         try:
             cursor.execute(f"SELECT * FROM {table_name} LIMIT 0")
             return True
-        except sqlite3.OperationalError as exc:
-            if self._is_fts5_unavailable_error(exc):
-                # Only disable FTS entirely when the whole module is missing.
-                # A missing trigram tokenizer only affects trigram searches.
-                if self._is_trigram_unavailable_error(exc):
-                    self._warn_trigram_unavailable(exc)
-                else:
-                    self._warn_fts5_unavailable(exc)
-                return None
-            if "no such table" in str(exc).lower():
-                return False
-            raise
+        except (sqlite3.OperationalError, UnicodeDecodeError) as exc:
+            # UnicodeDecodeError can occur when FTS shadow tables or content
+            # columns hold invalid UTF-8 bytes. On some Python/SQLite builds
+            # it surfaces as a bare UnicodeDecodeError (ValueError subclass,
+            # not sqlite3.Error); on others as OperationalError("Could not
+            # decode to UTF-8 column ..."). Catch both so the probe never
+            # kills the connection or raises to writable-init/recovery flows.
+            if isinstance(exc, sqlite3.OperationalError):
+                if self._is_fts5_unavailable_error(exc):
+                    # Only disable FTS entirely when the whole module is missing.
+                    # A missing trigram tokenizer only affects trigram searches.
+                    if self._is_trigram_unavailable_error(exc):
+                        self._warn_trigram_unavailable(exc)
+                    else:
+                        self._warn_fts5_unavailable(exc)
+                    return None
+                if "no such table" in str(exc).lower():
+                    return False
+                # Re-raise any other OperationalError (e.g. malformed schema,
+                # corrupt vtable that isn't a decode error).
+                if "decode to utf-8" not in str(exc).lower():
+                    raise
+            # Swallow: decode error means the index is degraded but the
+            # store remains accessible. Writable init / recovery will
+            # schedule a rebuild or degrade to LIKE.
+            logger.warning(
+                "%s probe encountered invalid UTF-8 in FTS content; "
+                "search may return incomplete results until FTS is rebuilt: %s",
+                table_name,
+                exc,
+            )
+            return None
 
     def _recover_stale_fts(self, cursor: sqlite3.Cursor, *, legacy: bool) -> bool:
         """Atomically rebuild stale base/trigram indexes and resume syncing."""
@@ -608,7 +517,7 @@ class SessionSchemaMixin:
         """Body of :meth:`_recover_stale_fts`; caller holds rebuild authority."""
         try:
             trigram_status = self._fts_table_probe(cursor, "messages_fts_trigram")
-        except sqlite3.DatabaseError:
+        except (sqlite3.DatabaseError, UnicodeDecodeError):
             # A corrupt vtable may fail even a LIMIT 0 probe. It still needs
             # to be included in the drop-and-recreate recovery below.
             trigram_status = True
@@ -682,46 +591,12 @@ class SessionSchemaMixin:
             # DDL transaction behavior differs.
             self._drop_all_fts_triggers(cursor)
             self._conn.commit()
-            try:
-                # A corrupt FTS5 shadow table can make DROP TABLE itself fail
-                # while the canonical messages table remains readable. Remove
-                # the derived schema through the same narrowly-scoped
-                # writable_schema fallback as the offline repair command, then
-                # recreate and backfill it from canonical rows.
-                self._drop_corrupt_fts_schema(
-                    cursor,
-                    include_trigram=include_trigram,
-                )
-                cursor.executescript(
-                    "BEGIN IMMEDIATE;"
-                    + rebuild_sql
-                    + f"DELETE FROM state_meta WHERE key = '{FTS_STALE_KEY}';"
-                    + "COMMIT;"
-                )
-            except sqlite3.DatabaseError as fallback_exc:
-                try:
-                    self._conn.rollback()
-                except sqlite3.Error:
-                    pass
-                self._drop_all_fts_triggers(cursor)
-                self._conn.commit()
-                logger.error(
-                    "Automatic rebuild of stale FTS indexes failed (%s; "
-                    "schema fallback: %s); canonical writes remain enabled "
-                    "with FTS detached.",
-                    exc,
-                    fallback_exc,
-                )
-                return False
-
-            self._fts_stale = False
-            self._fts_enabled = True
-            self._trigram_available = include_trigram
-            logger.warning(
-                "Rebuilt stale state.db FTS indexes through schema fallback "
-                "and restored sync triggers."
+            logger.error(
+                "Automatic rebuild of stale FTS indexes failed (%s); "
+                "canonical writes remain enabled with FTS detached.",
+                exc,
             )
-            return True
+            return False
 
         self._fts_stale = False
         self._fts_enabled = True
@@ -733,7 +608,6 @@ class SessionSchemaMixin:
         return True
 
     @staticmethod
-    @functools.lru_cache(maxsize=8)
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
         """Extract expected columns per table from SCHEMA_SQL.
 
@@ -746,14 +620,38 @@ class SessionSchemaMixin:
         Adding a column to SCHEMA_SQL is all that's needed; the
         reconciliation loop picks it up automatically.
 
-        The parse result is memoized only in this process.  A previous disk
-        cache stored reconstructed type expressions and replayed those strings
-        into ``ALTER TABLE``.  Its schema hash authenticated the shipped DDL,
-        not the cache contents, so a corrupt/synchronized/tampered JSON file
-        could become executable migration SQL.  Re-parsing once per process
-        keeps the shipped schema as the sole DDL authority while avoiding the
-        repeated ~85 ms scratch-database cost during that process.
+        The parse result is memoized on disk keyed by a hash of the DDL:
+        executing SCHEMA_SQL (FTS5 virtual tables included) in the scratch
+        DB costs ~85ms on every startup, but the output is a pure function
+        of the DDL text, which only changes when the shipped code changes.
+        Reconciliation itself (diffing the LIVE database) still runs every
+        startup — only the reference-side parse is cached. A corrupt or
+        stale cache degrades to recomputation.
         """
+        import hashlib as _hashlib
+        import json as _json
+
+        cache_path = None
+        schema_hash = _hashlib.sha256(schema_sql.encode("utf-8")).hexdigest()
+        try:
+            from hermes_constants import get_hermes_home
+            cache_path = get_hermes_home() / "cache" / "schema_columns.json"
+            blob = _json.loads(cache_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(blob, dict)
+                and blob.get("schema_hash") == schema_hash
+                and isinstance(blob.get("tables"), dict)
+            ):
+                tables = blob["tables"]
+                if all(
+                    isinstance(cols, dict)
+                    and all(isinstance(v, str) for v in cols.values())
+                    for cols in tables.values()
+                ):
+                    return tables
+        except Exception:
+            pass  # missing/corrupt cache → recompute below
+
         ref = sqlite3.connect(":memory:")
         try:
             ref.executescript(schema_sql)
@@ -763,9 +661,8 @@ class SessionSchemaMixin:
                 "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall():
                 cols: Dict[str, str] = {}
-                safe_table = str(tbl).replace('"', '""')
                 for row in ref.execute(
-                    f'PRAGMA table_info("{safe_table}")'
+                    f'PRAGMA table_info("{tbl}")'
                 ).fetchall():
                     # row: (cid, name, type, notnull, dflt_value, pk)
                     col_name = row[1]
@@ -783,6 +680,22 @@ class SessionSchemaMixin:
                 table_columns[tbl] = cols
         finally:
             ref.close()
+
+        if cache_path is not None:
+            try:
+                import os as _os
+                import tempfile as _tempfile
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp = _tempfile.mkstemp(
+                    dir=str(cache_path.parent), prefix=".schema_columns."
+                )
+                with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    _json.dump(
+                        {"schema_hash": schema_hash, "tables": table_columns}, fh
+                    )
+                _os.replace(tmp, cache_path)
+            except Exception:
+                pass  # cache write is best-effort
         return table_columns
 
     def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
@@ -800,11 +713,10 @@ class SessionSchemaMixin:
         """
         expected = self._parse_schema_columns(SCHEMA_SQL)
         for table_name, declared_cols in expected.items():
-            safe_table_name = table_name.replace('"', '""')
             # Get current columns from the live table
             try:
                 rows = cursor.execute(
-                    f'PRAGMA table_info("{safe_table_name}")'
+                    f'PRAGMA table_info("{table_name}")'
                 ).fetchall()
             except sqlite3.OperationalError:
                 continue  # Table doesn't exist yet (shouldn't happen after executescript)
@@ -819,7 +731,7 @@ class SessionSchemaMixin:
                     safe_name = col_name.replace('"', '""')
                     try:
                         cursor.execute(
-                            f'ALTER TABLE "{safe_table_name}" ADD COLUMN "{safe_name}" {col_type}'
+                            f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
                         )
                     except sqlite3.OperationalError as exc:
                         message = str(exc).lower()
@@ -1143,6 +1055,17 @@ class SessionSchemaMixin:
                 "INSERT INTO schema_version (version) VALUES (?)",
                 (SCHEMA_VERSION,),
             )
+            # Record store provenance on creation so fresh vs wiped stores are distinguishable (#97568)
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            instance_id = str(uuid.uuid4())
+            cursor.executemany(
+                "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
+                [
+                    ("store_instance_id", instance_id),
+                    ("store_created_at_utc", now_iso),
+                ],
+            )
+
         else:
             current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
             # Data migrations that can't be expressed declaratively (row

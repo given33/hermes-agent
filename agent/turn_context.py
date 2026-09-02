@@ -95,11 +95,37 @@ def _preflight_request_tokens(
             "using generic transcript estimate",
             exc_info=True,
         )
+    if _agent_stale_thinking_on_wire(agent):
+        return estimate_request_tokens_rough(
+            messages,
+            system_prompt=system_prompt or "",
+            tools=tools,
+        )
     return estimate_request_tokens_rough(
         messages,
         system_prompt=system_prompt or "",
         tools=tools,
+        charge_stale_thinking=False,
     )
+
+
+def _agent_stale_thinking_on_wire(agent: Any) -> bool:
+    """Whether the agent's active route replays stale thinking text (#84371).
+
+    Route facts unavailable (test doubles, partially-built agents) default to
+    ``True`` — the conservative full charge.
+    """
+    try:
+        from agent.message_sanitization import stale_thinking_reaches_wire
+
+        return stale_thinking_reaches_wire(
+            getattr(agent, "api_mode", "") or "",
+            getattr(agent, "provider", "") or "",
+            getattr(agent, "model", "") or "",
+            getattr(agent, "base_url", "") or "",
+        )
+    except Exception:
+        return True
 
 
 def compose_user_api_content(
@@ -377,6 +403,21 @@ def compression_made_progress(
 # old name bound means existing callers and any test that patches
 # ``_compression_made_progress`` continue to work unchanged.
 _compression_made_progress = compression_made_progress
+
+
+class PreflightCompressionTimedOut(RuntimeError):
+    """Raised when an oversized turn cannot safely finish preflight."""
+
+
+def _fail_closed_after_preflight_timeout(agent, request_tokens: int) -> None:
+    """Stop an oversized turn instead of sending its unchanged provider payload."""
+    if not getattr(agent, "_last_compression_timed_out", False):
+        return
+    raise PreflightCompressionTimedOut(
+        "Context compression timed out before it could commit while the request "
+        f"was still approximately {request_tokens:,} tokens. The provider call "
+        "was not sent. Run /compress and wait for it to finish, then retry."
+    )
 
 
 def _review_fork_first_request_pending(agent: Any) -> bool:
@@ -1143,6 +1184,7 @@ def build_turn_context(
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):
+                    _fail_closed_after_preflight_timeout(agent, _preflight_tokens)
                     _preflight_compression_blocked = True
                     break  # Cannot compress further: neither rows nor tokens moved
                 conversation_history = conversation_history_after_compression(

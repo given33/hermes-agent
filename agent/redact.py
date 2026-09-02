@@ -150,23 +150,20 @@ _PREFIX_PATTERNS = [
 # match — those are handled by the config/form/URL paths, and a bare
 # ``password=…`` in a form body must not be swallowed greedily by ``\S+``.
 _SECRET_ENV_NAMES = r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDENTIAL|AUTH)"
-# Run quoted assignments in a dedicated pass. The optional-quote expression
-# below can backtrack to an empty quote and mask only the first token of a
-# value such as ``TOKEN=\"alpha bravo\"``.
-_ENV_QUOTED_ASSIGN_RE = re.compile(
-    rf"([A-Za-z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Za-z0-9_]{{0,50}})\s*=\s*(['\"])([^'\"\r\n]*)\2",
-    re.IGNORECASE,
-)
 # Uppercase keys keep the legacy embedded match (``MYTOKEN=…``, ``FOO_SECRET``)
 # — an all-caps key is almost never prose.
 _ENV_ASSIGN_RE = re.compile(
-    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(?!['\"])(['\"]?)(\S+)",
+    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
 )
 # Lowercase env names: only underscore-boundary forms (``openai_key=…``,
 # ``FAL_KEY=…``, ``db_pw=…``) — NOT bare ``password=``/``token=``/``secret=``,
 # which appear in prose, URLs, and form bodies (issue #77484).
+# Anchor each attempt to the start of an identifier run.  Without the
+# lookbehind, ``re.sub`` retries the greedy ``[a-z0-9_]+`` prefix at every byte
+# of a long non-matching opaque payload, making strict compaction redaction
+# quadratic while holding the GIL (#99255).
 _ENV_ASSIGN_LOWER_RE = re.compile(
-    rf"([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(?!['\"])(['\"]?)(\S+)",
+    rf"(?<![a-z0-9_])([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
     re.IGNORECASE,
 )
 
@@ -207,15 +204,22 @@ _ENV_LOOKUP_VALUE_RE = re.compile(
 # ``(?:[A-Za-z0-9_\-]+\.)+`` (exponential backtracking on long dotted runs).
 # The ``*`` runs bordering {_SECRET_CFG_NAMES} must stay backtrackable
 # (secret words are matchable by the class, e.g. ``app.api.key=…``).
+# The lookbehind anchors each attempt to the start of a key run: without it,
+# ``re.sub`` retries the backtrackable ``*`` prefix at every byte of a long
+# non-matching dotted run, making the sub quadratic whenever the text contains
+# a secret keyword anywhere (the ``_CFG_SECRET_WORD_RE`` pre-gate only skips
+# secret-free text). Match set is unchanged — any match starting mid-run
+# implies a leftmost match starting at the run start (#99255).
 _CFG_DOTTED_RE = re.compile(
+    rf"(?<![A-Za-z0-9_.\-])"
     rf"([A-Za-z0-9_\-]++\.[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*+"
     rf"|[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*\.[A-Za-z0-9_.\-]++)"
-    rf"=(?!['\"]){_CFG_VALUE}",
+    rf"={_CFG_VALUE}",
     re.IGNORECASE,
 )
 # Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
 _CFG_ANCHORED_RE = re.compile(
-    rf"(^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)=(?!['\"]){_CFG_VALUE}",
+    rf"(^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -867,11 +871,6 @@ def redact_sensitive_text(
                 if not _key_has_secret_keyword(name):
                     return m.group(0)
                 return f"{name}={quote}{_mask_token(value)}{quote}"
-            # Capture quoted values (including spaces) before the unquoted
-            # assignment passes.  The latter explicitly skip a quote so a
-            # masked value such as ``"alpha ...lta"`` is not split again and
-            # leaked from the middle onward.
-            text = _ENV_QUOTED_ASSIGN_RE.sub(_redact_env, text)
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase env names (``openai_key=…``). Skip URLs — the query
             # string may contain ``token=``/``key=`` params that are
