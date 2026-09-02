@@ -69,6 +69,14 @@ connector-only in the product topology and are shown as informational; they
 cannot be selected as peer gateways until an independent Hermes API gateway
 with RoomLink is deployed on that device.
 
+For the four-device layout described in the deployment audit, keep the roles
+separate: server 1 runs the `hermes-manager` authority/BFF, server 2 runs an
+independent HTTPS Hermes gateway and is registered in `bot_peers`, Windows/WSL
+is a connector-only worker, and DBB3 Linux is a connector-only worker. The
+second server becomes a room member only after its RoomLink endpoint and
+server-managed key are configured; Windows/WSL and DBB3 remain execution
+lanes unless they are separately promoted to full gateways.
+
 ## Operator configuration
 
 The manager uses the upstream peer registry. For example, the manager may
