@@ -70,12 +70,15 @@ cannot be selected as peer gateways until an independent Hermes API gateway
 with RoomLink is deployed on that device.
 
 For the four-device layout described in the deployment audit, keep the roles
-separate: server 1 runs the `hermes-manager` authority/BFF, server 2 runs an
+explicit: server 1 runs the `hermes-manager` authority/BFF, server 2 runs an
 independent HTTPS Hermes gateway and is registered in `bot_peers`, Windows/WSL
-is a connector-only worker, and DBB3 Linux is a connector-only worker. The
-second server becomes a room member only after its RoomLink endpoint and
-server-managed key are configured; Windows/WSL and DBB3 remain execution
-lanes unless they are separately promoted to full gateways.
+is a connector-only worker, and DBB3 Linux is a connector-only worker. A
+single room can contain up to six gateway members, so additional devices can
+be added by registering more peers (for example `server2`, `windows`, and
+`dbb3`) after each device is independently deployed as an HTTPS `api_server`
+with RoomLink. Existing Windows/WSL and DBB3 connector services do not become
+room members automatically: they remain execution lanes until that separate
+gateway deployment and peer registration are complete.
 
 ## Operator configuration
 
@@ -84,10 +87,19 @@ contain the following non-secret configuration:
 
 ```yaml
 bot_peers:
-  hk:
-    url: https://hk-gateway.example.test
-    note: Hong Kong gateway
+  server2:
+    url: https://server2-gateway.example.test
+    note: Second server gateway
     profiles: [default]
+  # Optional only after independent api_server + RoomLink deployment:
+  # windows:
+  #   url: https://windows-gateway.example.test
+  #   note: Windows gateway
+  #   profiles: [default]
+  # dbb3:
+  #   url: https://dbb3-gateway.example.test
+  #   note: DBB3 gateway
+  #   profiles: [default]
 ```
 
 The matching API key is stored in the manager's secret scope as

@@ -125,6 +125,17 @@ def test_mobile_group_gateway_catalog_is_secret_free_and_lists_connector_only_no
         module,
         "_mobile_group_chat_peer_entries",
         lambda: {
+            "server2": {
+                "gateway_id": "server2",
+                "label": "Server 2",
+                "profiles": ("default", "reviewer"),
+                "profiles_declared": True,
+                "ready": True,
+                "reason": "",
+                "peer": {"url": "https://server2.example.test"},
+                "url": "https://server2.example.test",
+                "api_key": "server2-secret-that-must-not-leak",
+            },
             "hk": {
                 "gateway_id": "hk",
                 "label": "Hong Kong",
@@ -143,10 +154,16 @@ def test_mobile_group_gateway_catalog_is_secret_free_and_lists_connector_only_no
     result = module.mobile_group_chat_gateways(object())
     encoded = json.dumps(result, ensure_ascii=False)
 
-    assert {gateway["gateway_id"] for gateway in result["gateways"]} == {"local", "hk"}
-    assert result["gateways"][1]["room_link_ready"] is True
+    assert {gateway["gateway_id"] for gateway in result["gateways"]} == {
+        "local",
+        "server2",
+        "hk",
+    }
+    assert all(gateway["room_link_ready"] is True for gateway in result["gateways"][1:])
     assert {node["node_id"] for node in result["execution_nodes"]} == {"dbb3", "wsl", "hk"}
     assert "https://hk.example.test" not in encoded
+    assert "https://server2.example.test" not in encoded
+    assert "server2-secret-that-must-not-leak" not in encoded
     assert "secret-that-must-not-leak" not in encoded
     assert "api_key" not in encoded
 
