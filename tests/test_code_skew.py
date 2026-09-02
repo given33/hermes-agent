@@ -128,8 +128,14 @@ class TestModelOptionsSkewGuard:
             return func()
 
         monkeypatch.setattr(web_server, "run_in_threadpool", _fake_run_in_threadpool)
+        def _unexpected_skill_scope(profile):
+            raise AssertionError("model options must not acquire the skills lock")
+
+        monkeypatch.setattr(web_server, "_profile_scope", _unexpected_skill_scope)
         monkeypatch.setattr(
-            web_server, "_profile_scope", lambda profile: contextlib.nullcontext()
+            web_server,
+            "_config_profile_scope",
+            lambda profile: contextlib.nullcontext(),
         )
         monkeypatch.setattr("hermes_cli.inventory.load_picker_context", lambda: {})
 
