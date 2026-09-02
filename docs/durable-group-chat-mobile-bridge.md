@@ -103,7 +103,8 @@ bot_peers:
 ```
 
 The matching API key is stored in the manager's secret scope as
-`HERMES_PEER_HK_KEY`. On the target gateway, configure a strong
+`HERMES_PEER_SERVER2_KEY` (the `HERMES_PEER_<NAME>_KEY` form follows the
+registered peer name). On the target gateway, configure a strong
 `API_SERVER_KEY` and an HTTPS `HERMES_ROOM_LINK_URL` (or the equivalent gateway
 config setting). The BFF only returns `gateway_id`, labels, declared profiles,
 and readiness reasons; it never returns the URL or either credential.
