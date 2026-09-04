@@ -1139,6 +1139,12 @@ def _run_sequential_tool_execution_middleware(
                 # this agent's capacity while retaining the process-wide
                 # orphan bound until the worker really exits.
                 execution_lease.abandon()
+            # The interrupt reason lives on the agent (set by the requester -
+            # e.g. a subagent lifecycle cancel sets it to "subagent
+            # cancellation requested"). Never substitute a generic fallback:
+            # the point of this message is to surface exactly that reason
+            # while hiding the caller's private detail.
+            interrupt_reason = getattr(agent, "_tool_interrupt_reason", None)
             message = (
                 f"[Tool execution cancelled — {function_name} was abandoned: "
                 f"{interrupt_reason}]"
