@@ -43,6 +43,20 @@ class TestUnifiedDashboardRouting:
 
         monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
 
+        # Windows deliberately does NOT re-exec (os.execvpe under Python 3.14+
+        # crashes with STATUS_ACCESS_VIOLATION): cmd_dashboard reroutes via
+        # subprocess.Popen + sys.exit(proc.wait()). Patch that seam too —
+        # otherwise the real machine dashboard spawns and the test wedges.
+        class _FakeProc:
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(argv, env=None, **kwargs):
+            execs.append((sys.executable, argv, env or {}))
+            return _FakeProc()
+
+        monkeypatch.setattr(main_mod.subprocess, "Popen", fake_popen)
+
         with pytest.raises(SystemExit):
             main_mod.cmd_dashboard(_args())
 
@@ -88,11 +102,20 @@ class TestUnifiedDashboardRouting:
 class TestInteractiveDashboardAuthSetup:
 
     def test_loopback_proxy_public_url_offers_auth_setup(
-        self, main_mod, monkeypatch, capsys
+        self, main_mod, monkeypatch, capsys, tmp_path
     ):
         """A TTY operator is prompted when public_url gates a loopback bind."""
+        # Trigger the one-time plugin-route mount FIRST: this fork's web_server
+        # import auto-registers dashboard auth providers (the iOS owner-mobile
+        # token provider among them). Clearing after the mount leaves the
+        # registry genuinely empty so the interactive-setup gate engages.
+        import hermes_cli.web_server  # noqa: F401
         from hermes_cli.dashboard_auth import clear_providers
 
+        # Isolate the config root: on a host whose real ~/.hermes/config.yaml
+        # already carries dashboard.public_url the setup helper takes the
+        # already-configured path and never prompts.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
         monkeypatch.setenv(
             "HERMES_DASHBOARD_PUBLIC_URL",
             "https://dashboard.example.test:9443",
