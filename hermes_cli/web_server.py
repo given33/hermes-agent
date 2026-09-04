@@ -8240,9 +8240,15 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
                 # string with no provider info, so without this a user who
                 # picks an OpenRouter model while their default provider is
                 # ollama-local keeps the stale provider and 404s. Only fires
-                # on a real model change so saving unrelated config fields
-                # never overwrites an explicit provider.
-                if model_val != prev_default and prev_provider:
+                # on a real model change — a ctx-only partial update (no
+                # model key) and saving unrelated config fields never touch
+                # the explicit provider.
+                if (
+                    isinstance(model_val, str)
+                    and model_val
+                    and model_val != prev_default
+                    and prev_provider
+                ):
                     new_provider, resolved_model = _infer_provider_on_model_change(
                         model_val, prev_provider
                     )
@@ -8258,33 +8264,9 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
                             disk_model, norm_provider, norm_model
                         )
                         model_val = norm_model
+                # Preserve all subkeys; only a real model string updates the
+                # default (a ctx-only partial update must not touch it).
                 if isinstance(model_val, str) and model_val:
-                    prev_default = str(disk_model.get("default") or "").strip()
-                    prev_provider = str(disk_model.get("provider") or "").strip()
-                    # When the model name actually changed, re-detect which
-                    # provider serves it. The Config-page Model field is a flat
-                    # string with no provider info, so without this a user who
-                    # picks an OpenRouter model while their default provider is
-                    # ollama-local keeps the stale provider and 404s. Only fires
-                    # on a real model change so saving unrelated config fields
-                    # never overwrites an explicit provider.
-                    if model_val != prev_default and prev_provider:
-                        new_provider, resolved_model = _infer_provider_on_model_change(
-                            model_val, prev_provider
-                        )
-                        if new_provider and new_provider.strip().lower() != prev_provider.lower():
-                            # Route through the canonical assignment chokepoints so
-                            # the model is normalized for the new provider and stale
-                            # base_url/api_mode/api_key are cleared on the switch
-                            # (and preserved on a same-provider re-pick).
-                            norm_provider, norm_model = _normalize_main_model_assignment(
-                                new_provider, resolved_model
-                            )
-                            disk_model = _apply_main_model_assignment(
-                                disk_model, norm_provider, norm_model
-                            )
-                            model_val = norm_model
-                    # Preserve all subkeys, update default with the new value
                     disk_model["default"] = model_val
                 # Write context_length into the model dict (0 = remove/auto),
                 # but only when the payload actually carried the key.
