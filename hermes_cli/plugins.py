@@ -1612,7 +1612,7 @@ class PluginContext:
     ) -> PluginRegistration:
         """Record host-owned cleanup for a successful registration."""
         registration = self._manager._track_registration(
-            self.manifest, kind, key, release
+            self.manifest, kind, key, release, persistent=persistent
         )
         self._effect_registrations.append(registration)
         return registration

@@ -3065,6 +3065,17 @@ def _retire_legacy_review_rows(conn: sqlite3.Connection) -> None:
     still contain review rows or an in-flight review run, so upgrading must
     preserve their history without leaving work permanently undispatchable.
     """
+    # The SELECT below assumes the modern ``tasks`` shape. Ancient boards
+    # predate those columns — the additive migrator backfills
+    # ``current_run_id``/``worker_pid`` but never creates ``status`` or
+    # ``claim_lock`` — so a schema missing any of them predates the review
+    # workflow and has no review rows to retire. Skip instead of crashing
+    # the whole migration on ``no such column`` (pinned by the
+    # legacy-schema tests in test_kanban_core_functionality.py and the
+    # concurrent-migration test in test_kanban_db.py).
+    task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if not {"status", "current_run_id", "worker_pid", "claim_lock"} <= task_cols:
+        return
     candidates = conn.execute(
         "SELECT id, status, current_run_id, worker_pid, claim_lock "
         "FROM tasks WHERE status IN ('review', 'running')"
