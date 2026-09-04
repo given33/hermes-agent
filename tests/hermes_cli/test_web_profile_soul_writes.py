@@ -29,12 +29,20 @@ SOUL = "# Persona\n\nYou are a careful, terse assistant.\n"
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token")
     from hermes_cli import web_server
 
-    with TestClient(web_server.app, raise_server_exceptions=False) as c:
-        c.headers["Authorization"] = "Bearer soul-test-token"
-        yield c
+    # _SESSION_TOKEN is snapshotted once at web_server import time; setting
+    # the env var here is a no-op when another test imported the module
+    # first (then auth 401s instead of reaching the endpoint). Use the
+    # server's own token seam and restore on the way out.
+    prev_token = web_server._SESSION_TOKEN
+    web_server._apply_ssh_session_token("soul-test-token")
+    try:
+        with TestClient(web_server.app, raise_server_exceptions=False) as c:
+            c.headers["Authorization"] = "Bearer soul-test-token"
+            yield c
+    finally:
+        web_server._SESSION_TOKEN = prev_token
 
 
 @pytest.fixture()

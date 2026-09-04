@@ -18,12 +18,22 @@ from fastapi.testclient import TestClient  # noqa: E402
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "clamp-test-token")
     from hermes_cli import web_server
 
-    with TestClient(web_server.app, raise_server_exceptions=False) as c:
-        c.headers["Authorization"] = "Bearer clamp-test-token"
-        yield c
+    # _SESSION_TOKEN is snapshotted once at web_server import time (the
+    # product mints it at server start), so setting the env var here does
+    # nothing when an earlier test in the same process imported the module
+    # first - auth would then 401 instead of reaching the validators. Push
+    # our token through the same seam the server itself uses and restore
+    # whatever a previous test installed.
+    prev_token = web_server._SESSION_TOKEN
+    web_server._apply_ssh_session_token("clamp-test-token")
+    try:
+        with TestClient(web_server.app, raise_server_exceptions=False) as c:
+            c.headers["Authorization"] = "Bearer clamp-test-token"
+            yield c
+    finally:
+        web_server._SESSION_TOKEN = prev_token
 
 
 class TestSessionPaginationClamps:
