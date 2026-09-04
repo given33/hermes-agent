@@ -473,6 +473,15 @@ class TestLaunchdRestartWedgedIntegration:
         assert ("drain", 4242, 195.0) in events
 
 
+@pytest.mark.skipif(
+    not hasattr(asyncio, "start_unix_server"),
+    reason="loop-tick witness socket is AF_UNIX (asyncio.start_unix_server, "
+    "POSIX-only): on Windows the watchdog degrades gracefully - it logs "
+    "'Loop tick socket unavailable' and liveness probes run without the "
+    "scheduling witness, never escalating on a stale heartbeat. Porting the "
+    "witness to a loopback TCP socket is a tracked product task; until it "
+    "lands the witness contract itself is untestable on Windows.",
+)
 class TestLoopTickWitness:
     """Two-witness liveness (#90502 review).
 

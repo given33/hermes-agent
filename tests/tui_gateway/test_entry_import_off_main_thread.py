@@ -50,7 +50,9 @@ def _spawn_worker_import_entry():
         "    sys.stdout.write('IMPORT_FAILED: ' + errs[0] + '\\n')\n"
         "    sys.exit(2)\n"
         "# main thread of this process still installs SIGPIPE handler\n"
-        "h = signal.getsignal(signal.SIGPIPE)\n"
+        "# (POSIX-only: Windows' signal module has no SIGPIPE attribute and\n"
+        "# entry.py guards each install — the worker import above is the point)\n"
+        "h = signal.getsignal(signal.SIGPIPE) if hasattr(signal, 'SIGPIPE') else None\n"
         "sys.stdout.write('OK handler_installed=' + str(h is signal.SIG_IGN or callable(h)) + '\\n')\n"
         "sys.exit(0)\n"
     )
