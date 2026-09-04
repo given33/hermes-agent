@@ -4,6 +4,7 @@ import {
   cacheManifests,
   canSeedLoadedFromCache,
   MANIFEST_CACHE_KEY,
+  normalizePluginManifest,
 } from "./usePlugins";
 import type { PluginManifest } from "./types";
 
@@ -38,10 +39,26 @@ const exampleManifest: PluginManifest = {
   icon: "Puzzle",
   version: "1.0.0",
   tab: { path: "/test" },
+  slots: [],
   entry: "index.js",
   has_api: false,
   source: "local",
 };
+
+it("normalizes omitted or invalid slot declarations", () => {
+  expect(
+    normalizePluginManifest({
+      ...exampleManifest,
+      slots: ["chat", 42, null] as unknown as string[],
+    }),
+  ).toMatchObject({ slots: ["chat"] });
+  expect(
+    normalizePluginManifest({
+      ...exampleManifest,
+      slots: undefined,
+    }),
+  ).toMatchObject({ slots: [] });
+});
 
 describe("plugin manifest cache helpers", () => {
   let storage: Storage;

@@ -10,6 +10,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useLocation } from "react-router";
 import { api, HERMES_BASE_PATH } from "@/lib/api";
+import type { PluginManifestResponse } from "@/lib/api";
 import type { PluginManifest, RegisteredPlugin } from "./types";
 import {
   getPluginComponent,
@@ -20,12 +21,32 @@ import {
 
 export const MANIFEST_CACHE_KEY = "hermes:plugin-manifests";
 
+/**
+ * Convert the wire response into the stricter shape consumed by the loader.
+ * Older/local plugin manifests may omit `slots`; treating that as an empty
+ * declaration keeps route discovery safe instead of crashing on `.length`.
+ */
+export function normalizePluginManifest(
+  manifest: PluginManifestResponse,
+): PluginManifest {
+  return {
+    ...manifest,
+    slots: Array.isArray(manifest.slots)
+      ? manifest.slots.filter((slot): slot is string => typeof slot === "string")
+      : [],
+  };
+}
+
 export function getCachedManifests(): PluginManifest[] | null {
   try {
     const raw = sessionStorage.getItem(MANIFEST_CACHE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as PluginManifest[]) : null;
+    return Array.isArray(parsed)
+      ? parsed.map((manifest) =>
+          normalizePluginManifest(manifest as PluginManifestResponse),
+        )
+      : null;
   } catch {
     return null;
   }
@@ -106,9 +127,10 @@ export function usePlugins() {
     api
       .getPlugins()
       .then((list) => {
-        cacheManifests(list);
-        setManifests(list);
-        if (list.length === 0) setLoading(false);
+        const normalized = list.map(normalizePluginManifest);
+        cacheManifests(normalized);
+        setManifests(normalized);
+        if (normalized.length === 0) setLoading(false);
       })
       .catch(() => setLoading(false));
   }, []);
