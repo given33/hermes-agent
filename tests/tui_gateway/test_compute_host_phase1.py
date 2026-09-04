@@ -338,4 +338,11 @@ def test_shutdown_drain_sleep_never_overshoots_the_reserve(monkeypatch):
 
     assert events == ["finalize:idle:compute_host_sigterm"]
     assert slept, "the drain loop should have ticked at least once"
-    assert sum(slept) <= drain_budget + 1e-6
+    # The requested-sleep sum may run over the budget by OS sleep-timer
+    # quantization: on Windows, time.sleep can return a hair early, so the
+    # wall clock between ticks advances slightly less than the request and
+    # the next clamp re-requests the missing fragment. Observed under heavy
+    # parallel test load: ~1-2ms total on this 0.34s drain — the clamping
+    # contract itself (no flat-tick overshoot into the reserve) is intact as
+    # long as the sum stays within one tick of the budget.
+    assert sum(slept) <= drain_budget + 0.01
