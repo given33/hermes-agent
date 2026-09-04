@@ -6517,13 +6517,21 @@ def _cold_start_windows_gateway_after_update() -> bool:
             f"Windows gateway cold-start PID {pid} did not become ready"
         )
     print()
-    # The update path can run under a stock Windows console using a legacy
-    # code page; keep this atexit message ASCII so restart success never turns
-    # into a secondary UnicodeEncodeError.
     print(
-        "[ok] Gateway started via cold-start after update "
+        "✓ Gateway started via cold-start after update "
         f"(PID: {', '.join(map(str, ready_pids))})"
     )
+    # Persist the PIDs this ✓ vouched for so a death AFTER the updater exits
+    # (parent Job Object teardown, #91675) is reported by the next CLI
+    # invocation instead of staying silent. Best-effort. The attestation
+    # helper arrives with the upstream sync of gateway_windows; until then
+    # the call is a harmless no-op failure.
+    try:
+        gateway_windows._write_start_attestation(
+            ready_pids, "cold-start after update"
+        )
+    except Exception:
+        pass
     return True
 
 
