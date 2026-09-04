@@ -168,17 +168,36 @@ class TestExecuteCodeGuardCliApprovalSurvivesExecAskLeak:
         ``HERMES_SESSION_PLATFORM`` is set, so the whole-script gate is
         reached with ``HERMES_EXEC_ASK`` entirely absent. That path must
         show the CLI panel too, not a silent pending approval.
+
+        Bind the marker through the real session-context API (with proper
+        cleanup) instead of only poking ``HERMES_SESSION_PLATFORM`` into
+        ``os.environ``: once ANY earlier test in this process has engaged the
+        session-context latch, the bridge is ContextVar-authoritative and an
+        env-only marker is stripped as ``_UNSET`` - the guard would then see
+        no platform at all and auto-approve as a non-interactive session,
+        never invoking the callback. Binding through ``set_session_vars`` is
+        correct under both the pre-latch (env fallback) and post-latch
+        (ContextVar-authoritative) regimes.
         """
+        from gateway.session_context import reset_session_vars, set_session_vars
+
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
-        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-        calls = []
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+        set_session_vars(platform="telegram", source="telegram")
+        try:
+            calls = []
 
-        def _cb(command, description, **kwargs):
-            calls.append((command, description))
-            return "once"
+            def _cb(command, description, **kwargs):
+                calls.append((command, description))
+                return "once"
 
-        set_approval_callback(_cb)
-        result = check_execute_code_guard("print('marker')", "local")
+            set_approval_callback(_cb)
+            result = check_execute_code_guard("print('marker')", "local")
+        finally:
+            # Drop the bound context so the marker cannot leak into a later
+            # test (reset_session_vars restores every var to _UNSET in this
+            # context — the documented per-context teardown).
+            reset_session_vars()
 
         assert calls, "CLI approval callback was never invoked"
         assert result.get("approved") is True
