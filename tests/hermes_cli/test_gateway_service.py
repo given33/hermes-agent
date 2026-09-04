@@ -1309,6 +1309,56 @@ class TestSystemUnitHermesHome:
 class TestSystemUnitRefreshSyncsHermesHome:
     """sudo system refresh must not flip TimeoutStopSec via /root/.hermes."""
 
+    def test_sync_prefers_manager_environment_from_dropins(self, tmp_path, monkeypatch):
+        unit_home = tmp_path / "legacy-worker"
+        effective_home = tmp_path / "dispatcher"
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text(
+            f'[Service]\nEnvironment="HERMES_HOME={unit_home}"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_read_systemd_unit_environment",
+            lambda system=False: {"HERMES_HOME": str(effective_home)},
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "root-default"))
+
+        gateway_cli._sync_hermes_home_from_systemd_unit(system=True)
+
+        assert os.environ["HERMES_HOME"] == str(effective_home)
+
+    def test_sync_reads_dropin_before_stale_main_unit_offline(
+        self, tmp_path, monkeypatch
+    ):
+        legacy_home = tmp_path / "dbb3-worker"
+        dispatcher_home = tmp_path / "dispatcher"
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text(
+            f'[Service]\nEnvironment="HERMES_HOME={legacy_home}"\n',
+            encoding="utf-8",
+        )
+        dropin_dir = tmp_path / "hermes-gateway.service.d"
+        dropin_dir.mkdir()
+        (dropin_dir / "10-hermes-dispatcher-profile.conf").write_text(
+            f'[Service]\nEnvironment="HERMES_HOME={dispatcher_home}"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_read_systemd_unit_environment", lambda system=False: {}
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "root-default"))
+
+        gateway_cli._sync_hermes_home_from_systemd_unit(system=True)
+
+        assert os.environ["HERMES_HOME"] == str(dispatcher_home)
+
     def test_refresh_adopts_unit_hermes_home_before_rewriting(self, tmp_path, monkeypatch):
         root_home = tmp_path / "root"
         alice_home = tmp_path / "alice"

@@ -1483,7 +1483,7 @@ def _read_systemd_unit_environment(system: bool = False) -> dict[str, str]:
         )
     except (RuntimeError, subprocess.TimeoutExpired, OSError):
         return {}
-    if result.returncode != 0:
+    if result is None or getattr(result, "returncode", 1) != 0:
         return {}
     parsed: dict[str, str] = {}
     for line in result.stdout.splitlines():
@@ -1499,13 +1499,7 @@ def _read_systemd_unit_environment(system: bool = False) -> dict[str, str]:
 
 
 def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
-    """Read ``HERMES_HOME`` from the on-disk unit file (not ``systemctl show``).
-
-    Prefer the file when refreshing/comparing: under ``sudo``, ``systemctl``
-    may be slow/unavailable in tests, and the on-disk unit is what
-    ``systemd_unit_is_current`` / ``refresh_systemd_unit_if_needed`` already
-    compare against.
-    """
+    """Read ``HERMES_HOME`` from the main on-disk unit as an offline fallback."""
     unit_path = get_systemd_unit_path(system=system)
     if not unit_path.exists():
         return None
@@ -1524,6 +1518,48 @@ def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
     return None
 
 
+def _hermes_home_from_systemd_dropins(system: bool = False) -> str | None:
+    """Read the final ``HERMES_HOME`` assignment from on-disk drop-ins.
+
+    This is the offline fallback for a temporarily unavailable systemd
+    manager. Drop-ins override the main unit in lexical order, so reading the
+    main file first could otherwise reconnect service commands to a stale
+    worker profile.
+    """
+    unit_path = get_systemd_unit_path(system=system)
+    dropin_dir = unit_path.with_name(f"{unit_path.name}.d")
+    if not dropin_dir.exists():
+        return None
+    if dropin_dir.is_symlink() or not dropin_dir.is_dir():
+        raise RuntimeError(f"Unsafe systemd drop-in directory: {dropin_dir}")
+
+    hermes_home: str | None = None
+    for dropin_path in sorted(dropin_dir.glob("*.conf"), key=lambda path: path.name):
+        if dropin_path.is_symlink() or not dropin_path.is_file():
+            raise RuntimeError(f"Unsafe systemd drop-in file: {dropin_path}")
+        try:
+            text = dropin_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise RuntimeError(
+                f"Could not read systemd drop-in: {dropin_path}"
+            ) from error
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("Environment="):
+                continue
+            try:
+                assignments = shlex.split(stripped[len("Environment=") :].strip())
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Could not parse systemd drop-in: {dropin_path}"
+                ) from error
+            for assignment in assignments:
+                if assignment.startswith("HERMES_HOME="):
+                    value = assignment.split("=", 1)[1].strip()
+                    hermes_home = value or None
+    return hermes_home
+
+
 def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
     """When acting on a system-scope unit, adopt its ``HERMES_HOME``.
 
@@ -1535,11 +1571,16 @@ def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
     """
     if not system:
         return
-    # Prefer the on-disk unit (source of truth for refresh/compare). Fall
-    # back to ``systemctl show`` for units that only exist in the manager.
-    unit_home = (_hermes_home_from_systemd_unit_file(system=True) or "").strip()
+    # The manager's effective environment includes drop-ins and therefore is
+    # the runtime source of truth. Fall back to the main unit file when the
+    # manager is unavailable (notably during offline install/tests).
+    unit_home = (
+        _read_systemd_unit_environment(system=True).get("HERMES_HOME", "").strip()
+    )
     if not unit_home:
-        unit_home = _read_systemd_unit_environment(system=True).get("HERMES_HOME", "").strip()
+        unit_home = (_hermes_home_from_systemd_dropins(system=True) or "").strip()
+    if not unit_home:
+        unit_home = (_hermes_home_from_systemd_unit_file(system=True) or "").strip()
     if not unit_home:
         return
     current = os.environ.get("HERMES_HOME", "").strip()
