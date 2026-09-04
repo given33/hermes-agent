@@ -1967,7 +1967,14 @@ def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]
     profile's cached domain (``_launchd_domain()``) is never consulted.
     ``TimeoutExpired`` propagates (see ``_launchd_print_service_pid``).
     """
-    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    if not hasattr(os, "getuid"):
+        # POSIX-only helper. The runtime never reaches here on a POSIX-less
+        # host, but tests that mock ``is_macos`` to exercise the launchd
+        # branch DO — os.getuid does not exist there. Report "not
+        # bootstrapped" (the same shape as an empty launchctl) instead of
+        # crashing the caller's PID sweep.
+        return (None, None)
+    uid = os.getuid()
     for domain in (f"gui/{uid}", f"user/{uid}"):
         loaded, pid = _launchd_print_service_pid(domain, label)
         if loaded:
@@ -4978,7 +4985,12 @@ def _probe_launchd_domain_for_label(label: str) -> str:
     the rest live in ``gui/<uid>``), so the current profile's cached domain
     (``_launchd_domain()``) must never be reused for another label.
     """
-    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    if not hasattr(os, "getuid"):
+        # POSIX-only helper — same Windows-tests-mock-is_macos hazard as
+        # _locate_launchd_gateway_service; report "no domain" rather than
+        # crashing on the missing attribute.
+        return ""
+    uid = os.getuid()
     gui_domain = f"gui/{uid}"
     user_domain = f"user/{uid}"
 

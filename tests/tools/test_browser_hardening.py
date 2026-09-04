@@ -11,6 +11,25 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _can_create_symlinks() -> bool:
+    """Windows needs SeCreateSymbolicLinkPrivilege (admin or Developer Mode)
+    for os.symlink; the planted-symlink contract below is only exercisable
+    where symlink creation is permitted (official CI runners qualify)."""
+    import tempfile
+    from pathlib import Path
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "src"
+            src.write_text("x", encoding="utf-8")
+            (Path(d) / "lnk").symlink_to(src)
+            return True
+    except OSError:
+        return False
+
+
+_SYMLINKS_OK = _can_create_symlinks()
+
+
 def _reset_caches():
     """Reset all module-level caches so tests start clean."""
     import tools.browser_tool as bt
@@ -229,6 +248,10 @@ class TestTruncateSnapshot:
         content = Path(stored).read_text(encoding="utf-8")
         assert "STOREDSNAPSHOTSECRET" not in content
 
+    @pytest.mark.skipif(
+        not _SYMLINKS_OK,
+        reason="symlink creation requires privilege not held on this host",
+    )
     def test_stored_snapshot_refuses_planted_symlink(self, tmp_path, monkeypatch):
         """A pre-planted symlink at the content-hash path must not be
         followed to its target — only the link itself may be replaced.

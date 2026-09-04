@@ -62,6 +62,24 @@ class TestRegisterCredentialFiles:
         assert "real.json" in mounts[0]["container_path"]
 
 
+def _can_create_symlinks() -> bool:
+    """Windows needs SeCreateSymbolicLinkPrivilege (admin or Developer Mode)
+    for os.symlink; the symlink-sanitization contracts below are only
+    exercisable where symlink creation is permitted (official CI runners
+    qualify). Probe once at import; skip the contract tests elsewhere."""
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "src"
+            src.write_text("x", encoding="utf-8")
+            (Path(d) / "lnk").symlink_to(src)
+            return True
+    except OSError:
+        return False
+
+
+_SYMLINKS_OK = _can_create_symlinks()
+
 class TestSkillsDirectoryMount:
     def test_returns_mount_when_skills_dir_exists(self, tmp_path):
         hermes_home = tmp_path / ".hermes"
@@ -87,6 +105,10 @@ class TestSkillsDirectoryMount:
 
         assert mounts[0]["container_path"] == "/home/user/.hermes/skills"
 
+    @pytest.mark.skipif(
+        not _SYMLINKS_OK,
+        reason="symlink creation requires privilege not held on this host",
+    )
     def test_symlinks_are_sanitized(self, tmp_path):
         """Symlinks in skills dir should be excluded from the mount."""
         hermes_home = tmp_path / ".hermes"
@@ -126,6 +148,10 @@ class TestSkillsDirectoryMount:
 
 
 class TestIterSkillsFiles:
+    @pytest.mark.skipif(
+        not _SYMLINKS_OK,
+        reason="symlink creation requires privilege not held on this host",
+    )
     def test_returns_files_skipping_symlinks(self, tmp_path):
         hermes_home = tmp_path / ".hermes"
         skills_dir = hermes_home / "skills"
@@ -490,6 +516,10 @@ class TestIterCacheFiles:
         assert "upload.zip" in names
         assert "report.pdf" in names
 
+    @pytest.mark.skipif(
+        not _SYMLINKS_OK,
+        reason="symlink creation requires privilege not held on this host",
+    )
     def test_skips_symlinks(self, tmp_path, monkeypatch):
         """Symlinks inside cache dirs are skipped."""
         hermes_home = tmp_path / ".hermes"
