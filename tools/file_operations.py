@@ -1222,6 +1222,33 @@ class ShellFileOperations(FileOperations):
         """
         return "'" + str(arg).replace("'", "'\"'\"'") + "'"
 
+    def _rg_pattern_channel(self, pattern: str) -> tuple[bool, Optional[str]]:
+        """Decide how an rg regex pattern travels: inline arg or stdin.
+
+        Returns (use_stdin_channel, stdin_payload).
+
+        On a Windows host running the local bash, the Cygwin/MSYS
+        native-parent argv reconstruction collapses every doubled backslash
+        in the -c command string BEFORE bash's own parser runs, so
+        single-quoting cannot protect it: a literal backslash-n search
+        ("\\n") reaches rg as the regex "\\n" escape, which rg rejects
+        outright (the literal "\\n" is not allowed in a regex). The stdin
+        channel ("rg -f -") carries exact pattern bytes that no quoting
+        layer rewrites (_pipe_stdin writes raw UTF-8 with no newline
+        translation). Remote backends and non-Windows hosts parse the
+        command string fresh, so they keep the inline-argument form.
+        """
+        env = getattr(self, "env", None)
+        if env is None or "\\" not in pattern:
+            return False, None
+        try:
+            from tools.environments.local import LocalEnvironment, _IS_WINDOWS
+        except Exception:  # noqa: BLE001
+            return False, None
+        if _IS_WINDOWS and isinstance(env, LocalEnvironment):
+            return True, pattern + "\n"
+        return False, None
+
     def _escape_native_tool_arg(self, arg: str) -> str:
         """Escape a path argument destined for a NATIVE Windows binary.
 
@@ -3049,11 +3076,13 @@ class ShellFileOperations(FileOperations):
             return shown + (f" (+{extra} more)" if extra > 0 else "")
 
         glob_expr = f" --glob {self._escape_shell_text_arg(file_glob)}" if file_glob else ""
+        use_stdin_pattern, stdin_payload = self._rg_pattern_channel(pattern)
+        pat_arg = " -f -" if use_stdin_pattern else " " + self._escape_shell_text_arg(pattern)
         probe = self._exec(
-            f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_text_arg(pattern)} {self._escape_native_tool_arg(path)} "
-            f"2>/dev/null | head -50",
+            f"rg -i --count-matches{glob_expr}{pat_arg} "
+            f"{self._escape_native_tool_arg(path)} 2>/dev/null | head -50",
             timeout=30,
+            stdin_data=stdin_payload,
         )
         ci_total, ci_paths = _tally(probe.stdout)
         if ci_total > 0:
@@ -3067,10 +3096,10 @@ class ShellFileOperations(FileOperations):
         # returning a bare zero (bench case: match in .hidden/ silently
         # missing from results).
         hidden = self._exec(
-            f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_text_arg(pattern)} {self._escape_native_tool_arg(path)} "
-            f"2>/dev/null | head -50",
+            f"rg --hidden --no-ignore --count-matches{glob_expr}{pat_arg} "
+            f"{self._escape_native_tool_arg(path)} 2>/dev/null | head -50",
             timeout=30,
+            stdin_data=stdin_payload,
         )
         h_total, h_paths = _tally(hidden.stdout)
         if h_total > 0:
@@ -3081,10 +3110,10 @@ class ShellFileOperations(FileOperations):
             )
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
-                f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_text_arg(pattern)} {self._escape_native_tool_arg(path)} "
-                f"2>/dev/null | head -50",
+                f"rg -F --count-matches{glob_expr}{pat_arg} "
+                f"{self._escape_native_tool_arg(path)} 2>/dev/null | head -50",
                 timeout=30,
+                stdin_data=stdin_payload,
             )
             f_total, f_paths = _tally(fixed.stdout)
             if f_total > 0:
@@ -3375,8 +3404,15 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")  # Count per file
         
-        # Add pattern and path
-        cmd_parts.append(self._escape_shell_text_arg(rg_pattern))
+        # Add pattern and path. Backslash-bearing patterns on a Windows-hosted
+        # local bash ride the stdin channel (see _rg_pattern_channel): inline
+        # they would be mangled by the Cygwin/MSYS argv boundary before rg
+        # ever parses them.
+        use_stdin_pattern, stdin_payload = self._rg_pattern_channel(rg_pattern)
+        if use_stdin_pattern:
+            cmd_parts.extend(["-f", "-"])
+        else:
+            cmd_parts.append(self._escape_shell_text_arg(rg_pattern))
         # rg is a native Windows binary when installed via winget/cargo/choco:
         # it needs the C:/... path form, not the MSYS /c/... form (which
         # nothing converts back — Hermes sets MSYS_NO_PATHCONV for its bash).
@@ -3394,7 +3430,7 @@ class ShellFileOperations(FileOperations):
         # truncating head cleanly (exit 0 on SIGPIPE), so pipefail does not
         # introduce false errors on a successful-but-truncated search.
         cmd = "set -o pipefail; " + " ".join(cmd_parts)
-        result = self._exec(cmd, timeout=60)
+        result = self._exec(cmd, timeout=60, stdin_data=stdin_payload)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
         # _exec merges stderr into stdout (stderr=subprocess.STDOUT), so rg's
