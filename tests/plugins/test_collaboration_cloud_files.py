@@ -138,6 +138,10 @@ def test_delete_owner_account_data_removes_only_owned_collaboration_state(
         "files": {"files": 1},
         "tool_output_artifacts": {"artifacts": 0},
         "managed_resources": {"resources": 0, "events": 0, "operations": 0},
+        # The durable group-chat ledger is part of the owner-account sweep
+        # (product surface); with no durable rooms on this fixture it
+        # accounts 0.
+        "durable_group_rooms": 0,
     }
     assert single_state["conversations"] == [
         replacement_conversation,
