@@ -4208,24 +4208,20 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     Installs that can't honor non-default branches (e.g. Docker) surface a
     one-line notice instead of silently dropping the flag.
     """
-    from hermes_cli.config import (
-        detect_install_method,
-        is_nix_install_method,
-        recommended_update_command_for_method,
+    # Same marker-first admission gate as the apply path, so --check never
+    # reports git state for an install whose real update mechanism is an
+    # image pull or a package-managed install (#91277 Phase 3): refusal is
+    # "refused by contract" — exit 2, distinct from exit 1 hard errors.
+    from hermes_cli.update_contract import (
+        evaluate_update_admission,
+        record_refusal_receipt,
     )
-    method = detect_install_method(_m().PROJECT_ROOT)
-    if method == "docker":
-        # Docker can't ``git fetch`` from within the container.  Surface the
-        # same long-form ``docker pull`` guidance ``hermes update`` (apply
-        # path) uses — telling the user to "reinstall via curl" or that
-        # ".git is missing" would point them at the wrong remediation.
-        from hermes_cli.config import format_docker_update_message
-        print(format_docker_update_message())
-        sys.exit(1)
 
-    if is_nix_install_method(method) or method == "apt":
-        print(recommended_update_command_for_method(method))
-        sys.exit(1)
+    refusal = evaluate_update_admission(_m().PROJECT_ROOT)
+    if refusal is not None:
+        print(refusal.message)
+        record_refusal_receipt(refusal)
+        sys.exit(2)
 
     git_dir = _m().PROJECT_ROOT / ".git"
     if not git_dir.exists():

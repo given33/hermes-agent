@@ -497,44 +497,12 @@ CLARIFY_SCHEMA = {
                     "required": ["question"],
                 },
             },
-            "questions": {
-                "type": "array",
-                "maxItems": MAX_QUESTIONS,
-                "description": (
-                    "Ask 2-5 INDEPENDENT questions in one call instead of "
-                    "several sequential clarify calls — the user answers them "
-                    "on one form, in any order. Each item has its own "
-                    "question/choices/multi_select (same rules as the "
-                    "top-level parameters); optional `id` is echoed back in "
-                    "the matching response. When set, the top-level question/"
-                    "choices are ignored. put a short batch title in the "
-                    "top-level `question` The result is {responses: [...]}, "
-                    "with `timed_out: true` added if the user stopped part-way "
-                    "(unanswered entries have an empty user_response). Only "
-                    "batch questions that are truly independent — if one "
-                    "answer would change another question, ask separately."
-                ),
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {
-                            "type": "string",
-                            "description": (
-                                "Optional short identifier echoed in the "
-                                "matching response (e.g. 'approach')."
-                            ),
-                        },
-                        "question": {"type": "string"},
-                        "choices": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "maxItems": MAX_CHOICES,
-                        },
-                        "multi_select": {"type": "boolean"},
-                    },
-                    "required": ["question"],
-                },
-            },
+            # NOTE: the handler also accepts (unadvertised): a per-question
+            # `id` (echoed in the matching response — redundant since rows
+            # carry the question text and preserve order), and the legacy
+            # single-question shape (`question` + `choices` + `multi_select`
+            # at top level; a top-level `question` beside `questions` is the
+            # batch form's title). One documented way to call.
         },
         "required": ["questions"],
     },
