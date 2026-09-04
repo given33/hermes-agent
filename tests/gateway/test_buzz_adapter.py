@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -617,6 +618,11 @@ class TestCliErrorContract:
             "x" * 100_000,
             json.dumps({"error": "relay_error", "message": "x" * 100_000}),
         ],
+        # Short ids: pytest derives test ids from the params, and a 100k-char
+        # id overflows Windows' 32k per-environment-variable limit the moment
+        # any fixture (PYTEST_CURRENT_TEST, tmp_path bookkeeping) lands the
+        # test name in the environment. The payloads stay full-size.
+        ids=["plain-flood", "json-flood"],
     )
     def test_bounds_untrusted_cli_error_output(self, stderr):
         msg = _cli_error_message(stderr, 2)
@@ -2769,7 +2775,9 @@ class TestInboundMediaLocalisation:
         assert event.message_type == MessageType.DOCUMENT
         assert event.media_types == ["application/pdf"]
         assert len(event.media_urls) == 1
-        assert "/cache/documents/" in event.media_urls[0]
+        # The cached-media URL carries native separators (backslashes on
+        # Windows); normalize before the marker check.
+        assert "/cache/documents/" in event.media_urls[0].replace("\\", "/")
 
     @pytest.mark.asyncio
     async def test_download_failure_preserves_caption_and_alt_text(
@@ -3062,9 +3070,18 @@ class TestInboundMediaAuthorizationGate:
     @pytest.mark.asyncio
     async def test_live_media_redacts_long_path_before_bounding(self, tmp_path):
         parent = tmp_path
+        # Windows MAX_PATH (260) caps how deep the fixture can actually go:
+        # clamp the segment length to the largest that still fits six nested
+        # private segments plus the file, so the redaction-before-bounding
+        # ordering proof runs everywhere. On POSIX the classic 150-char
+        # segments still apply (short tmp prefixes leave plenty of headroom).
+        segment = 150
+        if os.name == "nt":
+            headroom = 248 - len(str(tmp_path)) - len("/handoff.txt")
+            segment = max(10, min(150, headroom // 6 - 14))
         private_parts = []
         for index in range(6):
-            part = f"private-{index}-" + ("x" * 150)
+            part = f"private-{index}-" + ("x" * segment)
             private_parts.append(part)
             parent = parent / part
             parent.mkdir()
