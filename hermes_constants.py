@@ -51,13 +51,52 @@ def get_hermes_home_override() -> str | None:
     return str(override)
 
 
+def _home_is_ambient_windows_account(home: str) -> bool:
+    """True when *home* merely restates the ambient Windows account home.
+
+    Launchers that scope a process (install.ps1 isolation, sandboxed
+    spawners) set HOME to a private directory, which never equals the
+    account's USERPROFILE / HOMEDRIVE+HOMEPATH. When HOME instead duplicates
+    the ambient account home, Path.home() is the better authority: it is the
+    pathlib home seam the official test suite (and embedders) patch, and on
+    a stock Windows session it resolves to the same directory anyway
+    (Python >= 3.8 expands '~' on Windows from USERPROFILE, never HOME).
+    """
+    def _norm(value: str) -> str:
+        return os.path.normcase(os.path.normpath(value))
+
+    target = _norm(home)
+    candidates: list[str] = []
+    profile = os.environ.get("USERPROFILE", "").strip()
+    if profile:
+        candidates.append(profile)
+    drive = os.environ.get("HOMEDRIVE", "").strip()
+    hpath = os.environ.get("HOMEPATH", "").strip()
+    if drive and hpath:
+        candidates.append(os.path.join(drive, hpath))
+    return any(target == _norm(candidate) for candidate in candidates)
+
+
 def _get_platform_default_hermes_home() -> Path:
     """Return the platform-native default Hermes home path."""
     # An explicit HOME is the profile-isolation contract used by launchers,
     # tests, containers, and subprocess spawners. Platform cache directories
     # are only a fallback when that location is absent.
+    #
+    # Windows delta: when HOME is just the ambient account home (it equals
+    # USERPROFILE / HOMEDRIVE+HOMEPATH rather than a launcher-scoped
+    # override), resolve through Path.home() so the pathlib home seam the
+    # official suite patches stays authoritative — on a stock session it is
+    # the same directory, so runtime behavior is unchanged. A HOME that
+    # differs from the account home still wins unchanged below (isolation
+    # contract), and unset HOME keeps the %LOCALAPPDATA%\hermes ladder.
     home = os.environ.get("HOME", "").strip()
     if home:
+        if sys.platform == "win32" and _home_is_ambient_windows_account(home):
+            try:
+                return Path.home() / ".hermes"
+            except (RuntimeError, OSError):
+                pass  # account home undeterminable; fall through to explicit HOME
         return Path(home) / ".hermes"
     if sys.platform == "win32":
         local_appdata = os.environ.get("LOCALAPPDATA", "").strip()

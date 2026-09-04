@@ -673,9 +673,23 @@ def _default_db_path() -> Path:
        import-time snapshot — the established test escape hatch) wins.
     2. Otherwise resolve ``get_hermes_home()`` fresh so a runtime
        ``HERMES_HOME`` redirect takes effect regardless of import order.
+
+    Exception to (1): the hermetic conftest re-pins DEFAULT_DB_PATH to the
+    per-test fake home on EVERY test (its 3b invariant). That invariant is
+    distinguishable from a deliberate re-point via the isolation marker the
+    same fixture exports — the pin always restates
+    ``HERMES_TEST_ISOLATION/state.db``. When it does, keep following the
+    live ``HERMES_HOME``: for tests that leave ``HERMES_HOME`` at the
+    fixture home the resolved value is identical, and a test that then
+    redirects ``HERMES_HOME`` itself (the runtime-redirect contract pinned
+    by tests/gateway/test_session_store_prune.py) gets the redirect instead
+    of a stale pin. Production never sets ``HERMES_TEST_ISOLATION``, so
+    behavior outside the test suite is unchanged.
     """
     if DEFAULT_DB_PATH != _IMPORT_DEFAULT_DB_PATH:
-        return DEFAULT_DB_PATH
+        isolation_home = os.environ.get("HERMES_TEST_ISOLATION", "").strip()
+        if not isolation_home or DEFAULT_DB_PATH != Path(isolation_home) / "state.db":
+            return DEFAULT_DB_PATH
     return get_hermes_home() / "state.db"
 
 

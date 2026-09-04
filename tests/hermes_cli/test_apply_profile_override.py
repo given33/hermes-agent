@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def _run_apply_profile_override(
     tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
@@ -101,6 +103,10 @@ class TestApplyProfileOverrideHermesHomeGuard:
 
     def test_sudo_explicit_profile_resolves_invoking_users_profile(self, tmp_path, monkeypatch):
         """sudo elias ... should resolve `-p elias` under SUDO_USER, not root."""
+        # POSIX premise: sudo/SUDO_USER resolution reads the pwd database; the
+        # module does not exist on Windows (upstream runs this unmarked test
+        # only on its Linux lane).
+        pytest.importorskip("pwd")
         root_home = tmp_path / "root"
         user_home = tmp_path / "home" / "hermes"
         profile_dir = user_home / ".hermes" / "profiles" / "elias"
