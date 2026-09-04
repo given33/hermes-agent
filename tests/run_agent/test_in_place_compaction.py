@@ -305,8 +305,11 @@ class TestInPlaceAntiGrowthGuard:
         from agent.conversation_compression import compress_context
         from agent.model_metadata import estimate_messages_tokens_rough
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        # SessionDB as a context manager: Windows cannot unlink an open
+        # SQLite file, so the db must be closed before tmp cleanup — the
+        # same form the sibling shrink test uses.
+        with tempfile.TemporaryDirectory() as tmp, \
+                SessionDB(db_path=Path(tmp) / "t.db") as db:
             sid = "20260819_salvage"
             _seed(db, sid, "salvage")
             agent = _make_agent(db, sid, in_place=True)
