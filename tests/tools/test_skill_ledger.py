@@ -511,7 +511,10 @@ def test_backup_fill_does_not_clobber_disk_hash(ledger_env):
     skill_dir.mkdir()
     skill_md = skill_dir / "SKILL.md"
     live = VALID_SKILL_CONTENT.replace("Original body.", "Live body.")
-    skill_md.write_text(live, encoding="utf-8")
+    # newline="" keeps the disk bytes identical to live.encode() — Windows
+    # text mode would otherwise translate \n to \r\n and shift the hash the
+    # capture stores (the disk-wins contract itself is platform-neutral).
+    skill_md.write_text(live, encoding="utf-8", newline="")
     _write_skills_tarball(
         ledger_env["home"],
         {
@@ -551,7 +554,9 @@ def test_backup_fill_ignores_tar_path_traversal(ledger_env):
     )
 
     captured = skill_ledger.snapshot_paths(skill_dir, complete_package=True)
-    paths = [i["path"] for i in captured]
+    # Normalize separators: ledgered paths are native (backslashes on
+    # Windows) while the package relpaths under test are POSIX.
+    paths = [i["path"].replace("\\", "/") for i in captured]
     # The legitimate missing file WAS filled — proof the fill is live.
     assert any(p.endswith("references/legit.md") for p in paths), (
         "package fill did not restore the missing support file"

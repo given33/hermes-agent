@@ -107,8 +107,10 @@ class TestGetSubprocessHome:
         assert home_a is not None
         assert home_b is not None
         assert home_a != home_b
-        assert home_a.endswith("alpha/home")
-        assert home_b.endswith("beta/home")
+        # Normalize separators: get_subprocess_home returns the native form
+        # (backslashes on Windows) while the suffix literals are POSIX.
+        assert home_a.replace("\\", "/").endswith("alpha/home")
+        assert home_b.replace("\\", "/").endswith("beta/home")
 
 
 
