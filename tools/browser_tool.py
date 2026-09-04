@@ -3736,13 +3736,20 @@ def _run_browser_command(
     # Local mode with no Chromium on disk: fail fast with an actionable
     # message instead of hanging for _command_timeout seconds per call.
     # Skip when engine=lightpanda — LP doesn't need Chromium for navigation.
-    # Only session-creating calls are guarded: a command targeting an
-    # already-tracked session must reach the spawn/timeout path, whose
+    # Only session-creating calls are guarded: a command against a LIVE
+    # session binding proceeds to the spawn/timeout path, whose
     # _handle_browser_command_timeout recovery owns wedged/dead-daemon
-    # eviction (#72205); once it evicts, the next session-creating call
-    # fails fast here again.
+    # eviction (#72205). The binding is recorded only by a successful
+    # navigation and is popped by timeout eviction, so a fresh or evicted
+    # session — including browser_navigate's own first dispatch after it
+    # resolves (and creates) its session — fails fast here instead of
+    # hanging for the full command timeout.
+    has_live_session = (
+        task_id in _active_sessions
+        and _last_active_session_key.get(_bare_task_id_for_session_key(task_id)) == task_id
+    )
     if (
-        task_id not in _active_sessions
+        not has_live_session
         and _is_local_mode()
         and not _chromium_installed()
         and _get_browser_engine() != "lightpanda"
