@@ -40,14 +40,17 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
 
 
 def _extract_install_sh_function(name: str) -> str:
-    text = INSTALL_SH.read_text()
+    # install.sh is UTF-8 and its echo lines carry multi-byte glyphs; on
+    # Windows a locale-default read_text() decodes them as cp936 mojibake,
+    # which bash then chokes on as bogus commands. Pin the encoding.
+    text = INSTALL_SH.read_text(encoding="utf-8")
     match = re.search(rf"{name}\(\) \{{.*?\n\}}", text, re.DOTALL)
     assert match is not None, f"{name}() not found in install.sh"
     return match.group(0)
 
 
 def _extract_install_sh_autostash_block() -> str:
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding="utf-8")
     match = re.search(
         r'local autostash_ref="".*?\n            fi\n',
         text,
@@ -64,6 +67,14 @@ def test_install_sh_discards_runtime_lockfile_churn_before_stash(
     repo = tmp_path / "hermes-agent"
     repo.mkdir()
     _git(repo, "init")
+    # On Windows the extracted installer logic runs under whatever POSIX bash
+    # is on PATH (WSL here), whose git re-evaluates the /mnt/c worktree with
+    # its own stat/mode defaults and flags untouched files as modified — the
+    # churn-only premise (package.json clean) then fails and the discard
+    # never engages. Repo-local config makes both git sides agree; a no-op
+    # on POSIX CI where the defaults already agree.
+    _git(repo, "config", "core.fileMode", "false")
+    _git(repo, "config", "core.autocrlf", "input")
     (repo / "package.json").write_text('{"dependencies":{"a":"1"}}\n')
     (repo / "package-lock.json").write_text('{"lock":"old"}\n')
     _git(repo, "add", "package.json", "package-lock.json")
@@ -81,8 +92,15 @@ def test_install_sh_discards_runtime_lockfile_churn_before_stash(
         "}\n"
         "run\n"
     )
+    # Execute via a snippet FILE, not ``bash -c``. On Windows the bash on
+    # PATH is WSL bash, and its Windows→WSL argument conversion corrupts a
+    # multi-line ``-c`` script (embedded quotes/newlines fragment the argv —
+    # bash then parses garbage). A relative file path survives the boundary
+    # and is byte-exact; POSIX hosts are unaffected by the equivalent form.
+    snippet = tmp_path / "install_snippet.sh"
+    snippet.write_text(script, encoding="utf-8", newline="\n")
     res = subprocess.run(
-        ["bash", "-c", script], cwd=repo, capture_output=True, text=True
+        ["bash", "../install_snippet.sh"], cwd=repo, capture_output=True, text=True
     )
 
     assert res.returncode == 0, res.stderr
