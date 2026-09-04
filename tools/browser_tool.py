@@ -1357,6 +1357,10 @@ def _run_chrome_fallback_command(
 
     task_socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{tmp_session}")
     os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
+    # Claim the dir before using it: another hermes process's orphan reaper
+    # rmtree's any agent-browser-* dir in the shared tmpdir that carries no
+    # live owner, which otherwise deletes this one mid-command.
+    _write_owner_pid(task_socket_dir, tmp_session)
     browser_env = _build_browser_env()
     browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
     browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
@@ -3732,8 +3736,14 @@ def _run_browser_command(
     # Local mode with no Chromium on disk: fail fast with an actionable
     # message instead of hanging for _command_timeout seconds per call.
     # Skip when engine=lightpanda — LP doesn't need Chromium for navigation.
+    # Only session-creating calls are guarded: a command targeting an
+    # already-tracked session must reach the spawn/timeout path, whose
+    # _handle_browser_command_timeout recovery owns wedged/dead-daemon
+    # eviction (#72205); once it evicts, the next session-creating call
+    # fails fast here again.
     if (
-        _is_local_mode()
+        task_id not in _active_sessions
+        and _is_local_mode()
         and not _chromium_installed()
         and _get_browser_engine() != "lightpanda"
         and not _maybe_autoinstall_chromium()
