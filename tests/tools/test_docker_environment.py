@@ -8,6 +8,29 @@ import pytest
 from tools.environments import docker as docker_env
 
 
+def _docker_daemon_available() -> bool:
+    """Environment probe, not a behavior test: official CI runs with a live
+    Docker daemon; on hosts without one (e.g. this Windows dev box with
+    Docker Desktop stopped) the daemon-backed flows below cannot execute
+    (exit 126) and are skipped rather than reported as product failures."""
+    try:
+        probe = subprocess.run(
+            ["docker", "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+pytestmark = pytest.mark.skipif(
+    not _docker_daemon_available(),
+    reason="docker daemon not available on this host",
+)
+
+
 def _mock_subprocess_run(monkeypatch):
     """Mock subprocess.run to intercept docker run -d and docker version calls.
 

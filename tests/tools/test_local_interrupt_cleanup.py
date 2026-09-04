@@ -23,6 +23,16 @@ import pytest
 from tools.environments import local as local_mod
 from tools.environments.local import LocalEnvironment
 
+# These tests exercise POSIX process-group cleanup semantics (os.getpgid /
+# os.killpg / os.setsid orphan reaping). On Windows the os module has no
+# getpgid/killpg at all — the local backend takes the job-object/taskkill
+# path instead — so the simulated contract cannot exist here. Premise-skip
+# rather than weakening the tests (same policy as the ssh ownership tests).
+pytestmark = pytest.mark.skipif(
+    not hasattr(os, "getpgid"),
+    reason="process-group cleanup semantics are POSIX-only; Windows kills via job objects/taskkill",
+)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_hermes_home(tmp_path, monkeypatch):
