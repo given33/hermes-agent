@@ -423,6 +423,40 @@ class TestMultipleWorktrees:
             assert not Path(info["path"]).exists()
 
 
+def _can_path_stub_executable():
+    """True when a bare, extensionless PATH-stubbed executable named
+    ``gh`` is invocable through subprocess.
+
+    POSIX premise: ``exec`` searches PATH and honors the ``#!`` shebang, so a
+    ``#!/bin/sh`` stub named ``gh`` is run by ``subprocess.run(["gh", ...])``.
+    On Windows, ``CreateProcess`` resolves a bare command name to ``.exe``
+    only — an extensionless stub is never found and the product's gh probe
+    fails safe (verdict False). Documented Windows adapter; the two tests
+    that REQUIRE a reporting gh are skipped, while the fail-safe/preserve
+    tests still run (they hold vacuously on Windows).
+    """
+    import subprocess as _sp
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d) / "stub-invoked"
+            gh = Path(d) / "gh"
+            gh.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 0\n")
+            gh.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = f"{d}{os.pathsep}{env.get('PATH', '')}"
+            try:
+                _sp.run(["gh"], capture_output=True, timeout=15, env=env)
+            except Exception:
+                return False
+            # Only the STUB's own execution counts: a real gh.exe found by
+            # CreateProcess's .exe fallback also exits 0 but proves nothing
+            # about whether a stub can hijack the name.
+            return marker.exists()
+    except Exception:
+        return False
+
+
 def _can_symlink():
     """Check if we can create symlinks (needs admin/dev-mode on Windows)."""
     import tempfile
@@ -1385,8 +1419,13 @@ class TestPrMergedEscapeHatch:
         gh.parent.mkdir(parents=True, exist_ok=True)
         gh.write_text(f"#!/bin/sh\nprintf '%s' '{stdout}'\nexit {exit_code}\n")
         gh.chmod(0o755)
-        monkeypatch.setenv("PATH", f"{gh.parent}:{os.environ['PATH']}")
+        monkeypatch.setenv("PATH", f"{gh.parent}{os.pathsep}{os.environ['PATH']}")
 
+    @pytest.mark.skipif(
+        not _can_path_stub_executable(),
+        reason="PATH-stubbed extensionless executables are POSIX-only "
+        "(Windows CreateProcess resolves bare names to .exe only)",
+    )
     def test_merged_pr_tree_is_reaped(self, git_repo, tmp_path, monkeypatch):
         import cli
         wt = self._mk_diverged(git_repo, "hermes-rebase-merged")
@@ -1425,6 +1464,11 @@ class TestPrMergedEscapeHatch:
         cli._prune_stale_worktrees(str(git_repo))
         assert wt.exists(), "dirty guard outranks the PR-merged verdict"
 
+    @pytest.mark.skipif(
+        not _can_path_stub_executable(),
+        reason="PATH-stubbed extensionless executables are POSIX-only "
+        "(Windows CreateProcess resolves bare names to .exe only)",
+    )
     def test_merged_verdict_memoized_by_branch_and_head(
         self, git_repo, tmp_path, monkeypatch
     ):
