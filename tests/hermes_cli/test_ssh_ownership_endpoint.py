@@ -131,6 +131,8 @@ def test_ssh_runtime_readonly_purelib_falls_back_to_stat(tmp_path, monkeypatch):
     # (daemon threads crash in their excepthooks → nondeterministic teardown
     # errors file-wide, the Aug 2026 CI flake). chmod is thread-safe and
     # exercises the genuine OSError path.
+    if not hasattr(os, "geteuid"):  # pragma: no cover - write bits POSIX-only
+        pytest.skip("directory write bits are not enforced on this platform")
     if os.geteuid() == 0:  # pragma: no cover - root ignores mode bits
         pytest.skip("directory write bits are not enforced for root")
     purelib.chmod(0o555)
