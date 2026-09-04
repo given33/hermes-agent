@@ -86,7 +86,12 @@ class TestReadFileBinaryClassification:
         assert r.is_binary is True
 
     def test_nul_byte_in_text_stays_binary(self, ops, tmp_path):
-        path = _write(tmp_path, "nul.txt", b"hello\x00world" + b"a" * 128)
+        # Name the fixture past the Windows reserved-device list: a base name
+        # of `nul` (any extension) redirects CreateFile to the NUL device, so
+        # the write is discarded and the file never exists — the premise is
+        # unconstructible on Windows. `nul_bytes.txt` exercises the same
+        # NUL-byte-in-content contract on every platform.
+        path = _write(tmp_path, "nul_bytes.txt", b"hello\x00world" + b"a" * 128)
         r = ops.read_file(path)
         assert r.is_binary is True
 
