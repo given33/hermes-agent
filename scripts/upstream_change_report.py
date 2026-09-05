@@ -9,11 +9,19 @@ from pathlib import Path
 
 
 IOS_RISK_PREFIXES = (
+    "agent/",
+    "apps/shared/",
+    "apps/desktop/src/",
+    "cron/",
     "dashboard/",
     "gateway/",
     "hermes_cli/",
+    "hermes_state",
     "plugins/",
-    "tools/mcp_tool.py",
+    "tools/",
+    "toolsets.py",
+    "tui_gateway/",
+    "web/",
 )
 DEPLOYMENT_RISK_PREFIXES = (
     ".github/workflows/",
@@ -59,10 +67,10 @@ def build_report(base: str, upstream_ref: str) -> str:
     )
     commits = git(
         "log",
-        "--no-merges",
         "--pretty=format:%h %s",
         f"{merge_base}..{upstream_ref}",
     ).splitlines()
+    commit_count = len(commits)
     commits = commits[:200]
     verdict = (
         "Manual Codex review required before merge."
@@ -74,7 +82,7 @@ def build_report(base: str, upstream_ref: str) -> str:
 - Upstream revision: `NousResearch/hermes-agent@{upstream_ref}`
 - Product base: `{base}`
 - Merge base: `{merge_base}`
-- Upstream commits: `{len(commits)}` (report capped at 200)
+- Upstream commits: `{commit_count}` (including merges; detail list capped at 200)
 - Upstream files changed: `{len(upstream_files)}`
 - Fork files changed since merge base: `{len(fork_files)}`
 - Direct file overlap: `{len(overlap)}`
@@ -106,7 +114,7 @@ decision even when the merge itself is conflict-free.
 - [ ] Official Hermes CI is green on the sync pull request.
 - [ ] Collaboration, mobile auth, deployment, MCP, and iOS contract tests are green.
 - [ ] Codex reviewed direct overlap and the generated risk sections.
-- [ ] Any required Hermes iOS adaptation was explicitly accepted or deferred.
+- [ ] Every required Hermes iOS adaptation has interface, UI, and test evidence; deferred items remain incomplete.
 - [ ] The approved `main` commit was deployed transactionally to the main server.
 - [ ] DBB3, WSL, and HK report the exact approved commit and pass health probes.
 """
