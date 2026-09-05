@@ -302,8 +302,11 @@ class TestInlinedDisplayMasks:
         from pathlib import Path
         src = (Path(__file__).resolve().parent.parent.parent
                / "cli.py").read_text(encoding="utf-8")
-        assert "is_token_provider(self.api_key)" in src, (
-            "cli.HermesCLI.show_config must guard self.api_key via "
+        # Upstream moved the guard onto the LIVE agent's credential (the
+        # constructor-seeded self.api_key can be a different vendor's key on
+        # non-OpenAI providers); assert the refactored marker.
+        assert "is_token_provider(display_key)" in src, (
+            "cli.HermesCLI.show_config must guard the displayed key via "
             "is_token_provider so callable Entra ID providers don't "
             "crash /config."
         )

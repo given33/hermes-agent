@@ -137,10 +137,15 @@ class TestSetupLogging:
 
         assert "profile-routed cron record" in (
             profile_home / "logs" / "agent.log"
-        ).read_text()
+        ).read_text(encoding="utf-8")
+        # The default-home file only exists once something routes to it.
+        # POSIX (stdlib RotatingFileHandler) opens it eagerly at setup; the
+        # Windows ConcurrentRotatingFileHandler opens on first emit. Treat a
+        # missing file as empty — the contract is that the record is absent.
+        default_log = hermes_home / "logs" / "agent.log"
         assert "profile-routed cron record" not in (
-            hermes_home / "logs" / "agent.log"
-        ).read_text()
+            default_log.read_text(encoding="utf-8") if default_log.exists() else ""
+        )
 
 
 
@@ -382,6 +387,13 @@ class TestAddRotatingHandler:
                 logger.removeHandler(h)
                 h.close()
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="managed-mode group-writable contract is setgid-stateDir POSIX "
+        "(NixOS): Windows maps chmod modes differently and the concurrent "
+        "handler opens lazily, so neither the 0660 byte-mode nor the "
+        "eagerly-created file premise holds there",
+    )
     def test_managed_mode_initial_open_sets_group_writable(self, tmp_path):
         log_path = tmp_path / "managed-open.log"
         logger = logging.getLogger("_test_rotating_managed_open")
