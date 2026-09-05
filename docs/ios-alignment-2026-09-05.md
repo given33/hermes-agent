@@ -54,3 +54,20 @@ real temporary skill files, profile provenance and scan failure reporting.
 The iOS facade, metadata loader and native catalog now use this endpoint;
 preview, scan and install reuse existing actions. Deployment and live-device
 acceptance remain pending.
+
+## Terminal Deadline Regression
+
+The Windows regression run reproduced lost partial output: a printing command
+followed by sleep returned only the timeout notice when cleanup exceeded the
+outer deadline. The backstop now reuses the per-execution capture, including
+bounded capture and spill metadata. Output recovery itself has a 200 ms bound
+so a stalled capture lock cannot defeat the command deadline.
+
+The canonical runner passed 32 tests with 3 platform skips on Windows and all
+35 tests on the isolated Linux source checkout. Tests exercise real subprocess
+output with forced outer expiry in both capture modes, interruption propagation,
+and a deliberately stalled capture lock. Ruff passed in the Linux environment.
+Logs: `windows-terminal-backstop-final-20260905.log` and
+`linux-terminal-backstop-20260905.log` in the audit findings directory.
+This fixes output loss, not the separate Windows process-cleanup latency or
+physical iPhone performance acceptance. Production deployment remains pending.

@@ -1,10 +1,27 @@
 """Verify that terminal command timeouts preserve partial output."""
 from tools.environments.local import LocalEnvironment
+import pytest
 
 
 class TestTimeoutPreservesPartialOutput:
     """When a command times out, any output captured before the deadline
     should be included in the result — not discarded."""
+
+    @pytest.mark.parametrize("bounded_capture", [False, True])
+    def test_outer_deadline_preserves_real_process_output(self, monkeypatch, bounded_capture):
+        from tools.environments import base
+
+        # Expire the outer bound before the poll loop's own timeout path.
+        monkeypatch.setattr(base, "_EXECUTE_WAIT_BOUND_GRACE_S", -1.0)
+        env = LocalEnvironment()
+        result = env.execute(
+            "echo 'partial before backstop' && sleep 30",
+            timeout=2,
+            bounded_capture=bounded_capture,
+        )
+        assert result["returncode"] == 124
+        assert "partial before backstop" in result["output"]
+        assert "timed out" in result["output"].lower()
 
     def test_timeout_includes_partial_output(self):
         """A command that prints then sleeps past the deadline should

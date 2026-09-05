@@ -1013,6 +1013,7 @@ class BaseEnvironment(ABC):
         *,
         bounded_capture: bool = False,
         watch_interrupt_tid: int | None = None,
+        output_holder: list | None = None,
     ) -> dict:
         """Poll-based wait with interrupt checking and stdout draining.
 
@@ -1074,6 +1075,8 @@ class BaseEnvironment(ABC):
             except Exception:
                 spill_path = None
         output = _BoundedOutputCollector(capture_limit, spill_path=spill_path)
+        if output_holder is not None:
+            output_holder.append(output)
 
         # Non-blocking drain via select().
         #
@@ -1504,6 +1507,7 @@ class BaseEnvironment(ABC):
         # commands look idle to cron/gateway heartbeats.
         parent_activity_cb = get_activity_callback()
         proc_holder: list = []
+        output_holder: list = []
 
         def _spawn_and_wait() -> dict:
             if parent_activity_cb is not None:
@@ -1517,6 +1521,7 @@ class BaseEnvironment(ABC):
                 timeout=effective_timeout,
                 bounded_capture=bounded_capture,
                 watch_interrupt_tid=parent_tid,
+                output_holder=output_holder,
             )
 
         def _on_timeout() -> None:
@@ -1574,7 +1579,26 @@ class BaseEnvironment(ABC):
 
         if bounded.timed_out:
             timeout_msg = f"\n[Command timed out after {effective_timeout}s]"
-            result = {"output": timeout_msg.lstrip(), "returncode": 124}
+            # Cleanup can outlast the inner wait's grace period. Preserve the
+            # same bounded capture when the wall-clock backstop wins that race.
+            if output_holder:
+                def _snapshot_output() -> dict:
+                    output = output_holder[0]
+                    rendered = output.render(suffix=timeout_msg)
+                    if output.total_chars == 0:
+                        rendered = rendered.lstrip()
+                    return self._finalize_wait_result(output, rendered, 124)
+
+                # A stalled spill write can hold the capture lock. Recovery
+                # must not turn that lock into another unbounded wait.
+                snapshot = run_bounded_sync(
+                    _snapshot_output, 0.2, label="terminal.timeout-output"
+                )
+                result = snapshot.value if not snapshot.timed_out else {
+                    "output": timeout_msg.lstrip(), "returncode": 124,
+                }
+            else:
+                result = {"output": timeout_msg.lstrip(), "returncode": 124}
         else:
             result = bounded.value
         self._update_cwd(result)

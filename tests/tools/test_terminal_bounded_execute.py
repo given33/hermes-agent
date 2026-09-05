@@ -57,7 +57,8 @@ def test_execute_parent_interrupt_still_kills_wait_on_deadline_worker(monkeypatc
 
     seen = {"parent": False}
 
-    def _wait(_proc, timeout=120, *, bounded_capture=False, watch_interrupt_tid=None):
+    def _wait(_proc, timeout=120, *, bounded_capture=False, watch_interrupt_tid=None,
+              output_holder=None):
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             from tools.interrupt import is_thread_interrupted
@@ -113,3 +114,29 @@ def test_execute_worker_sees_caller_activity_callback(monkeypatch):
 
     assert result["returncode"] == 0
     assert seen["cb"] is _cb
+
+
+def test_timeout_output_recovery_cannot_block_on_stalled_capture(monkeypatch):
+    import threading
+
+    monkeypatch.setattr(base_mod, "_EXECUTE_WAIT_BOUND_GRACE_S", 0.05)
+    env = LocalEnvironment()
+    release = threading.Event()
+    monkeypatch.setattr(env, "_run_bash", lambda *a, **k: SimpleNamespace(pid=None))
+    monkeypatch.setattr(env, "_kill_process", lambda proc: None)
+
+    def _wait(*args, output_holder, **kwargs):
+        collector = base_mod._BoundedOutputCollector(1000)
+        with collector._lock:
+            output_holder.append(collector)
+            release.wait(10)
+
+    monkeypatch.setattr(env, "_wait_for_process", _wait)
+    start = time.monotonic()
+    try:
+        result = env.execute("unused", timeout=1)
+        assert time.monotonic() - start < 3
+        assert result["returncode"] == 124
+        assert "timed out" in result["output"]
+    finally:
+        release.set()
