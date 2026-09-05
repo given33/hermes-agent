@@ -527,6 +527,28 @@ _FLAKY_RESULTS: List[Tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
 
+def _make_temproot() -> str:
+    """Create the isolated pytest temp root on the shortest writable base.
+
+    pytest nests ``pytest-of-<user>/pytest-N/<test>/`` under this root, and
+    the tests nest product state (``HERMES_HOME``) under that. On stock
+    Windows machines the legacy 260-character path limit is still active
+    (``LongPathsEnabled=0``), so every character of root depth can push deep
+    writes - e.g. the collaboration tool-output artifact store's encrypted
+    blobs - past the limit and fail the chain. The default ``gettempdir``
+    base (``AppData/Local/Temp``) is ~36 characters; the
+    user home is ~14 and grants ``mkdtemp`` the same unique-directory
+    isolation this root exists for. Prefer it; fall back to the default
+    when the home is not writable.
+    """
+    for base in (os.path.expanduser("~"), tempfile.gettempdir()):
+        try:
+            return tempfile.mkdtemp(prefix="hermes-pytest-tmproot-", dir=base)
+        except OSError:
+            continue
+    return tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: List[str],
@@ -553,7 +575,7 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
+    temproot = _make_temproot()
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
 
     subproc_start = time.monotonic()
