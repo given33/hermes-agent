@@ -66,6 +66,9 @@ fi
 [[ -f "${repo}/deploy/public/nginx-daxueshenmai.top.conf" ]] || die "nginx site config is missing"
 [[ -f "${repo}/deploy/public/managed-nodes.server.json" ]] || die "managed-nodes server config is missing"
 [[ -f "${repo}/deploy/public/runtime-requirements.lock" ]] || die "runtime dependency lock is missing"
+[[ -f "${repo}/deploy/public/candidate-start-guard.py" ]] || die "candidate start guard is missing"
+[[ -f "${repo}/deploy/public/runtime-home-guard.py" ]] || die "runtime home guard is missing"
+[[ -f "${repo}/deploy/public/profile-runtime-io.py" ]] || die "profile runtime I/O helper is missing"
 [[ -f "${repo}/deploy/recovery/configure-main-managed-installation-ssh.sh" ]] \
   || die "managed installation SSH configurator is missing"
 
@@ -432,6 +435,9 @@ scp "${ssh_args[@]}" \
   "${repo}/deploy/public/nginx-daxueshenmai.top.conf" \
   "${repo}/deploy/public/managed-nodes.server.json" \
   "${repo}/deploy/public/runtime-requirements.lock" \
+  "${repo}/deploy/public/candidate-start-guard.py" \
+  "${repo}/deploy/public/runtime-home-guard.py" \
+  "${repo}/deploy/public/profile-runtime-io.py" \
   "${remote}:${stage}/deploy/public/"
 scp "${ssh_args[@]}" \
   "${runtime_source_manifest}" \

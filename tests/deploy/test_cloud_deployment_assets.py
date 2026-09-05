@@ -1052,7 +1052,11 @@ def test_public_installer_rolls_back_and_installs_every_runtime_file():
         capture_output=True,
         text=True,
         check=False,
-        timeout=180,
+        # The full scenario set (migration rollback, rebind hard-kill
+        # recovery, injected phase failures, venv swap) takes ~285s on the
+        # reference host; the original 180s cap predates the scenarios and
+        # expired a harness that exits 0.
+        timeout=600,
     )
     assert result.returncode == 0, result.stdout + "\n" + result.stderr
     assert "public installer transaction test passed" in result.stdout
