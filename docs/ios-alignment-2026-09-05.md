@@ -41,3 +41,16 @@ Ruff passed for the changed Python tools and tests.
 - No Mac/iPhone device entry is available. macOS CI compilation is available,
   but signed installation, physical-device interaction and Instruments
   latency/frame/memory/CPU measurements remain unverified.
+
+## Official Skill Catalog Batch
+
+Ported `GET /api/skills/hub/official` and `OptionalSkillSource.list_local` from
+the official baseline. The sole structural adaptation is importing the source
+class from this checkout's existing monolithic `tools.skills_hub` module and
+using the existing router exception style. No second scanner or installer is
+introduced. The response includes identifier, category, metadata and the
+requested profile's installed flag. Six mounted-router tests pass, including
+real temporary skill files, profile provenance and scan failure reporting.
+The iOS facade, metadata loader and native catalog now use this endpoint;
+preview, scan and install reuse existing actions. Deployment and live-device
+acceptance remain pending.

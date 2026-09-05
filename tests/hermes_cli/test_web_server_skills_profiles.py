@@ -129,3 +129,41 @@ class TestProfileScopedHubActions:
             json={"identifier": "official/demo", "profile": "ghost"},
         )
         assert resp.status_code == 404
+
+    def test_official_catalog_scans_all_local_skills_and_scopes_installed_flags(
+        self, client, isolated_profiles, tmp_path, monkeypatch
+    ):
+        import hermes_constants
+        from tools.skills_hub import HubLockFile
+
+        optional = tmp_path / "optional-skills"
+        _write_skill(optional / "ops", "daily", "Daily operations")
+        _write_skill(optional / "research", "digest", "Research digest")
+        monkeypatch.setattr(hermes_constants, "get_optional_skills_dir", lambda fallback: optional)
+        lock = HubLockFile(isolated_profiles["worker_alpha"] / "skills" / ".hub" / "lock.json")
+        lock.save({"version": 1, "installed": {"daily": {"identifier": "official/ops/daily"}}})
+
+        response = client.get("/api/skills/hub/official", params={"profile": "worker_alpha"})
+        assert response.status_code == 200
+        rows = response.json()["skills"]
+        assert [(row["identifier"], row["category"], row["installed"]) for row in rows] == [
+            ("official/ops/daily", "ops", True),
+            ("official/research/digest", "research", False),
+        ]
+        assert rows[0]["description"] == "Daily operations"
+        assert all(row["trust_level"] == "builtin" for row in rows)
+        default = client.get("/api/skills/hub/official", params={"profile": "default"})
+        assert default.status_code == 200
+        assert all(not row["installed"] for row in default.json()["skills"])
+        assert sorted(path.name for path in isolated_profiles["default"].joinpath("skills").iterdir()) == ["dashboard-skill"]
+
+    def test_official_catalog_reports_scan_failure(self, client, monkeypatch):
+        from tools.skills_hub import OptionalSkillSource
+
+        def fail(_self):
+            raise OSError("catalog unavailable")
+
+        monkeypatch.setattr(OptionalSkillSource, "list_local", fail)
+        response = client.get("/api/skills/hub/official", params={"profile": "worker_alpha"})
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Official catalog failed: catalog unavailable"

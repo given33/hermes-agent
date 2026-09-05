@@ -3930,6 +3930,10 @@ class OptionalSkillSource(SkillSource):
                 return skill_md.parent
         return None
 
+    def list_local(self) -> List[SkillMeta]:
+        """Every optional skill in the local checkout, with frontmatter metadata."""
+        return self._scan_all()
+
     def _scan_all(self) -> List[SkillMeta]:
         """Enumerate all optional skills with metadata."""
         if not self._optional_dir.is_dir():
