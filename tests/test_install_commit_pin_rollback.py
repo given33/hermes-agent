@@ -21,9 +21,11 @@ its behavior. These run the bash implementation of the same logic for real.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -74,6 +76,38 @@ def repo(tmp_path):
     return origin, shas
 
 
+def _bash_command() -> str:
+    """Resolve a REAL Git-Bash for the installer pin block.
+
+    Windows CreateProcess resolves a bare ``bash`` to
+    ``C:\\Windows\\System32\\bash.exe`` (the WSL launcher) BEFORE scanning
+    PATH, so ``subprocess.run(["bash", ...])`` silently runs the script under
+    WSL, where the Windows-style cd target and the MINGW git toolchain do not
+    exist. Probe PATH (and the standard Git install dirs) for a MINGW/MSYS
+    bash instead. POSIX keeps PATH resolution.
+    """
+    if sys.platform != "win32":
+        return "bash"
+    candidates: list[Path] = []
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if directory:
+            candidates.append(Path(directory) / "bash.exe")
+    program_files = os.environ.get("ProgramFiles", "")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", "")
+    local_app_data = os.environ.get("LocalAppData", "")
+    for base in (program_files, program_files_x86, local_app_data):
+        if base:
+            candidates.append(Path(base) / "Programs" / "Git" / "bin" / "bash.exe")
+            candidates.append(Path(base) / "Git" / "bin" / "bash.exe")
+    for candidate in candidates:
+        low = str(candidate).lower()
+        if "system32" in low or "windowsapps" in low:
+            continue  # the WSL launcher, not a real POSIX shell
+        if candidate.is_file():
+            return str(candidate)
+    return "bash"
+
+
 def _run_pin_block(repo_dir: Path, commit: str, *, force: bool = False) -> str:
     """Execute install.sh's pin block standalone against ``repo_dir``."""
     script = "\n".join(
@@ -83,12 +117,15 @@ def _run_pin_block(repo_dir: Path, commit: str, *, force: bool = False) -> str:
             "log_warn() { echo \"WARN $*\"; }",
             f'INSTALL_COMMIT="{commit}"',
             f'FORCE_COMMIT={"true" if force else "false"}',
-            f'cd "{repo_dir}"',
+            # Git-Bash: backslashes inside double quotes are escape
+            # characters, so hand the script a forward-slash path
+            # (C:/Users/...), which bash on Windows accepts natively.
+            f'cd "{str(repo_dir).replace(chr(92), chr(47))}"',
             _extract_pin_block(),
         ]
     )
     return subprocess.run(
-        ["bash", "-c", script],
+        [_bash_command(), "-c", script],
         capture_output=True,
         text=True,
         check=True,
