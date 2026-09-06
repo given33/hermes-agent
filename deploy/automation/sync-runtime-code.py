@@ -207,15 +207,17 @@ def main():
         active = [(prefix, unit) for prefix, unit in prefixes if run(prefix + ['is-active', unit], check=False).stdout.strip() == 'active']
         if not active:
             raise RuntimeError('No active Hermes service found')
-        before = protected_config_hashes(node['homes'])
         backup = state / ('rollback-' + commit + '-' + str(time.time_ns()))
         backup.mkdir(mode=0o700)
         link_backup = root / '.runtime-backups' / backup.name
         link_backup.mkdir(parents=True, mode=0o700)
         changed, links = [], []
-        report = {'commit': commit, 'version': version, 'files': files, 'configs': before, 'status': 'preparing'}
         for prefix, unit in active:
             run(prefix + ['stop', unit])
+        # Gateways can persist auth while stopping. Fence the code transaction
+        # after that graceful shutdown has finished.
+        before = protected_config_hashes(node['homes'])
+        report = {'commit': commit, 'version': version, 'files': files, 'configs': before, 'status': 'preparing'}
         try:
             pairs = [(generation / name, root / name) for name in files]
             for name in ['.hermes-source-commit', '.hermes-product-commit']:
@@ -247,8 +249,10 @@ def main():
                     link.rename(saved)
                 links.append((link, saved, existed))
                 link.symlink_to(destination, target_is_directory=True)
-            if protected_config_hashes(node['homes']) != before:
-                raise RuntimeError('Instance configuration changed during code update')
+            after = protected_config_hashes(node['homes'])
+            if after != before:
+                affected = sorted(key for key in before.keys() | after.keys() if before.get(key) != after.get(key))
+                raise RuntimeError('Instance configuration changed during code update: ' + ', '.join(affected))
             for name, digest in files.items():
                 if digest_file(root / name) != digest:
                     raise RuntimeError('Runtime checksum mismatch: ' + name)

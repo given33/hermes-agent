@@ -38,7 +38,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=root
-ExecStart={python} {installed} {args.role}
+ExecStart={python} {Path(node['root']) / 'deploy/automation/sync-runtime-code.py'} {args.role}
 TimeoutStartSec=20min
 TimeoutStopSec=30s
 KillMode=control-group
