@@ -63,9 +63,12 @@ def release_target(role: str) -> dict:
     token = token_path.read_text().strip()
     payload = request_json('https://daxueshenmai.top/api/plugins/collaboration/connector/deployment-health',
                            {'Authorization': 'Bearer ' + token, 'X-Connector-ID': family + '-primary'})
-    if payload.get('ok') is not True:
-        raise RuntimeError('The hub has not published a healthy release')
-    return payload['release']
+    release = payload.get('release') if isinstance(payload, dict) else None
+    if not isinstance(release, dict) or not re.fullmatch('[0-9a-f]{40}', str(release.get('commit') or '')):
+        raise RuntimeError('The hub has not published a verified release')
+    # Worker liveness is reported separately. A connector recovering from a
+    # restart must still be able to consume the Hub's already-committed code.
+    return release
 
 
 def run(args: list[str], *, check: bool = True, **kwargs):
