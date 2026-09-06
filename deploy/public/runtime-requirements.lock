@@ -326,6 +326,7 @@ nemo-relay==0.7.2 ; (platform_machine == 'aarch64' and 'android' not in platform
     --hash=sha256:711ffc75947cadcbdd49ea36430258cd3ac8ec9d9d1a4293c245d813c9bac23b \
     --hash=sha256:7db593b09e4c78a62cb979ce07ea1773443a18df4d1fc96eba165174c11f927e \
     --hash=sha256:a26c493b8a6f0e3e49960ba9922015d7ac77ce0ad7d13679136ec553b13d52e7 \
+    --hash=sha256:b4ae77c1f3d58eabda264e82ffaca54548df80caede7dd6af8cbd8f72b4a82ed \
     --hash=sha256:c912268461fa9ef9ae34bcd2516047d52c4ae5d7313eb7ca80e6ce311b9762ac \
     --hash=sha256:d4e1f56e325e7f503447c9f5961690fced5a6e6196cfaa96b54f49416143fe69
 openai==2.24.0 \

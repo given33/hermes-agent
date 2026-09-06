@@ -1430,12 +1430,6 @@ _HARD_WORK_MARKERS = (
     "迁移",
     "回滚",
     "生成文件",
-    "统计",
-    "计算",
-    "汇总",
-    "查询",
-    "扫描",
-    "读取",
     "检查文件",
     "清理",
     "压缩",
@@ -1449,10 +1443,6 @@ _HARD_WORK_MARKERS = (
     "build",
     "migrate",
     "rollback",
-    "count",
-    "summarize",
-    "scan",
-    "read",
 )
 _EXPLANATION_MARKERS = (
     "如何",
@@ -5964,7 +5954,7 @@ def hosted_progress_protocol(role_name: str) -> str:
             "若同一阶段持续较久且没有上述事件，提供低频心跳：说明已经验证到哪里、当前在处理什么、还缺什么。预计少于五分钟的短步骤不单独心跳；长任务从上次可见更新起五到十五分钟内至少更新一次，阻断或需要用户决定时立即更新。",
             "每次更新优先控制在两句，复杂阻断最多三句；至少包含一项已验证事实和一项当前动作、下一步或影响。失败时给出最后一次有代表性的错误、已尝试的策略及剩余影响，不逐次堆叠相同错误。",
             "不要逐条广播每次思考、每个工具调用、重复读取、普通重试或微小步骤；连续重试只在错误类别、处置策略、是否需要外部输入或最终结果改变时更新。不得为了满足频率虚构进度，也不得用过程回报代替实际执行。",
-            "内部推理、工具参数、命令和原始输出进入可折叠活动明细；正文只给用户可验证的工程结论、决策理由和必要风险，不披露隐藏思维链。",
+            "只提供可验证的动作、发现、阻断和结果；不向用户输出内部推理、工具参数或原始输入输出。",
             "进入角色交接前再发一条两句左右的收束更新：已完成/未完成、关键证据或产物、风险，以及接收角色下一步必须核验的事项；交接数据与用户可见更新必须一致。",
             "Hermes 原有的工具选择、Skill/MCP 使用、超时和失败恢复策略保持不变；本协议只约束可见过程回报的时机、密度、真实性和交接质量。",
         )
@@ -5983,9 +5973,12 @@ def hosted_role_delivery_contract(role_name: str) -> str:
         )
     else:
         rules = (
+            "Todo 只记录本成员负责的任务，不复制团队总计划或其他成员的任务。单步计算、问答和一次查询无需 Todo。",
+            "需要多个实质步骤时，通过 todo 工具维护简短清单：开始前列出待办，真正开始时改为 in_progress，有结果证据后改为 completed；同一成员通常只有一项 in_progress。",
+            "清单项写具体动作和产物，保持 id 稳定；失败或阻断保留未完成状态并说明原因，禁止收到任务或发起工具后就标记完成。",
             "Worker 的更新必须把实际动作与证据绑定：说明验证了什么、观察到什么、这对任务结论有何影响，以及下一组操作是什么。",
             "修改、部署或生成产物后必须给出可复核位置、版本/哈希或测试结果；失败不得包装为完成，尚未运行的测试必须标为未验证。",
-            "完成后把结果、证据、产物、异常路径和明确未完成项提交给调度员；不得把推测写成事实。",
+            "完成后把结果、证据、产物、异常路径和明确未完成项提交给 Hermes 主助手；这只是本成员的完成回报。由主助手核验全部成员回报并向用户给出唯一的最终答复，不自行宣称整个任务完成。",
         )
     return "\n".join((f"【{role_name} 角色交付契约】", *rules))
 
@@ -7053,12 +7046,11 @@ def _manager_plan_prompt(
         for item in (
             "你是 Hermes Manager（调度员/规划者），是整个 agent team 的调度中枢。",
             *directive_lines,
-            "你的职责只有一步：理解用户任务，把它拆成一个可直接派发的 Todo List。",
+            "你只负责必要的任务分工。此处的 plan 是成员分工表，不是成员个人的 todo 清单。Hermes 主助手负责接收成员结果、核验并给用户最终答复。",
             "不做深度规划：不写 objective、验收标准、证据要求或测试方案；"
             "不调查环境、不派调查子代理、不调用任何工具，直接输出拆分结果。",
             "拆分要求：",
-            "- 用户任务里有几个可独立交付的片段就拆几项；单一简单任务只拆一项；"
-            "禁止把多个要求合并成一项，也禁止拆出用户没有要求的项。",
+            "- 只按可独立完成的目标拆分；同一目标的一组连续动作交给同一成员，不为阅读、思考、检查、汇报分别派成员。禁止重复派发或增加用户未要求的工作。",
             "- 每项 4 个字段：title 一句话说清做什么；assignee 从可用执行节点中选择；"
             "depends_on 填前一项的 id（串行依赖），可并行的项用空数组；"
             "user_task_fragment 摘录用户任务原文中对应这一个项的片段。",
@@ -7068,19 +7060,15 @@ def _manager_plan_prompt(
             "运行中用 subagent_list 查看、subagent_send 调整、subagent_kill 终止。"
             "需要用户拍板时用 kanban_block(kind=\"needs_input\")，"
             "reason 格式：问题 + 选项（A. ... B. ...）。",
-            hosted_progress_protocol(_HERMES_MANAGER_LABEL),
-            hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
-            mention_priority_protocol(_HERMES_MANAGER_LABEL),
             # 可用执行节点由服务端按当前节点状态确定性注入（零 LLM 调用）。
-            f"可用执行节点（服务端确定性提供）：{', '.join(sorted(set(fallback_workers) | set(_WORKER_TARGET_PROFILES.values())))}",
+            f"可选执行节点（服务端提供，禁止虚构成员）：{', '.join(fallback_workers)}",
             f"服务器路由建议：{', '.join(fallback_workers)}",
             f"是否要求交付文件：{'yes' if artifact_required else 'no'}",
             "最终输出一个 JSON 对象且不要附加解释；过程回报通过运行事件发送，不得混入最终 JSON。结构必须为：",
             '{"workers":["dbb3-worker"],"plan":['
             '{"id":"todo-1","title":"一句话做什么","assignee":"dbb3-worker",'
             '"depends_on":[],"user_task_fragment":"用户任务原文片段"}]}',
-            "plan 是用户右滑后看到的 Todo List，也是服务端并行派发的依据："
-            "depends_on 为空数组的项目会被同时派发给各自的执行者。",
+            "每项必须有稳定 id、明确 assignee 和真实依赖。plan 仅说明分工，收到/执行/完成状态由真实运行事件更新。成员只向主助手回报自己负责的部分。",
             f"用户任务：\n{content}",
             attachment_context,
         )
@@ -7243,59 +7231,19 @@ def _render_deterministic_hosted_report(
     item_results: dict[str, str],
     attachments: list[dict[str, Any]],
 ) -> str:
-    """确定性看板汇报（纯 Python，零 LLM 调用）。
-
-    由调度员直接汇总：逐项列出「任务项 → 执行者 → 状态 → 结果摘录
-    （前 200 字）→ 产物」，最后附一行总计。
-    """
-
+    """Deliver members' complete results through the parent without a second board."""
     lines: list[str] = []
-    lines.append("# 任务执行看板")
-    lines.append("")
-    lines.append(f"用户任务：{str(content or '').strip()[:500]}")
-    lines.append("")
-    lines.append("## 执行明细")
     for index, item in enumerate(todo_items, start=1):
         item_id = str(item.get("id") or f"todo-{index}")
         status = str(item_statuses.get(item_id) or "")
         label = _hosted_todo_status_label(status)
-        excerpt = str(item_results.get(item_id) or "").strip().replace("\n", " ")[:200]
-        lines.append(f"{index}. {str(item.get('title') or item_id)}（ID: {item_id}）")
-        lines.append(f"   - 执行者：{item.get('assignee')}")
-        lines.append(f"   - 状态：{label}")
-        if excerpt:
-            lines.append(f"   - 结果：{excerpt}")
-        else:
-            lines.append("   - 结果：（执行者未提交文本结果）")
-    artifact_links: list[str] = []
-    for attachment in attachments:
-        if not isinstance(attachment, dict):
-            continue
-        name = str(attachment.get("name") or "产物").strip()
-        artifact_id = str(attachment.get("id") or "").strip()
-        artifact_links.append(f"{name}（附件 ID: {artifact_id}）" if artifact_id else name)
-    if artifact_links:
-        lines.append("")
-        lines.append("## 产物")
-        lines.extend(f"- {link}" for link in artifact_links)
-    total = len(todo_items)
-    completed = sum(
-        1
-        for item in todo_items
-        if str(item_statuses.get(str(item.get("id") or "")) or "") == "completed"
-    )
-    failed = sum(
-        1
-        for item in todo_items
-        if _hosted_todo_status_label(
-            str(item_statuses.get(str(item.get("id") or "")) or "")
-        )
-        == "失败"
-    )
-    unfinished = total - completed - failed
-    lines.append("")
-    lines.append(f"**总计**：共 {total} 项，完成 {completed} 项，失败 {failed} 项，未完成 {unfinished} 项。")
-    return "\n".join(lines)
+        result = str(item_results.get(item_id) or "").strip()
+        if len(todo_items) > 1:
+            lines.append(f"### {str(item.get('title') or item_id)}")
+        if status != "completed":
+            lines.append(f"{item.get('assignee') or '执行成员'}：{label}。")
+        lines.append(result or "执行成员尚未提交结果。")
+    return "\n\n".join(lines)
 
 
 def _hosted_manager_plan_todo_snapshot(
@@ -7764,7 +7712,8 @@ def classify_intent_with_context_model(
     system = (
         "Classify this Hermes conversation turn from semantics and context. "
         "chat is ordinary conversation, explanation, translation, summary, search, or read-only analysis that one "
-        "Hermes can answer. work is concrete development/operations, tool execution, state mutation, deployment, "
+        "Hermes can answer directly, including arithmetic and a small number of tool calls. Tool use alone does not require work mode. "
+        "work is concrete development/operations requiring remote workers, state mutation, deployment, "
         "multi-step execution, or creating a deliverable. An uploaded file is normally input, not a requested output. "
         "Repository edits do not imply a downloadable artifact. Resolve references such as continue or send that file "
         "from recent_messages. Select targets from dbb3 and pc (Windows/WSL/local computer). "
@@ -9343,6 +9292,15 @@ def apply_profile_event(
     payload = payload if isinstance(payload, dict) else {}
     activities = state.setdefault("activities", [])
     now = int(time.time() * 1000)
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        context_used = usage.get("context_used")
+        context_max = usage.get("context_max")
+        if (isinstance(context_used, (int, float)) and isinstance(context_max, (int, float))
+                and 0 <= context_used and context_max > 0):
+            state["context_used"] = int(context_used)
+            state["context_max"] = int(context_max)
+            state["context_used_percent"] = min(100, context_used / context_max * 100)
 
     def finish_retry_activity(status: str = "completed") -> None:
         for item in activities:
@@ -10157,6 +10115,9 @@ def _persist_hosted_role_state(
     snapshot = {
         "profile": profile,
         "member_id": member_id,
+        "context_used": state.get("context_used"),
+        "context_max": state.get("context_max"),
+        "context_used_percent": state.get("context_used_percent"),
         "content": content,
         "status": state_status,
         "activities": activities,
@@ -10226,6 +10187,9 @@ def _persist_hosted_role_state(
             "profile": profile,
             "member_id": member_id,
             "handoff_to": handoff_to,
+            "context_used": snapshot["context_used"],
+            "context_max": snapshot["context_max"],
+            "context_used_percent": snapshot["context_used_percent"],
             "started_at": snapshot["started_at"],
             "model_started_at": snapshot["model_started_at"] or None,
             "first_token_at": snapshot["first_token_at"] or None,
@@ -12122,6 +12086,8 @@ def _schedule_mobile_notification(
     kind: str,
     status: str,
     result: str,
+    *,
+    persisted_context: Optional[tuple[str, dict[str, Any]]] = None,
 ) -> None:
     """Queue a persisted notification on the process-wide APNs dispatcher.
 
@@ -12135,24 +12101,29 @@ def _schedule_mobile_notification(
 
     field = "notification" if kind == "completion" else "notification_awaiting"
     try:
-        with _STATE_LOCK:
-            state = load_single_state()
-            conversation = _conversation_by_id(state, conversation_id)
-            run = (conversation.get("hosted_turns") or {}).get(turn_id)
-            if not isinstance(run, dict):
-                return
-            owner_id = str(conversation.get("owner_id") or "").strip()
-            notification = run.get(field)
-            if not isinstance(notification, dict):
-                notification = _completion_notification_record(
-                    conversation_id,
-                    turn_id,
-                    status,
-                    result,
-                )
-                run[field] = notification
-                save_single_state(state)
-            notification_state = str(notification.get("state") or "queued")
+        if persisted_context is not None:
+            # Recovery already holds a committed snapshot. The dispatcher
+            # revalidates ownership and delivery before sending each push.
+            owner_id, notification = persisted_context
+        else:
+            with _STATE_LOCK:
+                state = load_single_state()
+                conversation = _conversation_by_id(state, conversation_id)
+                run = (conversation.get("hosted_turns") or {}).get(turn_id)
+                if not isinstance(run, dict):
+                    return
+                owner_id = str(conversation.get("owner_id") or "").strip()
+                notification = run.get(field)
+                if not isinstance(notification, dict):
+                    notification = _completion_notification_record(
+                        conversation_id,
+                        turn_id,
+                        status,
+                        result,
+                    )
+                    run[field] = notification
+                    save_single_state(state)
+        notification_state = str(notification.get("state") or "queued")
         if notification_state in _MOBILE_NOTIFICATION_TERMINAL_STATUSES:
             return
         if not owner_id:
@@ -12204,10 +12175,13 @@ def _schedule_mobile_completion_notification(
     turn_id: str,
     status: str,
     result: str,
+    *,
+    persisted_context: Optional[tuple[str, dict[str, Any]]] = None,
 ) -> None:
     """Queue a persisted task-completion notification (background exit UX)."""
 
-    _schedule_mobile_notification(conversation_id, turn_id, "completion", status, result)
+    _schedule_mobile_notification(conversation_id, turn_id, "completion", status, result,
+                                  persisted_context=persisted_context)
 
 
 def _schedule_mobile_awaiting_notification(
@@ -14279,6 +14253,9 @@ def execute_hosted_chat(
                     _role_state.get("runtime_session_id") or ""
                 ).strip(),
                 "runtime_message_id": _role_state.get("runtime_tip_message_id"),
+                "context_used": _role_state.get("context_used"),
+                "context_max": _role_state.get("context_max"),
+                "context_used_percent": _role_state.get("context_used_percent"),
             },
         },
     )
@@ -15708,6 +15685,7 @@ def resume_unfinished_hosted_workflows(
                     str(turn_id),
                     str(notification.get("task_status") or run.get("status") or "failed"),
                     str(notification.get("result") or ""),
+                    persisted_context=(str(conversation.get("owner_id") or "").strip(), notification),
                 )
 
 

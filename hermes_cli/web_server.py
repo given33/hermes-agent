@@ -7619,6 +7619,7 @@ async def get_model_options(
     refresh: bool = False,
     include_unconfigured: bool = False,
     explicit_only: bool = False,
+    catalog_only: bool = False,
 ):
     """Return authenticated providers + their curated model lists.
 
@@ -7643,7 +7644,7 @@ async def get_model_options(
                 status_code=503, detail=f"Restart required: {skew_msg}"
             )
 
-        from hermes_cli.inventory import build_model_options_payload, load_picker_context
+        from hermes_cli.inventory import build_model_options_payload, build_models_payload, load_picker_context
 
         def _build_payload_scoped() -> dict:
             # Keep the profile override inside the worker thread so the full
@@ -7654,6 +7655,12 @@ async def get_model_options(
             # cache miss, and _profile_scope's RLock held across that block
             # starves concurrent /api/config and freezes the server (#58576).
             with _config_profile_scope(profile):
+                if catalog_only:
+                    return build_models_payload(
+                        load_picker_context(), explicit_only=True, picker_hints=True,
+                        canonical_order=True, for_picker=True,
+                        probe_custom_providers=False, probe_current_custom_provider=False,
+                    )
                 return build_model_options_payload(
                     load_picker_context(),
                     explicit_only=bool(explicit_only),
@@ -7935,7 +7942,9 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
                 }
 
         def _apply_assignment():
-            with _profile_scope(body.profile or profile):
+            # Model assignment only uses context-local config paths. Skill
+            # discovery must not hold up an unrelated model switch.
+            with _config_profile_scope(body.profile or profile), _CONFIG_MUTATION_LOCK:
                 return _apply_model_assignment_sync(
                     scope, provider, model, task, base_url, api_key
                 )

@@ -43,6 +43,52 @@ def test_connector_nonnegative_int_rejects_corrupt_state():
     assert module._nonnegative_int(float("inf")) == 0
 
 
+def test_simple_calculation_does_not_create_workflow_or_call_router_model():
+    module = load_module()
+    for prompt in (
+        "请直接计算 137×29，只回复结果，不调用工具，不分派任务。",
+        "E2E-20260906-02：这是一条普通聊天验收。请直接计算 137×29，只回复计算结果，不调用工具，不分派任务。",
+        "Summarize this sentence: The train arrives at noon.",
+        "查询一下今天的天气",
+    ):
+        def unexpected_model(_):
+            raise AssertionError("A simple turn must bypass the router model")
+        result = module.classify_user_intent(prompt, model_classifier=unexpected_model)
+        assert result["mode"] == "chat", prompt
+        assert result["lock_level"] == "hard_chat", prompt
+        assert result["profiles"] == ["default"], prompt
+
+
+def test_parent_report_preserves_full_results_and_failure_without_board():
+    module = load_module()
+    long_result = "Verified result.\n" * 50
+    result = module._render_deterministic_hosted_report(
+        content="Task", todo_items=[{"id": "a", "title": "Research", "assignee": "pc-worker"}],
+        item_statuses={"a": "completed"}, item_results={"a": long_result}, attachments=[],
+    )
+    assert result == long_result.strip()
+    failed = module._render_deterministic_hosted_report(
+        content="Task", todo_items=[{"id": "a", "assignee": "pc-worker"}],
+        item_statuses={"a": "failed"}, item_results={"a": "Connection refused"}, attachments=[],
+    )
+    assert "pc-worker" in failed and "失败" in failed and "Connection refused" in failed
+
+
+def test_message_completion_keeps_real_context_usage():
+    module = load_module()
+    state = {"content": "", "status": "streaming", "activities": []}
+    module.apply_profile_event(state, {"type": "message.complete", "payload": {
+        "content": "3973", "usage": {"context_used": 32768, "context_max": 131072},
+    }})
+    assert state["context_used"] == 32768
+    assert state["context_max"] == 131072
+    assert state["context_used_percent"] == 25
+    module.apply_profile_event(state, {"type": "message.complete", "payload": {
+        "usage": {"context_used": -1, "context_max": 0},
+    }})
+    assert state["context_used"] == 32768
+
+
 def test_connector_flags_normalize_textual_values():
     module = load_module()
     assert module._coerce_flag(True) is True
@@ -5561,11 +5607,11 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         run = conversation["hosted_turns"]["turn-hosted-1"]
         final_message = assistant_messages[-1]
-        # 最终汇报由确定性看板生成（零 LLM），不是 runner 里 "default" 的文本。
+        # The parent publishes complete worker results without a second board.
         self.assertEqual(final_message["content"], run["result"])
-        self.assertIn("任务执行看板", final_message["content"])
+        self.assertNotIn("任务执行看板", final_message["content"])
         self.assertIn("执行完成，服务已恢复", final_message["content"])
-        self.assertIn("dbb3-worker", final_message["content"])
+        self.assertEqual(final_message["content"], "执行完成，服务已恢复")
         self.assertEqual(run["status"], "completed")
         self.assertEqual(
             run["aggregation"],
@@ -5700,7 +5746,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         notification_starts = []
         module.start_hosted_workflow = lambda *args: hosted_starts.append(args)
         module._schedule_mobile_completion_notification = (
-            lambda *args: notification_starts.append(args)
+            lambda *args, **kwargs: notification_starts.append(args)
         )
 
         module.resume_unfinished_hosted_workflows([conversation])
@@ -5777,6 +5823,13 @@ class CollaborationDashboardTests(unittest.TestCase):
             self.assertEqual(created_threads[0].name, "hermes-apns-dispatcher")
             self.assertTrue(created_threads[0].daemon)
             self.assertEqual(len(module._MOBILE_NOTIFICATION_PENDING), 2)
+            # Index reads replay the already-loaded outbox without cloning
+            # the entire account once per historical notification.
+            module.load_single_state = lambda: (_ for _ in ()).throw(AssertionError("redundant state read"))
+            with patch.object(module.threading, "Thread", FakeThread):
+                module.resume_unfinished_hosted_workflows(conversations)
+            self.assertEqual(len(module._MOBILE_NOTIFICATION_PENDING), 2)
+            self.assertEqual(len(created_threads), 1)
         finally:
             module._MOBILE_NOTIFICATION_DISPATCH_THREAD = None
             module._MOBILE_NOTIFICATION_PENDING.clear()
@@ -7256,7 +7309,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             for message in reversed(conversation["messages"])
             if message.get("meta", {}).get("final_report")
         )
-        self.assertIn("任务执行看板", final_message["content"])
+        self.assertNotIn("任务执行看板", final_message["content"])
         self.assertIn("dbb3-worker 完成", final_message["content"])
         self.assertIn("pc-worker 完成", final_message["content"])
 
@@ -7389,7 +7442,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(run["status"], "failed")
         self.assertEqual(run["stage"], "failed")
         self.assertEqual(run["validation_verdicts"]["final_report"], "failed")
-        self.assertIn("todo-1", run["result"])
+        self.assertIn("dbb3-worker", run["result"])
         self.assertIn("未完成", run["result"])
 
     def test_intent_classifier_hard_chat_lock_rejects_conflicting_model(self):
@@ -7696,7 +7749,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         run = conversation["hosted_turns"]["turn-manager-owned"]
         self.assertEqual(run["stage"], "completed")
-        self.assertIn("任务执行看板", run["result"])
+        self.assertNotIn("任务执行看板", run["result"])
         self.assertIn("worker evidence", run["result"])
         self.assertEqual(
             run["manager_plan"]["workers"],
