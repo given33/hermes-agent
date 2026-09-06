@@ -148,7 +148,7 @@ def main():
         if receipt.get('commit') == commit and all(
             (root / name).is_file() and digest_file(root / name) == digest
             for name, digest in receipt.get('files', {}).items()
-        ) and receipt.get('files'):
+        ) and receipt.get('files') and args.role == 'hub':
             print(json.dumps({'role': args.role, 'commit': commit, 'status': 'current'}))
             return
         ancestry = request_json(f'https://api.github.com/repos/{REPOSITORY}/compare/{commit}...main')
