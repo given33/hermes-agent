@@ -529,7 +529,10 @@ async def collaboration_dashboard_lifespan(_app):
         )
 
 
-async def _enforce_active_account_generation(request: Request) -> None:
+async def _enforce_active_account_generation(
+    request: Request | None = None,
+    websocket: WebSocket | None = None,
+) -> None:
     """Router-wide stale-generation fence (P1-15).
 
     Owner-mobile bearer tokens carry the generation they were minted for.
@@ -541,14 +544,17 @@ async def _enforce_active_account_generation(request: Request) -> None:
     matching the per-route `_account_generation_for_request` semantics.
     """
 
-    principal = getattr(getattr(request, "state", None), "token_principal", None)
+    connection = request or websocket
+    if connection is None:
+        return
+    principal = getattr(getattr(connection, "state", None), "token_principal", None)
     if getattr(principal, "provider", "") != "owner-mobile":
         return
-    owner_id = owner_id_from_request(request)
+    owner_id = owner_id_from_request(connection)
     if not owner_id:
         return
     live_generation = _account_generation_for_owner(owner_id)
-    if account_generation_from_request(request) != live_generation:
+    if account_generation_from_request(connection) != live_generation:
         raise HTTPException(status_code=410, detail="Account generation is no longer active")
 
 
@@ -13369,6 +13375,45 @@ def _request_remote_timeout_locked(
     return True
 
 
+def _remote_queue_needs_transaction(
+    state: dict[str, Any], connector_id: str, *, now: int,
+    cancellations: bool = False,
+) -> bool:
+    """Avoid copying every transcript when an idle connector polls its queue."""
+    for conversation in state.get("conversations") or []:
+        if not isinstance(conversation, dict):
+            continue
+        for hosted in (conversation.get("hosted_turns") or {}).values():
+            if not isinstance(hosted, dict):
+                continue
+            for remote in (hosted.get("remote_runs") or {}).values():
+                if not isinstance(remote, dict):
+                    continue
+                status = str(remote.get("status") or "queued")
+                if status in _REMOTE_TERMINAL_STATUSES:
+                    continue
+                cancelling = _coerce_flag(remote.get("cancel_requested"))
+                deadline = _positive_int(remote.get(
+                    "cancel_force_terminal_at" if cancelling else "deadline_at"
+                ))
+                if deadline is not None and deadline <= now:
+                    return True
+                if _remote_run_connector_id(remote) != connector_id:
+                    continue
+                if cancellations:
+                    if (cancelling or _coerce_flag(hosted.get("cancel_requested"))) and (
+                        _nonnegative_int(remote.get("cancel_lease_until")) <= now
+                    ):
+                        return True
+                elif _remote_run_is_pullable(remote) and not cancelling:
+                    if status == "queued" or (
+                        status in {"leased", "running", "awaiting_input"}
+                        and _nonnegative_int(remote.get("lease_until")) <= now
+                    ):
+                        return True
+    return False
+
+
 def _advance_remote_run_deadlines(
     state: dict[str, Any],
     *,
@@ -17569,6 +17614,10 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
     changed_conversation_ids: set[str] = set()
     changed = False
     with _STATE_LOCK:
+        if not _remote_queue_needs_transaction(
+            _load_single_state_for_event_stream(), connector_id, now=now,
+        ):
+            return {"runs": [], "server_time": now}
         state = load_single_state()
         deadline_changes = _advance_remote_run_deadlines(state, now=now)
         if deadline_changes:
@@ -17771,6 +17820,11 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
     changed_conversation_ids: set[str] = set()
     changed = False
     with _STATE_LOCK:
+        if not _remote_queue_needs_transaction(
+            _load_single_state_for_event_stream(), connector_id, now=now,
+            cancellations=True,
+        ):
+            return {"cancellations": [], "server_time": now}
         state = load_single_state()
         deadline_changes = _advance_remote_run_deadlines(state, now=now)
         if deadline_changes:

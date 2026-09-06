@@ -258,9 +258,12 @@ def main():
                     raise RuntimeError('Runtime checksum mismatch: ' + name)
             for prefix, unit in reversed(active):
                 run(prefix + ['start', unit])
-            time.sleep(3)
             for prefix, unit in active:
-                run(prefix + ['is-active', unit])
+                deadline = time.monotonic() + 90
+                while run(prefix + ['is-active', unit], check=False).stdout.strip() != 'active':
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('Updated service did not become active: ' + unit)
+                    time.sleep(1)
             if args.role == 'hub':
                 deadline = time.monotonic() + 90
                 while True:

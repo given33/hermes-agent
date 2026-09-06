@@ -43,6 +43,47 @@ def test_connector_nonnegative_int_rejects_corrupt_state():
     assert module._nonnegative_int(float("inf")) == 0
 
 
+def test_router_account_fence_accepts_websocket_connections():
+    from fastapi import FastAPI, WebSocket
+    from fastapi.testclient import TestClient
+
+    module = load_module()
+
+    @module.router.websocket("/test-live")
+    async def live(socket: WebSocket):
+        await socket.accept()
+        await socket.send_json({"streaming": True})
+        await socket.close()
+
+    app = FastAPI()
+    app.include_router(module.router)
+    with TestClient(app).websocket_connect("/test-live") as socket:
+        assert socket.receive_json() == {"streaming": True}
+
+
+def test_idle_connector_poll_never_copies_conversation_history(monkeypatch):
+    module = load_module()
+    monkeypatch.setattr(module, "_require_connector", lambda _: "dbb3-primary")
+    monkeypatch.setattr(module, "_rate_limit_connector", lambda *args: None)
+    state = {"conversations": [{"hosted_turns": {"t": {"remote_runs": {
+        "worker": {"profile": "dbb3-worker", "status": "completed"},
+    }}}}]}
+    monkeypatch.setattr(module, "_load_single_state_for_event_stream", lambda: state)
+
+    def unexpected_write_read():
+        raise AssertionError("Idle polls must not copy mutable account state")
+
+    monkeypatch.setattr(module, "load_single_state", unexpected_write_read)
+    body = module.ConnectorPullBody(connector_id="dbb3-primary")
+    assert module.connector_pull_runs(body, SimpleNamespace())["runs"] == []
+    assert module.connector_pull_cancellations(body, SimpleNamespace())["cancellations"] == []
+    remote = state["conversations"][0]["hosted_turns"]["t"]["remote_runs"]["worker"]
+    remote.update(status="running", deadline_at=100)
+    assert module._remote_queue_needs_transaction(state, "pc-primary", now=101)
+    remote.update(status="queued", deadline_at=10000, connector_id="dbb3-primary")
+    assert module._remote_queue_needs_transaction(state, "dbb3-primary", now=101)
+
+
 def test_simple_calculation_does_not_create_workflow_or_call_router_model():
     module = load_module()
     for prompt in (
