@@ -6350,7 +6350,7 @@ def _pending_hosted_role_intervention(
     deliveries: Optional[set[str]] = None,
 ) -> Optional[dict[str, Any]]:
     with _STATE_LOCK:
-        state = load_single_state()
+        state = _load_single_state_for_event_stream()
         conversation = _conversation_by_id(state, conversation_id)
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
         if not isinstance(run, dict):
@@ -6368,7 +6368,7 @@ def _pending_hosted_role_intervention(
                 continue
             if str(item.get("queue_mode") or "one_at_a_time") == "all_at_once":
                 delivery_key, claim = _intervention_delivery_claim(
-                    item,
+                    deepcopy(item),
                     role_stage=role_stage,
                     profile=profile,
                 )
@@ -6394,7 +6394,7 @@ def _hosted_intervention_by_id(
 ) -> Optional[dict[str, Any]]:
     wanted = str(intervention_id or "")
     with _STATE_LOCK:
-        state = load_single_state()
+        state = _load_single_state_for_event_stream()
         conversation = _conversation_by_id(state, conversation_id)
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
         if not isinstance(run, dict):

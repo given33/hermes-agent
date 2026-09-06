@@ -226,6 +226,35 @@ def test_gateway_replays_session_ready_emitted_before_local_registration():
     assert gateway._early_session_ready == set()
 
 
+def test_session_rpc_does_not_block_reader_or_other_conversations():
+    gateway = _GatewayProcess.__new__(_GatewayProcess)
+    gateway._session_lock = threading.Lock()
+    gateway._sessions_by_conversation = {}
+    gateway._sessions_by_live = {}
+    gateway._early_session_ready = set()
+    barrier = threading.Barrier(2)
+
+    def rpc(_method, params, *, timeout):
+        conversation = params["tool_artifact_context"]["conversation_id"]
+        assert gateway._session_lock.acquire(timeout=3), "RPC blocked the event reader"
+        try:
+            gateway._early_session_ready.add(conversation)
+        finally:
+            gateway._session_lock.release()
+        barrier.wait(timeout=3)
+        return {"session_id": conversation, "stored_session_id": conversation}
+
+    gateway.rpc = rpc
+
+    def create(conversation):
+        return gateway.ensure_session(conversation, artifact_context={"conversation_id": conversation})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        states = list(executor.map(create, ["first", "second"]))
+    assert all(state.agent_ready.is_set() for state in states)
+    assert create("first") is states[0]
+
+
 def test_gateway_replays_early_session_info_as_ready_boundary():
     gateway = _GatewayProcess.__new__(_GatewayProcess)
     gateway._session_lock = threading.Lock()

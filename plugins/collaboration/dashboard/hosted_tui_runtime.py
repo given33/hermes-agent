@@ -81,6 +81,7 @@ class _GatewayProcess:
         self._write_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._session_lock = threading.Lock()
+        self._session_creation_locks: dict[str, threading.Lock] = {}
         self._pending: dict[str, queue.Queue[dict[str, Any]]] = {}
         self._ready = threading.Event()
         self._closed = threading.Event()
@@ -368,7 +369,15 @@ class _GatewayProcess:
             raise HostedTuiGatewayError("Hosted conversation id is required")
         requested_session_id = str(requested_session_id or "").strip()
         with self._session_lock:
-            existing = self._sessions_by_conversation.get(conversation_id)
+            creation_locks = getattr(self, "_session_creation_locks", None)
+            if creation_locks is None:
+                creation_locks = self._session_creation_locks = {}
+            creation_lock = creation_locks.setdefault(conversation_id, threading.Lock())
+        # The stdout reader takes _session_lock before delivering session
+        # events. Holding it across RPC can prevent the reply from being read.
+        with creation_lock:
+            with self._session_lock:
+                existing = self._sessions_by_conversation.get(conversation_id)
             if existing is not None:
                 self.live_session_id = existing.live_session_id
                 self.stored_session_id = existing.stored_session_id
@@ -418,34 +427,30 @@ class _GatewayProcess:
                 stored_session_id=stored_session_id,
                 artifact_context=dict(artifact_context),
             )
-            early_ready = getattr(self, "_early_session_ready", set())
-            early_info_map = getattr(self, "_early_session_info", {})
-            if live_session_id in early_ready:
-                early_ready.discard(live_session_id)
-                state.agent_ready.set()
-            early_info = early_info_map.pop(live_session_id, None)
-            if isinstance(early_info, dict):
-                early_payload = early_info.get("payload")
-                if isinstance(early_payload, dict):
-                    if early_payload.get("session_id"):
-                        state.stored_session_id = str(
-                            early_payload.get("session_id")
-                        )
-                    state.latest_session_info = {
-                        "type": "session.info",
-                        "payload": {
-                            **early_payload,
-                            "session_id": state.stored_session_id,
-                        },
-                    }
+            with self._session_lock:
+                early_ready = getattr(self, "_early_session_ready", set())
+                early_info_map = getattr(self, "_early_session_info", {})
+                if live_session_id in early_ready:
+                    early_ready.discard(live_session_id)
                     state.agent_ready.set()
-            info = result.get("info")
-            if isinstance(info, dict) and not info.get("lazy", True):
-                state.agent_ready.set()
-            self._sessions_by_conversation[conversation_id] = state
-            self._sessions_by_live[live_session_id] = state
-            self.live_session_id = live_session_id
-            self.stored_session_id = stored_session_id
+                early_info = early_info_map.pop(live_session_id, None)
+                if isinstance(early_info, dict):
+                    early_payload = early_info.get("payload")
+                    if isinstance(early_payload, dict):
+                        if early_payload.get("session_id"):
+                            state.stored_session_id = str(early_payload["session_id"])
+                        state.latest_session_info = {
+                            "type": "session.info",
+                            "payload": {**early_payload, "session_id": state.stored_session_id},
+                        }
+                        state.agent_ready.set()
+                info = result.get("info")
+                if isinstance(info, dict) and not info.get("lazy", True):
+                    state.agent_ready.set()
+                self._sessions_by_conversation[conversation_id] = state
+                self._sessions_by_live[live_session_id] = state
+                self.live_session_id = live_session_id
+                self.stored_session_id = stored_session_id
             return state
 
     def wait_until_warm(self, conversation_id: str, timeout: float = 60.0) -> bool:

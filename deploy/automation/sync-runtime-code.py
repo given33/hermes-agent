@@ -184,7 +184,7 @@ def main():
             result = run([python, '-m', 'pip', 'install', '--disable-pip-version-check', '--require-hashes',
                           '--no-deps', '-r', str(dependency_lock)], timeout=600)
             (generation / '.dependency-install.log').write_text(result.stdout + result.stderr)
-            run([python, '-m', 'pip', 'install', '--no-deps', '--no-build-isolation', '-e', str(generation)], timeout=120)
+            run([python, '-m', 'pip', 'install', '--no-deps', '-e', str(generation)], timeout=180)
             ready.write_text(digest_file(dependency_lock))
         environment_owner = original.stat()
         for directory, subdirectories, filenames in os.walk(environment):
@@ -245,8 +245,7 @@ def main():
             # separately built dashboard assets. The candidate import check
             # above uses the isolated generation; activation binds its venv
             # to the now-verified stable code path.
-            run([python, '-m', 'pip', 'install', '--no-deps', '--no-build-isolation',
-                 '-e', str(root)], timeout=120)
+            run([python, '-m', 'pip', 'install', '--no-deps', '-e', str(root)], timeout=180)
             for name, destination in [(node['environment'], environment), ('.fabric-current', generation)]:
                 link = root / name
                 saved = link_backup / name
