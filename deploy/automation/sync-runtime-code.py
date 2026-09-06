@@ -241,6 +241,12 @@ def main():
                     os.chown(temporary, previous.st_uid, previous.st_gid)
                     temporary.chmod(previous.st_mode & 0o777)
                 os.replace(temporary, destination)
+            # Services run from the stable install root, which also owns the
+            # separately built dashboard assets. The candidate import check
+            # above uses the isolated generation; activation binds its venv
+            # to the now-verified stable code path.
+            run([python, '-m', 'pip', 'install', '--no-deps', '--no-build-isolation',
+                 '-e', str(root)], timeout=120)
             for name, destination in [(node['environment'], environment), ('.fabric-current', generation)]:
                 link = root / name
                 saved = link_backup / name
