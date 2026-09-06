@@ -5,18 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
 import { $cronJobs, setCronJobs } from '@/store/cron'
 import {
-  beginGatewaySwitch,
-  endGatewaySwitch,
-  recoverActiveSourceAfterFailedGatewaySwitch,
-  registerGatewaySwitchLifecycle
-} from '@/store/gateway-switch'
-import {
   $cronSessions,
   $messagingPlatformTotals,
   $messagingSessions,
-  $messagingTruncated,
-  $sessionProfilesTruncated,
-  $sessionProfilesUsage,
   $sessions,
   $sessionsLoading,
   setCronSessions,
