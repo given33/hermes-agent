@@ -261,7 +261,10 @@ def main():
                 deadline = time.monotonic() + 90
                 while True:
                     try:
-                        with urllib.request.urlopen('http://127.0.0.2:9119/health', timeout=5) as response:
+                        # The dashboard mounts its health route under /api; /health is
+                        # redirected through the authenticated UI shell and is not a
+                        # reliable release verification endpoint.
+                        with urllib.request.urlopen('http://127.0.0.2:9119/api/health', timeout=5) as response:
                             if response.status == 200:
                                 break
                     except Exception:
