@@ -50,6 +50,7 @@ bootstrap_trusted_runtime()
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.requests import HTTPConnection
 from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
@@ -529,10 +530,7 @@ async def collaboration_dashboard_lifespan(_app):
         )
 
 
-async def _enforce_active_account_generation(
-    request: Request | None = None,
-    websocket: WebSocket | None = None,
-) -> None:
+async def _enforce_active_account_generation(request: HTTPConnection) -> None:
     """Router-wide stale-generation fence (P1-15).
 
     Owner-mobile bearer tokens carry the generation they were minted for.
@@ -544,17 +542,14 @@ async def _enforce_active_account_generation(
     matching the per-route `_account_generation_for_request` semantics.
     """
 
-    connection = request or websocket
-    if connection is None:
-        return
-    principal = getattr(getattr(connection, "state", None), "token_principal", None)
+    principal = getattr(getattr(request, "state", None), "token_principal", None)
     if getattr(principal, "provider", "") != "owner-mobile":
         return
-    owner_id = owner_id_from_request(connection)
+    owner_id = owner_id_from_request(request)
     if not owner_id:
         return
     live_generation = _account_generation_for_owner(owner_id)
-    if account_generation_from_request(connection) != live_generation:
+    if account_generation_from_request(request) != live_generation:
         raise HTTPException(status_code=410, detail="Account generation is no longer active")
 
 
