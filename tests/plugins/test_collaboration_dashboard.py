@@ -5972,6 +5972,9 @@ class CollaborationDashboardTests(unittest.TestCase):
     def test_conversation_index_compacts_hosted_role_event_payloads(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
+        conversation["hosted_events"] = [{"payload": "event" * 20000}]
+        conversation["session_entries"] = [{"content": "history" * 20000}]
+        conversation["session_entry_quarantine"] = [{"content": "private" * 20000}]
         now = int(time.time() * 1000)
         conversation["hosted_turns"] = {
             "turn-heavy": {
@@ -5999,6 +6002,10 @@ class CollaborationDashboardTests(unittest.TestCase):
         response = module.get_single_conversations()
 
         summary = response["conversations"][0]
+        self.assertNotIn("hosted_events", summary)
+        self.assertNotIn("session_entries", summary)
+        self.assertNotIn("session_entry_quarantine", summary)
+        self.assertIn("hosted_events", conversation)
         hosted = summary["hosted_turns"]["turn-heavy"]
         self.assertEqual(hosted["status"], "running")
         self.assertEqual(hosted["stage"], "worker")

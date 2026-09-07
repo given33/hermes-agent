@@ -18557,6 +18557,12 @@ def _conversation_index_projection(conversation: dict[str, Any]) -> dict[str, An
     for key in ("session_archived", "session_pinned", "session_unread"):
         projected.pop(key, None)
     for key in (
+        "hosted_events",
+        "hosted_event_sequences",
+        "hosted_event_terminals",
+        "session_entries",
+        "session_entry_quarantine",
+        "session_entry_diagnostics",
         "history_message_count",
         "history_last_message",
         "history_session_entry_count",
