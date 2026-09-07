@@ -30,6 +30,7 @@ NODES = {
              'units': ['hermes-gateway', 'hermes-dashboard'], 'user_units': ['dbb3-cloud-connector'],
              'homes': ['/home/hermes/.hermes'], 'connector': '/opt/dbb3-team/dbb3_cloud_connector.py'},
     'wsl': {'root': '/mnt/d/Hermes/hermes-agent', 'environment': 'venv', 'units': [],
+            'generation_root': '/var/lib/hermes-runtime-code/wsl',
             'user_units': ['hermes-wsl-gateway', 'pc-cloud-connector'],
             'homes': ['/mnt/d/Hermes/home'], 'connector': '/opt/pc-team/pc_cloud_connector.py'},
     'hk': {'root': '/opt/hk-hermes', 'environment': '.venv', 'units': ['hermes-gateway-hk-worker'],
@@ -262,7 +263,7 @@ def main():
         if not args.check:
             prune_backups(root, state, receipt)
         verify_approved_commit(commit)
-        generation = root / '.fabric-generations' / commit
+        generation = Path(node.get('generation_root', root / '.fabric-generations')) / commit
         if generation.resolve() != generation:
             raise ValueError('Release generation must not be a symlink')
         generation.mkdir(parents=True, exist_ok=True)

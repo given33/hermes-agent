@@ -94,6 +94,23 @@ def _set_startup_config(
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
 
 
+def test_seeded_kanban_worker_does_not_prefetch_banner_or_rescan_skills(
+    main_mod, fake_cli, monkeypatch, tmp_path,
+):
+    home = tmp_path / "worker"
+    (home / "skills").mkdir(parents=True)
+    (home / "skills" / ".bundled_manifest").write_text("{}")
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: home)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-worker")
+    monkeypatch.setattr(main_mod, "_termux_should_prefetch_update_check",
+                        lambda: pytest.fail("Worker must not prepare a terminal banner"))
+    monkeypatch.setattr(main_mod, "_sync_bundled_skills_for_startup",
+                        lambda: pytest.fail("Existing worker skills must not be scanned again"))
+    _set_startup_config(monkeypatch)
+    main_mod.cmd_chat(_chat_args(query="work kanban task task-worker"))
+    assert fake_cli["query"] == "work kanban task task-worker"
+
+
 def test_cmd_chat_rejects_noninteractive_gpt55_pro_startup_override(
     main_mod, fake_cli, codex_config, monkeypatch, capsys
 ):

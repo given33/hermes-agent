@@ -3334,7 +3334,8 @@ def cmd_chat(args):
     # Start update check in background (runs while other init happens).
     # On Termux this imports rich/prompt_toolkit in the foreground and then
     # competes for CPU on single-core devices, so keep it opt-in there.
-    if _termux_should_prefetch_update_check():
+    kanban_worker = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    if not kanban_worker and _termux_should_prefetch_update_check():
         try:
             from hermes_cli.banner import prefetch_banner_data, prefetch_update_check
 
@@ -3389,7 +3390,7 @@ def cmd_chat(args):
             _banner_mod._available_skills_cache = None
         except Exception:
             pass
-    else:
+    elif not kanban_worker:
         threading.Thread(
             target=_skills_sync_bg, name="bundled-skills-sync", daemon=True
         ).start()
