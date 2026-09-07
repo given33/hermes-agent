@@ -122,12 +122,60 @@ def protected_config_hashes(homes: list[str]) -> dict[str, str]:
     return result
 
 
+def runtime_is_current(root: Path, receipt: dict, commit: str) -> bool:
+    files = receipt.get('files')
+    return bool(receipt.get('status') == 'committed' and receipt.get('commit') == commit
+                and isinstance(files, dict) and files and all(
+                    code_member(name) and (root / name).is_file()
+                    and digest_file(root / name) == digest
+                    for name, digest in files.items()))
+
+
+def publish_release(role: str, state: Path, receipt: dict) -> None:
+    evidence_path = (Path('/var/lib/hermes-agent-release/release-evidence.json') if role == 'hub'
+                     else state / 'release.json')
+    evidence = json.loads(evidence_path.read_text()) if evidence_path.is_file() else {}
+    fields = {'schema': 'hermes.release-evidence.v1' if role == 'hub' else 'hermes.fabric-release.v1',
+              'phase': 'committed', 'node_id': role, 'commit': receipt['commit'],
+              'version': receipt['version'],
+              'runtime_sha256': hashlib.sha256(json.dumps(receipt['files'], sort_keys=True).encode()).hexdigest()}
+    if all(evidence.get(key) == value for key, value in fields.items()):
+        return
+    evidence.update(fields)
+    evidence['deployed_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = evidence_path.with_suffix('.new')
+    temporary.write_text(json.dumps(evidence, indent=2))
+    temporary.chmod(0o644)
+    os.replace(temporary, evidence_path)
+
+
+def prune_backups(root: Path, state: Path, receipt: dict, keep: int = 3) -> list[str]:
+    protected = {Path(item[1]).parent.name for key in ('file_backups', 'link_backups')
+                 for item in receipt.get(key, []) if isinstance(item, list) and len(item) == 3}
+    removed = []
+    for parent in (state, root / '.runtime-backups'):
+        if not parent.is_dir() or parent.resolve() != parent:
+            continue
+        backups = sorted((path for path in parent.iterdir()
+                          if re.fullmatch(r'rollback-[0-9a-f]{40}-[0-9]+', path.name)
+                          and path.is_dir() and not path.is_symlink()
+                          and path.resolve().parent == parent),
+                         key=lambda path: int(path.name.rsplit('-', 1)[1]), reverse=True)
+        for path in backups[keep:]:
+            if path.name not in protected:
+                shutil.rmtree(path)
+                removed.append(str(path))
+    return removed
+
+
 def main():
     import fcntl
     import pwd
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('role', choices=NODES)
     parser.add_argument('--check', action='store_true')
+    parser.add_argument('--prune-only', action='store_true')
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('This system updater must run as root')
@@ -142,18 +190,23 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
+        receipt_path = state / 'runtime-release.json'
+        receipt = json.loads(receipt_path.read_text()) if receipt_path.is_file() else {}
+        if args.prune_only:
+            print(json.dumps({'role': args.role, 'removed_backups': prune_backups(root, state, receipt)}))
+            return
         target = release_target(args.role)
         commit = str(target.get('commit') or '')
         if not re.fullmatch('[0-9a-f]{40}', commit):
             raise ValueError('Release must identify a full Git commit')
-        receipt_path = state / 'runtime-release.json'
-        receipt = json.loads(receipt_path.read_text()) if receipt_path.is_file() else {}
-        if receipt.get('commit') == commit and all(
-            (root / name).is_file() and digest_file(root / name) == digest
-            for name, digest in receipt.get('files', {}).items()
-        ) and receipt.get('files') and args.role == 'hub':
+        if runtime_is_current(root, receipt, commit):
+            if not args.check:
+                publish_release(args.role, state, receipt)
+                prune_backups(root, state, receipt)
             print(json.dumps({'role': args.role, 'commit': commit, 'status': 'current'}))
             return
+        if not args.check:
+            prune_backups(root, state, receipt)
         ancestry = request_json(f'https://api.github.com/repos/{REPOSITORY}/compare/{commit}...main')
         if ancestry.get('status') not in {'ahead', 'identical'}:
             raise ValueError('Release is not part of the approved main branch')
@@ -309,18 +362,8 @@ def main():
             report['link_backups'] = [[str(path), str(saved), existed] for path, saved, existed in links]
             (backup / 'transaction.json').write_text(json.dumps(report, indent=2))
         receipt_path.write_text(json.dumps(report, indent=2))
-        evidence_path = (Path('/var/lib/hermes-agent-release/release-evidence.json') if args.role == 'hub'
-                         else state / 'release.json')
-        evidence = json.loads(evidence_path.read_text()) if evidence_path.is_file() else {}
-        evidence.update({'schema': 'hermes.release-evidence.v1' if args.role == 'hub' else 'hermes.fabric-release.v1',
-                         'phase': 'committed', 'node_id': args.role, 'commit': commit, 'version': version,
-                         'deployed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                         'runtime_sha256': hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()})
-        evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = evidence_path.with_suffix('.new')
-        temporary.write_text(json.dumps(evidence, indent=2))
-        temporary.chmod(0o644)
-        os.replace(temporary, evidence_path)
+        publish_release(args.role, state, report)
+        prune_backups(root, state, report)
         print(json.dumps({'role': args.role, 'commit': commit, 'version': version,
                           'status': 'committed', 'config_unchanged': protected_config_hashes(node['homes']) == before}))
 

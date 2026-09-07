@@ -61,3 +61,43 @@ def test_each_machine_keeps_a_distinct_home_and_existing_profile_content(updater
     before = updater.protected_config_hashes([str(home)])
     assert before == {str(profile / 'SOUL.md'): updater.digest_file(profile / 'SOUL.md')}
     assert (profile / 'SOUL.md').read_text() == 'Independent role'
+
+
+def test_same_release_repairs_evidence_without_a_deployment(updater, tmp_path):
+    root = tmp_path / 'runtime'
+    root.mkdir()
+    (root / 'run_agent.py').write_text('pass')
+    receipt = {'status': 'committed', 'commit': 'a' * 40, 'version': 'test',
+               'files': {'run_agent.py': updater.digest_file(root / 'run_agent.py')}}
+    for role in updater.NODES:
+        assert updater.runtime_is_current(root, receipt, 'a' * 40)
+        if role == 'hub':
+            continue
+        state = tmp_path / role
+        updater.publish_release(role, state, receipt)
+        first = (state / 'release.json').stat().st_mtime_ns
+        updater.publish_release(role, state, receipt)
+        assert (state / 'release.json').stat().st_mtime_ns == first
+    (root / 'run_agent.py').write_text('changed')
+    assert not updater.runtime_is_current(root, receipt, 'a' * 40)
+    assert not updater.runtime_is_current(root, {'status': 'committed', 'commit': 'a' * 40, 'files': {}}, 'a' * 40)
+
+
+def test_backup_retention_keeps_current_rollback_and_unrelated_data(updater, tmp_path):
+    root, state = tmp_path / 'runtime', tmp_path / 'state'
+    for parent in (state, root / '.runtime-backups'):
+        parent.mkdir(parents=True)
+        for index in range(7):
+            folder = parent / ('rollback-' + 'a' * 40 + '-' + str(index))
+            folder.mkdir()
+            (folder / 'code').write_text('backup')
+        (parent / 'profile').mkdir()
+    protected = 'rollback-' + 'a' * 40 + '-0'
+    receipt = {'file_backups': [['run_agent.py', str(state / protected / 'code'), True]]}
+    removed = updater.prune_backups(root, state, receipt)
+    assert len(removed) == 6
+    for parent in (state, root / '.runtime-backups'):
+        assert (parent / protected).is_dir()
+        assert (parent / 'profile').is_dir()
+        assert len(list(parent.iterdir())) == 5
+    assert updater.prune_backups(root, state, receipt) == []
