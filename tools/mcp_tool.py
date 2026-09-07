@@ -8380,6 +8380,12 @@ def refresh_agent_mcp_tools(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
+            # Late discovery / turn-start refresh uses the same route as the
+            # agent's initial snapshot. Resolving the profile default here can
+            # synchronously probe an unrelated provider before the first token.
+            context_length=getattr(
+                getattr(agent, "context_compressor", None), "context_length", 0
+            ) or 0,
         )
         or []
     )

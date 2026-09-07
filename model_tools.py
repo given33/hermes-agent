@@ -326,6 +326,7 @@ def get_tool_definitions(
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
     tool_role: Optional[str] = None,
+    context_length: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -336,6 +337,8 @@ def get_tool_definitions(
         enabled_toolsets: Only include tools from these toolsets.
         disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
         quiet_mode: Suppress status prints.
+        context_length: Already resolved window of the calling agent. Reuse it
+            for tool disclosure instead of probing the profile's default model.
         skip_tool_search_assembly: When True, return the pre-assembly tool list
             (raw schemas for every enabled tool). Used internally by the
             tool_search / tool_describe bridge handlers so they can read the
@@ -376,6 +379,7 @@ def get_tool_definitions(
                 _is_dispatcher_owned_worker(),
                 profile_scope,
                 str(tool_role or "").strip().lower(),
+                context_length,
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
@@ -390,7 +394,7 @@ def get_tool_definitions(
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly,
-                                       tool_role=tool_role)
+                                       tool_role=tool_role, context_length=context_length)
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -423,6 +427,7 @@ def _compute_tool_definitions(
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
     tool_role: Optional[str] = None,
+    context_length: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -687,7 +692,8 @@ def _compute_tool_definitions(
     # has already normalized schemas, and the assembly is idempotent in
     # case some caller invokes get_tool_definitions twice.
     return assemble_tool_search(filtered_tools, quiet_mode=quiet_mode,
-                                skip=skip_tool_search_assembly)
+                                skip=skip_tool_search_assembly,
+                                context_length=context_length)
 
 
 def assemble_tool_search(

@@ -16,6 +16,7 @@ from unittest.mock import patch
 def test_agent_override_does_not_probe_profile_default_for_tool_search():
     """The compressor resolves the real route; disclosure must reuse it."""
     from run_agent import AIAgent
+    from tools.mcp_tool import refresh_agent_mcp_tools
 
     with patch("model_tools._resolve_active_context_length", return_value=999_000) as default_probe, \
          patch("agent.context_compressor.get_model_context_length", return_value=64_000):
@@ -24,6 +25,10 @@ def test_agent_override_does_not_probe_profile_default_for_tool_search():
             base_url="https://api.openai.com/v1", enabled_toolsets=[],
             quiet_mode=True, skip_context_files=True, skip_memory=True,
         )
+        # The first conversation prologue and late MCP discovery both rebuild
+        # the snapshot. This was a separate default-model network probe even
+        # after initialization correctly reused the compressor's window.
+        refresh_agent_mcp_tools(agent, content_aware=True)
     default_probe.assert_not_called()
     assert agent.valid_tool_names == {tool["function"]["name"] for tool in agent.tools}
 
@@ -48,6 +53,32 @@ def test_resolved_window_controls_disclosure_without_another_probe():
     assert "tool_call" in {t["function"]["name"] for t in small}
     assert "tool_call" in {t["function"]["name"] for t in large}
     assert len(json.dumps(small)) < len(json.dumps(large))
+
+
+def test_tool_definition_cache_keeps_active_windows_separate():
+    import json
+    import model_tools
+    from tools.registry import registry
+    from tools.tool_search import ToolSearchConfig
+
+    schema = {"type": "function", "function": {
+        "name": "mcp_window_search", "description": "search " * 2000,
+        "parameters": {"type": "object", "properties": {}},
+    }}
+    registry.register(name="mcp_window_search", toolset="mcp-window",
+                      schema=schema, handler=lambda args, **kwargs: "{}")
+    model_tools._clear_tool_defs_cache()
+    with patch("model_tools._resolve_active_context_length") as default_probe, \
+         patch("tools.tool_search.load_config", return_value=ToolSearchConfig.from_raw(None)):
+        small = model_tools.get_tool_definitions(
+            enabled_toolsets=["mcp-window"], quiet_mode=True, context_length=64)
+        large = model_tools.get_tool_definitions(
+            enabled_toolsets=["mcp-window"], quiet_mode=True, context_length=1_000_000)
+        again = model_tools.get_tool_definitions(
+            enabled_toolsets=["mcp-window"], quiet_mode=True, context_length=64)
+    default_probe.assert_not_called()
+    assert len(json.dumps(small)) < len(json.dumps(large))
+    assert again == small
 
 
 def _model_cfg(**overrides):
