@@ -60,6 +60,24 @@ def _lazy_config():
 
 
 class TestLazyMcpRegistration:
+    def test_managed_manifest_uses_lazy_call_path_without_cold_boot_connections(self):
+        config = {"ios-calendar": {
+            "url": "http://127.0.0.1:8760/mcp", "lazy_start": True,
+            "manifest": {"tool_definitions": [{
+                "name": "calendars", "description": "List calendars",
+                "input_schema": {"type": "object", "properties": {}},
+            }]},
+        }}
+        with patch("tools.mcp_schema_cache.get_cached_entry", return_value=None), \
+             patch("tools.mcp_tool._register_from_cache_sync", return_value=["calendar"]) as register, \
+             patch("tools.mcp_tool._ensure_mcp_loop") as loop, \
+             patch("tools.mcp_tool._run_on_mcp_loop") as run:
+            mcp.register_mcp_servers(config)
+        register.assert_called_once()
+        assert register.call_args.args[2]["tools"][0]["inputSchema"]["type"] == "object"
+        loop.assert_not_called()
+        run.assert_not_called()
+
     def test_registers_from_cache_without_connect(self):
         config = _lazy_config()
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \

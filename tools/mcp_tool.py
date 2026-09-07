@@ -5912,7 +5912,7 @@ def _resolve_server_lazy(name: str, config: dict) -> bool:
     following the same per-server key pattern as ``idle_timeout_seconds``.
     Design from #56832 (Vansh5632).
     """
-    return _parse_boolish(config.get("lazy", False), default=False)
+    return _parse_boolish(config.get("lazy", config.get("lazy_start", False)), default=False)
 
 
 def _ensure_lazy_server_connected(server_name: str) -> bool:
@@ -7729,6 +7729,20 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             if not _resolve_server_lazy(name, cfg):
                 continue
             entry = get_cached_entry(name, config_fingerprint(cfg))
+            if not entry and _parse_boolish(cfg.get("lazy_start", False), default=False):
+                manifest = cfg.get("manifest")
+                definitions = manifest.get("tool_definitions") if isinstance(manifest, dict) else None
+                if isinstance(definitions, list) and definitions:
+                    # Managed services ship their schemas with their local
+                    # manifest. Reuse the official lazy call path on cold boot.
+                    manifest_tools = [
+                        {"name": tool["name"], "description": tool.get("description", ""),
+                         "inputSchema": tool.get("input_schema", tool.get("inputSchema", {}))}
+                        for tool in definitions if isinstance(tool, dict)
+                        and isinstance(tool.get("name"), str) and tool["name"]
+                    ]
+                    if manifest_tools:
+                        entry = {"tools": manifest_tools, "utility_tools": []}
             if not entry:
                 continue
             with _lock:
