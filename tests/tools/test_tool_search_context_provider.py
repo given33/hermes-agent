@@ -13,6 +13,43 @@ generic direct-API metadata.
 from unittest.mock import patch
 
 
+def test_agent_override_does_not_probe_profile_default_for_tool_search():
+    """The compressor resolves the real route; disclosure must reuse it."""
+    from run_agent import AIAgent
+
+    with patch("model_tools._resolve_active_context_length", return_value=999_000) as default_probe, \
+         patch("agent.context_compressor.get_model_context_length", return_value=64_000):
+        agent = AIAgent(
+            model="gpt-4o", provider="openai", api_key="test-key",
+            base_url="https://api.openai.com/v1", enabled_toolsets=[],
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+        )
+    default_probe.assert_not_called()
+    assert agent.valid_tool_names == {tool["function"]["name"] for tool in agent.tools}
+
+
+def test_resolved_window_controls_disclosure_without_another_probe():
+    import json
+    import model_tools
+    from tools.registry import registry
+    from tools.tool_search import ToolSearchConfig
+
+    tools = [{"type": "function", "function": {
+        "name": "mcp_demo_search", "description": "search " * 2000,
+        "parameters": {"type": "object", "properties": {}},
+    }}]
+    registry.register(name="mcp_demo_search", toolset="mcp-demo",
+                      schema=tools[0], handler=lambda args, **kwargs: "{}")
+    with patch("model_tools._resolve_active_context_length") as default_probe, \
+         patch("tools.tool_search.load_config", return_value=ToolSearchConfig.from_raw(None)):
+        small = model_tools.assemble_tool_search(tools, quiet_mode=True, context_length=64)
+        large = model_tools.assemble_tool_search(tools, quiet_mode=True, context_length=1_000_000)
+    default_probe.assert_not_called()
+    assert "tool_call" in {t["function"]["name"] for t in small}
+    assert "tool_call" in {t["function"]["name"] for t in large}
+    assert len(json.dumps(small)) < len(json.dumps(large))
+
+
 def _model_cfg(**overrides):
     cfg = {
         "model": "gpt-5.6-sol",

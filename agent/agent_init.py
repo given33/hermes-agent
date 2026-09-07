@@ -1614,6 +1614,10 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        # The active model may differ from this profile's default. Resolve its
+        # context once below before sizing disclosure; probing the default here
+        # adds unrelated network requests before the first model request.
+        skip_tool_search_assembly=True,
     )
     
     # Show tool configuration and store valid tool names for validation
@@ -2828,6 +2832,13 @@ def init_agent(
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
         )
+    from model_tools import assemble_tool_search
+    agent.tools = assemble_tool_search(
+        agent.tools, quiet_mode=agent.quiet_mode,
+        context_length=getattr(agent.context_compressor, "context_length", 0) or 0,
+    )
+    agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:

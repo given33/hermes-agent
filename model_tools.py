@@ -686,13 +686,27 @@ def _compute_tool_definitions(
     # This is deliberately the last step before returning — sanitization
     # has already normalized schemas, and the assembly is idempotent in
     # case some caller invokes get_tool_definitions twice.
+    return assemble_tool_search(filtered_tools, quiet_mode=quiet_mode,
+                                skip=skip_tool_search_assembly)
+
+
+def assemble_tool_search(
+    tools: List[Dict[str, Any]], *, quiet_mode: bool = False,
+    skip: bool = False, context_length: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Apply disclosure using an already resolved agent window when available.
+
+    Agent initialization waits for its own context engine before calling this;
+    a task model override must not probe the profile's unrelated default model.
+    """
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
-        if not skip_tool_search_assembly and ts_cfg.enabled != "off":
-            context_length = _resolve_active_context_length()
+        if not skip and ts_cfg.enabled != "off":
+            if context_length is None:
+                context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(
-                filtered_tools,
+                tools,
                 context_length=context_length,
                 config=ts_cfg,
             )
@@ -707,11 +721,11 @@ def _compute_tool_definitions(
                     f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
                     f"tool_search/describe/call — {_forms.get(assembly.listing_form, assembly.listing_form)}."
                 )
-            filtered_tools = assembly.tool_defs
+            tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
-    return filtered_tools
+    return tools
 
 
 def _resolve_active_context_length() -> int:
