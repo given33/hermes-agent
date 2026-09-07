@@ -161,6 +161,39 @@ def test_run_turn_returns_completed_reply_without_idle_ack(monkeypatch):
     assert result == "ok"
 
 
+def test_model_events_are_delivered_before_delayed_prompt_ack():
+    gateway = _GatewayProcess.__new__(_GatewayProcess)
+    gateway.last_used = 0.0
+    state = _HostedSessionState(
+        conversation_id="conversation-live", live_session_id="live-session",
+        stored_session_id="stored-session", artifact_context={},
+    )
+    gateway.ensure_session = lambda *_args, **_kwargs: state
+    state.idle_after_turn.set()
+    delivered = threading.Event()
+    observed = []
+
+    def callback(event):
+        observed.append(event["type"])
+        if event["type"] == "thinking.delta":
+            delivered.set()
+
+    def rpc(_method, _params, *, timeout):
+        sink = state.current_sink
+        sink.events.put({"type": "thinking.delta", "payload": {"text": "working"}})
+        assert delivered.wait(timeout=1), "Model output waited for the RPC acknowledgement"
+        sink.events.put({"type": "message.complete", "payload": {"text": "done"}})
+        assert sink.done.wait(timeout=1)
+        return {"status": "streaming"}
+
+    gateway.rpc = rpc
+    assert gateway.run_turn(
+        "hello", requested_session_id="", turn_id="turn-live", event_callback=callback,
+        cancel_check=None, timeout=2, conversation_id="conversation-live", artifact_context={},
+    ) == "done"
+    assert observed == ["thinking.delta", "message.complete"]
+
+
 def test_gateway_tracks_multiple_conversations_with_distinct_artifact_scopes():
     gateway = _GatewayProcess.__new__(_GatewayProcess)
     gateway._session_lock = threading.Lock()

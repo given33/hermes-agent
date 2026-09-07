@@ -292,8 +292,8 @@ class _GatewayProcess:
             if event is None:
                 return
             event_type = str(event.get("type") or "")
-            if event_type not in {"session.info", "error"}:
-                sink.accepted.wait(timeout=30.0)
+            # The gateway can emit model events before its prompt RPC reply.
+            # Those events prove execution; never hold them for bookkeeping.
             try:
                 if sink.callback is not None:
                     sink.callback(event)
