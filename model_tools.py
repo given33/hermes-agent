@@ -1329,6 +1329,8 @@ def handle_function_call(
         _ts_mod = None
 
     if _ts_mod is not None and _ts_mod.is_bridge_tool(function_name):
+        if enabled_tools is not None and function_name not in enabled_tools:
+            return tool_error(f"Tool '{function_name}' is not available in this session.")
         try:
             # Use skip_tool_search_assembly=True so we see the real catalog,
             # not the already-collapsed bridge-only list (the bridge would
@@ -1402,7 +1404,8 @@ def handle_function_call(
                 turn_id=turn_id,
                 api_request_id=api_request_id,
                 user_task=user_task,
-                enabled_tools=enabled_tools,
+                enabled_tools=([*enabled_tools, underlying_name]
+                               if enabled_tools is not None else None),
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 skip_tool_request_middleware=skip_tool_request_middleware,
                 skip_tool_execution_middleware=skip_tool_execution_middleware,

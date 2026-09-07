@@ -522,6 +522,20 @@ def _emit_cancelled_terminal_post_tool_call(
     return result
 
 
+def _tool_dispatch_allowlist(agent, function_name: str, original_name: str):
+    names = getattr(agent, "valid_tool_names", None)
+    if not names:
+        return None
+    result = list(names)
+    # The executor unwraps tool_call before dispatch. Carry only that verified
+    # target through the second allowlist gate, without changing the session.
+    if (original_name == "tool_call" and "tool_call" in names
+            and function_name in _tool_search_scoped_names(agent)
+            and function_name not in result):
+        result.append(function_name)
+    return result
+
+
 def _tool_search_scoped_names(agent) -> frozenset:
     """Return the deferrable tool names the session may invoke via tool_call.
 
@@ -2816,11 +2830,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             turn_id=getattr(agent, "_current_turn_id", "") or "",
                             api_request_id=getattr(agent, "_current_api_request_id", "")
                             or "",
-                            enabled_tools=(
-                                list(agent.valid_tool_names)
-                                if agent.valid_tool_names
-                                else None
-                            ),
+                            enabled_tools=_tool_dispatch_allowlist(
+                                agent, function_name, tool_call.function.name),
                             skip_pre_tool_call_hook=True,
                             skip_tool_request_middleware=True,
                             skip_tool_execution_middleware=True,
@@ -2898,11 +2909,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             turn_id=getattr(agent, "_current_turn_id", "") or "",
                             api_request_id=getattr(agent, "_current_api_request_id", "")
                             or "",
-                            enabled_tools=(
-                                list(agent.valid_tool_names)
-                                if agent.valid_tool_names
-                                else None
-                            ),
+                            enabled_tools=_tool_dispatch_allowlist(
+                                agent, function_name, tool_call.function.name),
                             skip_pre_tool_call_hook=True,
                             skip_tool_request_middleware=True,
                             skip_tool_execution_middleware=True,

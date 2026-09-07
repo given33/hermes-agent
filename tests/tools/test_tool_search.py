@@ -540,6 +540,29 @@ class TestRegression_ToolsetScoping:
         # core tools are never deferrable
         assert "terminal" not in names
 
+    def test_bridge_dispatch_carries_only_its_authorized_deferred_target(self):
+        from types import SimpleNamespace
+        import model_tools
+        from agent.tool_executor import _tool_dispatch_allowlist
+
+        self._register("mcp_bridge_allowed", "mcp-bridge-session")
+        self._register("mcp_bridge_denied", "mcp-other-session")
+        agent = SimpleNamespace(valid_tool_names={"tool_call", "tool_search"},
+                                enabled_toolsets=["mcp-bridge-session"], disabled_toolsets=None)
+        for use_executor in (False, True):
+            for name, permitted in (("mcp_bridge_allowed", True), ("mcp_bridge_denied", False)):
+                allowed = (_tool_dispatch_allowlist(agent, name, "tool_call") if use_executor
+                           else list(agent.valid_tool_names))
+                result = json.loads(model_tools.handle_function_call(
+                    function_name=name if use_executor else "tool_call",
+                    function_args={} if use_executor else {"name": name, "arguments": {}},
+                    enabled_tools=allowed, enabled_toolsets=agent.enabled_toolsets))
+                assert bool(result.get("ok")) is permitted
+        assert agent.valid_tool_names == {"tool_call", "tool_search"}
+        denied = model_tools.handle_function_call("tool_call", {"name": "mcp_bridge_allowed", "arguments": {}},
+                    enabled_tools=["terminal"], enabled_toolsets=agent.enabled_toolsets)
+        assert "not available" in denied
+
 
 # ---------------------------------------------------------------------------
 # Catalog listing (skills-style progressive disclosure)

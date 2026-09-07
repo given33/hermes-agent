@@ -387,6 +387,13 @@ def main():
         link_backup = root / '.runtime-backups' / backup.name
         link_backup.mkdir(parents=True, mode=0o700)
         changed, links = [], []
+        # Peer recovery must not restart a gateway in the middle of replacing
+        # its code/interpreter links. The watchdog also checks the service is
+        # active, so an abandoned marker cannot prevent recovery after a crash.
+        maintenance = Path('/run/hermes-runtime-code-updating')
+        if maintenance.is_symlink():
+            raise RuntimeError('Unsafe runtime update marker')
+        maintenance.write_text(commit + '\n')
         for prefix, unit in active:
             run(prefix + ['stop', unit])
         # Gateways can persist auth while stopping. Fence the code transaction
@@ -484,6 +491,7 @@ def main():
             report['status'] = 'rolled-back'
             raise
         finally:
+            maintenance.unlink(missing_ok=True)
             report['file_backups'] = [[str(path), str(saved), existed] for path, saved, existed in changed]
             report['link_backups'] = [[str(path), str(saved), existed] for path, saved, existed in links]
             (backup / 'transaction.json').write_text(json.dumps(report, indent=2))

@@ -37,13 +37,13 @@ while :; do
     # Failed SSH probes say nothing about service health. systemd owns startup
     # deadlines, crash restarts and watchdog timeouts on the destination host.
     if ! state=$(ssh "${ssh_args[@]}" -p "${port}" "${user}@${host}" \
-        "${ctl} show '${unit}' --property=ActiveState --value" 2>/dev/null); then
+        "if test -f /run/hermes-runtime-code-updating && systemctl is-active --quiet hermes-runtime-sync.service; then printf updating; else ${ctl} show '${unit}' --property=ActiveState --value; fi" 2>/dev/null); then
       rm -f -- "${marker}"
       logger -t hermes-fabric-peer-watchdog "${id} unreachable; leaving its service unchanged"
       continue
     fi
     case "${state}" in
-      active|activating|reloading|deactivating) rm -f -- "${marker}"; continue ;;
+      active|activating|reloading|deactivating|updating) rm -f -- "${marker}"; continue ;;
       inactive|failed) ;;
       *) rm -f -- "${marker}"; continue ;;
     esac
@@ -56,7 +56,7 @@ while :; do
     # Recheck remotely immediately before start; never interrupt a healthy or
     # already-starting gateway when another supervisor recovered it meanwhile.
     if ssh "${ssh_args[@]}" -p "${port}" "${user}@${host}" \
-        "state=\$(${ctl} show '${unit}' --property=ActiveState --value) || exit; case \"\$state\" in inactive|failed) ${ctl} start --no-block '${unit}';; esac" >/dev/null 2>&1; then
+        "if test -f /run/hermes-runtime-code-updating && systemctl is-active --quiet hermes-runtime-sync.service; then exit 0; fi; state=\$(${ctl} show '${unit}' --property=ActiveState --value) || exit; case \"\$state\" in inactive|failed) ${ctl} start --no-block '${unit}';; esac" >/dev/null 2>&1; then
       logger -t hermes-fabric-peer-watchdog "${id} recovery check completed"
       rm -f -- "${marker}"
     fi
