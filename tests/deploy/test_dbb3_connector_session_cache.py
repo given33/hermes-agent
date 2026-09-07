@@ -10,6 +10,24 @@ import pytest
 from deploy.dbb3 import dbb3_cloud_connector as connector_module
 
 
+def test_execution_stream_enable_uses_official_atomic_config_api(monkeypatch, tmp_path):
+    import yaml
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _: tmp_path)
+    config = tmp_path / "config.yaml"
+    config.write_text("model:\n  default: keep-model\nplugins:\n  enabled: [existing]\n", encoding="utf-8")
+    connector = connector_module.DBB3CloudConnector(SimpleNamespace(), state_file=tmp_path / "state.json")
+    connector._enable_execution_stream("dbb3-worker")
+    saved = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert saved["model"]["default"] == "keep-model"
+    assert saved["plugins"]["enabled"] == ["existing", "collaboration-worker-stream"]
+    assert saved["plugins"]["stream_reasoning_deltas"] is True
+    before = config.stat().st_mtime_ns
+    connector._enable_execution_stream("dbb3-worker")
+    assert config.stat().st_mtime_ns == before
+
+
 def test_timestamp_ms_rejects_non_finite_values():
     assert connector_module._timestamp_ms(True) is None
     assert connector_module._timestamp_ms(float("nan")) is None

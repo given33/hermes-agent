@@ -2253,7 +2253,7 @@ class DBB3CloudConnector:
             if name not in enabled:
                 enabled.append(name)
             plugins.update(enabled=enabled, stream_reasoning_deltas=True)
-            atomic_config_write(path, config, sort_keys=False, allow_unicode=True)
+            atomic_config_write(path, config, sort_keys=False)
 
     def start_heartbeat(self, interval: float = 30.0) -> None:
         """Start a lightweight lease-renewal thread for active remote runs."""

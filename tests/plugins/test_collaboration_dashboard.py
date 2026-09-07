@@ -107,8 +107,27 @@ def test_simple_calculation_does_not_create_workflow_or_call_router_model():
         assert result["profiles"] == ["default"], prompt
 
     for prompt in ("叫我皇上，然后在 DBB3 部署项目并测试。", "请重启 DBB3 服务器上的服务并验证。",
-                   "让dbb3给我发送一句你好", "请 dbb3-worker 回复一句你好"):
+                   "让dbb3给我发送一句你好", "请 dbb3-worker 回复一句你好", "叫我皇上，让 dbb3 回复一句你好"):
         assert module._rule_based_user_intent(prompt)["mode"] == "work"
+
+
+def test_direct_member_assignment_preserves_objective_without_model_planning():
+    module = load_module()
+    objective = "让 dbb3-worker 回复一句你好"
+    plan = module._direct_member_plan(objective, ["dbb3-worker"])
+    assert plan["plan"][0]["objective"] == objective
+    assert plan["workers"] == ["dbb3-worker"]
+    assert not module._direct_member_plan("请 dbb3-worker 规划并执行多成员审核", ["dbb3-worker"])
+    assert not module._direct_member_plan(objective, ["dbb3-worker", "pc-worker"])
+
+
+def test_single_prompt_includes_real_member_registry_and_report_ownership():
+    module = load_module()
+    prompt = module.build_single_prompt({"messages": []}, "default", "你知道 DBB3 吗？")
+    assert "DBB3 (dbb3-worker)" in prompt
+    assert "Windows PC + WSL (pc-worker)" in prompt
+    assert "最终结果由当前会话的 Hermes 汇总" in prompt
+    assert "不依赖飞书群或 Telegram" in prompt
 
 
 def test_state_snapshot_isolates_containers_without_copying_transcript_text():

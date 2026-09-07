@@ -7725,6 +7725,27 @@ def _normalize_manager_handoff(
     return handoff
 
 
+def _explicit_member_request(content: str) -> bool:
+    return bool(re.search(
+        r"(?:让|叫|请|派发|分派|交给|委派|ask|assign|delegate).{0,20}"
+        r"(?:dbb3|pc-worker|hk-worker|windows|香港|本地电脑).{0,16}"
+        r"(?:发送|回复|回答|执行|完成|处理|运行|send|reply|run|do)", content.lower()
+    ))
+
+
+def _direct_member_plan(content: str, workers: list[str]) -> dict[str, Any]:
+    if len(workers) != 1 or not _explicit_member_request(content) or re.search(
+        r"拆分|规划|评审|审核|多个成员|并行|团队|plan|review|parallel", content, re.I
+    ):
+        return {}
+    return _normalize_manager_plan({
+        "difficulty": "simple", "workers": workers,
+        "reason": "用户已明确指定执行成员，直接派发原始任务。",
+        "plan": [{"id": "step-1", "title": summarize_task_title(content),
+                  "objective": content, "assignee": workers[0], "depends_on": []}],
+    }, content=content, fallback_workers=workers)
+
+
 def _rule_based_user_intent(content: str) -> dict[str, Any]:
     text = content.strip()
     lowered = text.lower()
@@ -7756,11 +7777,7 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         marker in lowered
         for marker in ("帮我", "请你", "直接", "现在", "完成", "执行", "go ahead")
     )
-    explicit_member_request = bool(device_matches) and bool(re.search(
-        r"(?:让|叫|请|派发|分派|交给|委派|ask|assign|delegate).{0,16}"
-        r"(?:dbb3|pc-worker|hk-worker|windows|香港|本地电脑).{0,12}"
-        r"(?:发送|回复|回答|执行|完成|处理|运行|send|reply|run|do)", lowered
-    ))
+    explicit_member_request = bool(device_matches) and _explicit_member_request(lowered)
     hard_work = explicit_workflow or explicit_member_request or (
         any(marker in lowered for marker in _HARD_WORK_MARKERS)
         and (imperative or not explanatory)
@@ -7775,7 +7792,7 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         r"|(?:你|当前会话).{0,12}(?:哪|那|什么).{0,8}(?:服务器|主机|模型|节点)"
         r"|(?:叫我|称呼我|call me|address me as)"
         r"|(?:where are you running|which (?:server|host|model) are you)", lowered
-    )) and not explicit_workflow and not re.search(
+    )) and not explicit_workflow and not explicit_member_request and not re.search(
         r"(?:部署|重启|安装|修复|迁移|删除|创建|构建|发布|测试|deploy|restart|install|migrate)"
         r"|(?:修改|更新).{0,12}(?:代码|文件|配置|服务)", lowered
     )
@@ -8734,10 +8751,26 @@ def build_single_prompt(
         "and update the list immediately after each step. Do not create a todo list for "
         "ordinary single-step chat."
     )
+    members = []
+    for node, label in (("dbb3-worker", "DBB3"), ("pc-worker", "Windows PC + WSL"),
+                        ("hk-worker", "Hong Kong Worker")):
+        try:
+            observed = _WORKER_CHANNEL.deployment_snapshot(node)
+            online = bool(observed.get("online") and observed.get("fresh"))
+        except Exception:
+            online = False
+        members.append(f"{label} ({node})：{'已连接' if online else '当前连接未确认'}")
     return (
         f"{planning_guidance}\n\n"
         "你正在 Hermes 官方 WebUI 单聊中。\n"
         f"当前 Hermes Profile：{profile}\n"
+        "本会话由当前服务器上的 Hermes 负责与用户沟通和最终汇报。"
+        "这是接入 Hermes 官方运行时的客户端；跨主机派发由协作服务处理，不依赖飞书群或 Telegram。\n"
+        f"协作服务已配置的独立成员：{'；'.join(members)}。\n"
+        "当前连接状态不代表任务已接单；不要把已配置成员说成不存在。"
+        "称呼、问候、计算、询问你所在主机或模型由你直接回答；只有明确指定成员执行、"
+        "或确有跨成员协作需求时才派发。调度员只汇报派发进展，成员报告自己的实际过程和证据，"
+        "最终结果由当前会话的 Hermes 汇总。不得声称未经执行确认的派发成功。\n"
         "请使用简体中文直接回答并执行用户请求。你仍可使用该 Profile 已配置的"
         "模型、Skill、MCP、记忆和工具。回复应清晰说明结果、关键过程与错误。\n\n"
         f"最近对话：\n{recent or '暂无'}\n\n"
@@ -10394,6 +10427,9 @@ def _persist_hosted_role_state(
         "milestone_content": str(state.get("milestone_content") or ""),
         "request_accepted": _coerce_flag(state.get("request_accepted")),
         "request_accepted_at": int(state.get("request_accepted_at") or 0),
+        "remote_phase": str(state.get("remote_phase") or ""),
+        "dispatched_at": int(state.get("dispatched_at") or 0),
+        "accepted_at": int(state.get("accepted_at") or 0),
         "model_retry_attempt": int(state.get("model_retry_attempt") or 0),
         "model_retry_max_attempts": int(
             state.get("model_retry_max_attempts") or _HOSTED_CHAT_API_ATTEMPTS
@@ -10450,6 +10486,9 @@ def _persist_hosted_role_state(
             "started_at": snapshot["started_at"],
             "model_started_at": snapshot["model_started_at"] or None,
             "first_token_at": snapshot["first_token_at"] or None,
+            "remote_phase": snapshot["remote_phase"],
+            "dispatched_at": snapshot["dispatched_at"] or None,
+            "accepted_at": snapshot["accepted_at"] or None,
             "completed_at": snapshot["completed_at"],
             "collapse_activities": True,
             "final_report": final_report and state_status in _HOSTED_TERMINAL_STATUSES,
@@ -10464,6 +10503,7 @@ def _persist_hosted_role_state(
     }
     pending_protocol_events = [
         {**dict(item), "role_stage": role_stage,
+         "payload": {"profile": profile, "member_id": member_id, **dict(item.get("payload") or {})},
          "idempotency_key": f"{turn_id}:{role_stage}:{item['idempotency_key']}"
          if item.get("idempotency_key") else ""}
         for item in state.get("_protocol_events") or []
@@ -14001,7 +14041,7 @@ def _remote_run_state_message(
     elif status == "running":
         content = result or (
             "成员已接收任务，等待本机调度。"
-            if str(remote_run.get("execution_state") or "") in {"triage", "todo", "ready", "queued"}
+            if not remote_run.get("execution_state") or str(remote_run.get("execution_state") or "") in {"triage", "todo", "ready", "queued"}
             else "已连接远程执行器，正在执行。"
         )
     elif str(remote_run.get("cancel_kind") or "") == "server_fallback":
@@ -14066,6 +14106,11 @@ def _remote_run_state_message(
         "started_at": int(remote_run.get("started_at") or remote_run.get("created_at") or int(time.time() * 1000)),
         "completed_at": int(remote_run.get("completed_at") or 0) or None,
         "updated_at": int(remote_run.get("updated_at") or int(time.time() * 1000)),
+        "remote_phase": ("waiting_claim" if status in {"queued", "leased"}
+                         else "starting" if status == "running" and not remote_run.get("execution_progress_at")
+                         else "executing" if status == "running" else status),
+        "dispatched_at": int(remote_run.get("created_at") or 0),
+        "accepted_at": int(remote_run.get("started_at") or 0),
     }
     stream_id = str(remote_run.get("id") or "")
     with _HOSTED_LIVE_STATE_LOCK:
@@ -14077,6 +14122,9 @@ def _remote_run_state_message(
         terminal = status in _REMOTE_TERMINAL_STATUSES
         state = {**deepcopy(streamed), **{key: value for key, value in state.items()
                  if key in {"status", "completed_at"} or (terminal and key == "content")}}
+        state["remote_phase"] = status if terminal else "executing"
+        state["dispatched_at"] = int(remote_run.get("created_at") or 0)
+        state["accepted_at"] = int(remote_run.get("started_at") or 0)
         if terminal:
             state["content"] = result or str(streamed.get("content") or "")
     _persist_hosted_role_state(
@@ -14731,6 +14779,13 @@ def execute_hosted_workflow(
         else {}
     )
     manager_result = str(run.get("manager_result") or "")
+    if remote_workers and not manager_plan and not plan_only:
+        manager_plan = _direct_member_plan(content, fallback_worker_profiles)
+        if manager_plan:
+            _persist_hosted_turn(conversation_id, turn_id, patch={
+                "manager_plan": manager_plan, "profiles": ["default", *manager_plan["workers"]],
+                "stage": "dispatching",
+            })
     if (remote_workers or manager_runner is not None) and not manager_plan:
         _persist_hosted_turn(
             conversation_id,
@@ -14946,9 +15001,14 @@ def execute_hosted_workflow(
         remote_workers=remote_workers,
     )
     worker_kanban_instruction = (
-        "官方 Kanban 是 DBB3 的唯一控制面。你可以读取根任务和已分配工作项，"
-        "也可以向已分配工作项写入进度、证据和交接评论；"
-        "不得创建、改派、关闭或删除根任务，也不得替 Manager 改变任务生命周期。"
+        "当前节点的官方 Kanban 记录你的已分配任务。汇报你自己的实际进展与证据；"
+        "完成后必须对当前已分配根任务调用 kanban_complete 并附上实际结果，"
+        "无法继续则调用 kanban_block 说明原因。只写评论或口头说完成不算交付。"
+        "不得创建、改派、关闭或删除其他成员的任务，不得宣称整个用户任务已完成；"
+        "协作服务收到所有成员的交付后，由当前会话的 Hermes 向用户给出最终汇报。"
+        if remote_workers else
+        "可以读取根任务和已分配工作项，也可以向已分配工作项写入进度、证据和交接评论；"
+        "只能完成你获分配的工作项，不得关闭团队共享根任务或改派其他成员任务。"
     )
 
     task_id = str(run.get("task_id") or "")
@@ -15262,7 +15322,7 @@ def execute_hosted_workflow(
         worker_prompt = "\n".join(
             entry
             for entry in (
-                "你正在 DBB3 唯一控制面的服务端托管工作流中。",
+                "你正在 Hermes 协作服务派发到当前节点的独立成员任务中。",
                 f"你的 Profile：{profile}",
                 f"官方 Kanban 根任务：{task_id}"
                 if task_id and not remote_workers
@@ -15285,7 +15345,7 @@ def execute_hosted_workflow(
                     turn_id,
                     role_stage=role_stage,
                 ),
-                "不要做最终总结；把结果、证据、耗时和遗留问题提交给调度者。",
+                "提交本成员的实际结果、证据、耗时和遗留问题，由当前会话的 Hermes 汇总最终答复。",
                 f"用户任务：{content}",
                 (
                     f"调度器追问（核实该 Todo 项是否确已完成）：\n{followup_question}"
@@ -18142,7 +18202,9 @@ def connector_stream_run(remote_run_id: str, body: ConnectorStreamBody, request:
         stream = _REMOTE_STREAM_STATES.get(remote_run_id)
         if stream is None:
             stream = deepcopy((hosted.get("role_events") or {}).get(role_stage) or {})
-            stream.update(status="streaming", started_at=remote.get("started_at") or remote.get("created_at"))
+            stream.update(status="streaming", remote_phase="executing",
+                          dispatched_at=remote.get("created_at"), accepted_at=remote.get("started_at"),
+                          started_at=remote.get("started_at") or remote.get("created_at"))
             # Queue messages are connection state, not model-generated output.
             if not stream.get("remote_stream_cursor"):
                 stream.update(content="", activities=[])
