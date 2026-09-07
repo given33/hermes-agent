@@ -165,6 +165,7 @@ def test_code_only_update_reuses_only_a_verified_dependency_environment(updater,
     assert not updater.reusable_environment(environment, lock)
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX runtime symlinks are exercised on Linux')
 def test_retention_reclaims_archives_and_code_without_removing_live_environment(updater, tmp_path):
     root, state, generations = tmp_path / 'root', tmp_path / 'state', tmp_path / 'native-code'
     for parent in (root, state, generations):
