@@ -16433,10 +16433,15 @@ def _owned_conversation_in_state(
     state: dict[str, Any],
     conversation_id: str,
     owner_id: str,
+    *,
+    hydrate_history: bool = True,
 ) -> tuple[dict[str, Any], bool]:
     """Resolve one conversation without disclosing another account's data."""
 
-    conversation = _conversation_by_id(state, conversation_id)
+    conversation = (_conversation_by_id(state, conversation_id) if hydrate_history else next(
+        (item for item in state.get("conversations") or [] if item.get("id") == conversation_id), None))
+    if not isinstance(conversation, dict):
+        raise HTTPException(status_code=404, detail="Conversation not found")
     existing_owner = str(conversation.get("owner_id") or "").strip()
     changed = False
     if conversation.get("delete_requested"):
@@ -19084,6 +19089,24 @@ def get_single_conversation(
     return result
 
 
+class OrganizeConversationHistoryBody(BaseModel):
+    conversation_ids: list[str] = Field(max_length=500)
+    history_category: str = Field(pattern=r"^(chat|test|runtime)$")
+
+
+@router.post("/single/conversations/organize")
+def organize_conversation_history(payload: OrganizeConversationHistoryBody, request: Request = None):
+    owner_id = owner_id_from_request(request)
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversations = [_owned_conversation_in_state(state, conversation_id, owner_id,
+                         hydrate_history=False)[0] for conversation_id in dict.fromkeys(payload.conversation_ids)]
+        for conversation in conversations:
+            conversation["history_category"] = payload.history_category
+        save_single_state(state)
+    return {"updated": [str(item["id"]) for item in conversations]}
+
+
 @router.patch("/single/conversations/{conversation_id}")
 def rename_single_conversation(
     conversation_id: str,
@@ -19112,6 +19135,7 @@ def rename_single_conversation(
             state,
             conversation_id,
             owner_id_from_request(request),
+            hydrate_history=False,
         )
         if title is not None:
             conversation["title"] = title
@@ -19124,7 +19148,6 @@ def rename_single_conversation(
             conversation["session_pinned"] = bool(payload.pinned)
         if payload.unread is not None:
             conversation["session_unread"] = bool(payload.unread)
-        conversation["updated_at"] = int(time.time() * 1000)
         save_single_state(state)
         return {"conversation": _public_conversation(conversation)}
 

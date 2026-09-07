@@ -166,6 +166,23 @@ def test_history_archive_retains_chat_identity_and_repairs_existing_indexes(monk
     assert restored["history_category"] == "test"
 
 
+def test_history_metadata_batch_does_not_restore_transcripts_or_change_activity_time(monkeypatch):
+    module = load_module()
+    rows = [{"id": f"chat-{index}", "owner_id": "owner", "account_generation": "gen",
+             "archived": True, "created_at": 100, "updated_at": 200} for index in range(3)]
+    saves = []
+    monkeypatch.setattr(module, "owner_id_from_request", lambda _: "owner")
+    monkeypatch.setattr(module, "_account_generation_for_owner", lambda _: "gen")
+    monkeypatch.setattr(module, "load_single_state", lambda: {"conversations": rows})
+    monkeypatch.setattr(module, "save_single_state", lambda state: saves.append(state))
+    monkeypatch.setattr(module, "_conversation_by_id", lambda *_: pytest.fail("Metadata must not load transcripts"))
+    result = module.organize_conversation_history(module.OrganizeConversationHistoryBody(
+        conversation_ids=[row["id"] for row in rows], history_category="test"))
+    assert len(result["updated"]) == 3
+    assert len(saves) == 1
+    assert all(row["history_category"] == "test" and row["updated_at"] == 200 for row in rows)
+
+
 def test_live_checkpoint_does_not_restore_archived_event_history(monkeypatch, tmp_path):
     module = load_module()
     archive = tmp_path / "archived.json"
