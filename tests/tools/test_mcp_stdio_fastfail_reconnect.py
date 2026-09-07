@@ -16,7 +16,7 @@ probe eventually noticed. Both fast-fail sites must signal a reconnect:
 import asyncio
 import json
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -113,7 +113,7 @@ def test_midcall_child_exit_signals_reconnect(monkeypatch, tmp_path):
     async def _watch_children():
         return  # children die immediately → watcher resolves first
 
-    server._watch_stdio_children = _watch_children
+    server._watch_stdio_children = Mock(side_effect=_watch_children)
     mcp_tool._ensure_mcp_loop()
     try:
         handler = _make_tool_handler("srv-midcall", "tool1", 10.0)
@@ -122,5 +122,6 @@ def test_midcall_child_exit_signals_reconnect(monkeypatch, tmp_path):
         assert "error" in parsed, parsed
         assert "exited mid-call" in parsed["error"], parsed
         assert server._reconnect_event.set_calls == 1
+        server._watch_stdio_children.assert_called_once_with()
     finally:
         _cleanup(mcp_tool, "srv-midcall")

@@ -124,6 +124,22 @@ def test_direct_member_assignment_preserves_objective_without_model_planning():
     assert not module._direct_member_plan(objective, ["dbb3-worker", "pc-worker"])
 
 
+def test_named_tool_assignment_bypasses_planner_without_routing_member_questions():
+    module = load_module()
+    for objective in (
+        "请派发给 pc-worker，使用已经配置的 MCP filesystem 的 list_allowed_directories 工具。",
+        "交给 pc-worker：读取工作目录下的年度数据文件并汇总。",
+        "请 pc-worker 使用已配置的 MCP filesystem 工具读取允许的目录。",
+        "Assign to pc-worker: use the configured filesystem list_allowed_directories tool.",
+    ):
+        assert module._rule_based_user_intent(objective)["mode"] == "work"
+        plan = module._direct_member_plan(objective, ["pc-worker"])
+        assert plan["direct_assignment"]
+        assert plan["plan"][0]["objective"] == objective
+    for question in ("你知道 DBB3 吗？", "请问 pc-worker 是什么？", "你现在运行在哪个服务器上？"):
+        assert not module._explicit_member_request(question)
+
+
 def test_final_speaker_reuses_single_worker_delivery_and_preserves_fallback_identity():
     module = load_module()
     run = {"role_events": {"worker": {"profile": "dbb3-worker", "status": "completed", "updated_at": 10,

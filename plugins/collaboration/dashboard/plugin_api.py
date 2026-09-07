@@ -7760,10 +7760,14 @@ def _normalize_manager_handoff(
 
 
 def _explicit_member_request(content: str) -> bool:
+    member = r"(?:dbb3(?:-worker)?|pc-worker|hk-worker|windows|香港|本地电脑)"
+    # An explicit assignment is already a routing decision. It must not need
+    # another execution verb immediately after a long tool or file name.
     return bool(re.search(
-        r"(?:让|叫|请|派发|分派|交给|委派|ask|assign|delegate).{0,20}"
-        r"(?:dbb3|pc-worker|hk-worker|windows|香港|本地电脑).{0,16}"
-        r"(?:发送|回复|回答|执行|完成|处理|运行|send|reply|run|do)", content.lower()
+        rf"(?:派发|分派|交给|委派|assign|delegate)[^。！？\n]{{0,20}}{member}"
+        rf"|(?:让|叫|请|ask)[^。！？\n]{{0,20}}{member}[^。！？\n]{{0,16}}"
+        r"(?:发送|回复|回答|执行|完成|处理|运行|使用|读取|搜索|send|reply|run|do|use|read|search)",
+        content.lower(),
     ))
 
 
