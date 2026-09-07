@@ -222,14 +222,22 @@ def main():
             raise ValueError('Release generation must not be a symlink')
         generation.mkdir(parents=True, exist_ok=True)
         archive = state / (commit + '.tar.gz')
+        files = None
+        if archive.exists():
+            try:
+                files = extract_runtime(archive, generation)
+            except (EOFError, tarfile.ReadError, OSError):
+                archive.rename(archive.with_suffix('.invalid'))
         if not archive.exists():
             temporary = archive.with_suffix('.download')
             request = urllib.request.Request(f'https://codeload.github.com/{REPOSITORY}/tar.gz/{commit}',
                                              headers={'User-Agent': 'Hermes-Runtime-Update'})
             with urllib.request.urlopen(request, timeout=120) as response, temporary.open('wb') as output:
                 shutil.copyfileobj(response, output)
+            files = extract_runtime(temporary, generation)
             os.replace(temporary, archive)
-        files = extract_runtime(archive, generation)
+        if files is None:
+            raise ValueError('Runtime archive was not validated')
         version_match = re.search(r'^version\s*=\s*"([^"]+)"', (generation / 'pyproject.toml').read_text(), re.M)
         version = version_match.group(1) if version_match else ''
         if not version or target.get('version') and target['version'] != version:

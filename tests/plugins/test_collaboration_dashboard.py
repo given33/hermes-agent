@@ -137,6 +137,35 @@ def test_archived_preview_save_does_not_reopen_full_history(monkeypatch, tmp_pat
     assert module._HOSTED_LIVE_CONVERSATIONS["old"]["messages"][0]["content"] == "preview"
 
 
+def test_history_archive_retains_chat_identity_and_repairs_existing_indexes(monkeypatch, tmp_path):
+    module = load_module()
+    monkeypatch.setattr(module, "_archive_root", lambda: tmp_path)
+    monkeypatch.setattr(module, "_conversation_history_summary", lambda c: (len(c["messages"]), c["messages"][-1]))
+    source = {"id": "chat-history", "owner_id": "owner", "account_generation": "gen",
+              "title": "A custom title longer than the automatic compact title limit", "title_source": "user",
+              "profile": "default", "runtime_sessions": {"default": "runtime-one"},
+              "created_at": 1000, "updated_at": 2000, "session_archived": False,
+              "history_category": "test", "messages": [{"role": "user", "content": "First message", "created_at": 1000},
+                                                       {"role": "assistant", "content": "Final answer", "created_at": 2000}]}
+    state = {"conversations": [source]}
+    module._archive_completed_conversations(state)
+    preview = state["conversations"][0]
+    assert preview["runtime_sessions"] == source["runtime_sessions"]
+    assert not module._conversation_index_projection(preview)["archived"]
+    for key in (*module._CONVERSATION_INDEX_METADATA, "history_index_version"):
+        preview.pop(key, None)
+    assert module._repair_conversation_index_metadata(preview)
+    assert preview["runtime_sessions"] == source["runtime_sessions"]
+    assert preview["title"] == source["title"]
+    assert preview["preview"] == "Final answer"
+    assert not module.compact_conversation_title(preview)
+    assert not module._repair_conversation_index_metadata(preview)
+    restored = module._restore_archived_conversation(state, source["id"])
+    assert len(restored["messages"]) == 2
+    assert restored["created_at"] == 1000
+    assert restored["history_category"] == "test"
+
+
 def test_live_checkpoint_does_not_restore_archived_event_history(monkeypatch, tmp_path):
     module = load_module()
     archive = tmp_path / "archived.json"

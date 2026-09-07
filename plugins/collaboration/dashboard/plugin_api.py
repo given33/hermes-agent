@@ -3389,6 +3389,8 @@ def summarize_task_title(content: str) -> str:
 
 
 def compact_conversation_title(conversation: dict[str, Any]) -> bool:
+    if conversation.get("title_source") in {"user", "llm", "derived"} or conversation.get("archived"):
+        return False
     current = str(conversation.get("title") or "").strip()
     poor_title = any(
         marker in current
@@ -3408,6 +3410,44 @@ def compact_conversation_title(conversation: dict[str, Any]) -> bool:
     if compacted == current:
         return False
     conversation["title"] = compacted
+    return True
+
+
+def _repair_conversation_index_metadata(conversation: dict[str, Any]) -> bool:
+    if conversation.get("history_index_version") == 1:
+        return False
+    source = conversation
+    if conversation.get("archived"):
+        path = _conversation_archive_path(str(conversation.get("id") or ""))
+        try:
+            source = json.loads(path.read_text(encoding="utf-8")) if path else {}
+        except (OSError, ValueError):
+            return False
+        if not isinstance(source, dict) or any(source.get(key) != conversation.get(key)
+                for key in ("id", "owner_id", "account_generation")):
+            return False
+        for key in _CONVERSATION_INDEX_METADATA:
+            if key in source:
+                conversation[key] = deepcopy(source[key])
+    messages = source.get("messages") or []
+    first_user = next((str(item.get("content") or "") for item in messages
+                       if item.get("role") == "user" and item.get("content")), "")
+    if first_user and conversation.get("title_source") not in {"user", "llm"}:
+        from agent.title_generator import derive_title
+        derived = derive_title(first_user)
+        if derived:
+            conversation["title"] = derived
+            conversation["title_source"] = "derived"
+    created = _nonnegative_int(conversation.get("created_at"))
+    timestamps = [int(item["created_at"]) for item in messages
+                  if isinstance(item.get("created_at"), (int, float)) and item["created_at"] > 0]
+    if timestamps:
+        conversation["created_at"] = min([created, *timestamps]) if created else min(timestamps)
+    last = next((str(item.get("content") or "") for item in reversed(messages)
+                 if item.get("content") and item.get("role") in {"user", "assistant"}), "")
+    if last:
+        conversation["preview"] = " ".join(last.split())[:240]
+    conversation["history_index_version"] = 1
     return True
 
 
@@ -3869,6 +3909,12 @@ def _conversation_terminal(conversation: dict[str, Any]) -> bool:
     )
 
 
+_CONVERSATION_INDEX_METADATA = (
+    "runtime_sessions", "official_session_id", "official_profile", "official_model",
+    "title_source", "history_category", "preview", "session_archived", "session_pinned", "session_unread",
+)
+
+
 def _archive_completed_conversations(state: dict[str, Any]) -> None:
     """Move long-idle terminal conversations out of the hot state document.
 
@@ -3946,6 +3992,10 @@ def _archive_completed_conversations(state: dict[str, Any]) -> None:
             "archived": True,
             "archived_at": now,
         }
+        for key in _CONVERSATION_INDEX_METADATA:
+            if key in conversation:
+                placeholder[key] = deepcopy(conversation[key])
+        placeholder["history_index_version"] = 1
         conversations[index] = placeholder
 
 
@@ -3984,6 +4034,9 @@ def _restore_archived_conversation(
         if stored != expected:
             return None
     restored["restored_from_archive_at"] = int(time.time() * 1000)
+    for key in (*_CONVERSATION_INDEX_METADATA, "title", "created_at", "history_index_version"):
+        if key in placeholder:
+            restored[key] = deepcopy(placeholder[key])
     restored.pop("archived", None)
     conversations = state.get("conversations")
     if isinstance(conversations, list):
@@ -4659,6 +4712,9 @@ def create_adopted_single_conversation(
             pending_assistant.append(source)
     flush_assistant_turn()
     if conversation["messages"]:
+        conversation["created_at"] = min(
+            message["created_at"] for message in conversation["messages"]
+        )
         conversation["updated_at"] = max(
             message["created_at"]
             for message in conversation["messages"]
@@ -13998,7 +14054,12 @@ def _remote_run_state_message(
         "completed_at": int(remote_run.get("completed_at") or 0) or None,
         "updated_at": int(remote_run.get("updated_at") or int(time.time() * 1000)),
     }
-    streamed = _REMOTE_STREAM_STATES.get(str(remote_run.get("id") or ""))
+    stream_id = str(remote_run.get("id") or "")
+    with _HOSTED_LIVE_STATE_LOCK:
+        streamed = deepcopy(_REMOTE_STREAM_STATES.get(stream_id))
+    checkpoint_counts = {key: len((streamed or {}).get(key) or []) for key in (
+        "_protocol_events", "_pending_milestone_messages", "_session_entry_events",
+    )}
     if streamed:
         terminal = status in _REMOTE_TERMINAL_STATUSES
         state = {**deepcopy(streamed), **{key: value for key, value in state.items()
@@ -14017,11 +14078,15 @@ def _remote_run_state_message(
             semantic_progress if status == "running" or intervention_pause else ""
         ),
     )
-    if status in _REMOTE_TERMINAL_STATUSES:
-        _REMOTE_STREAM_STATES.pop(str(remote_run.get("id") or ""), None)
-    elif streamed:
-        streamed["_protocol_events"] = []
-        streamed["_live_protocol_event_count"] = 0
+    with _HOSTED_LIVE_STATE_LOCK:
+        current = _REMOTE_STREAM_STATES.get(stream_id)
+        if status in _REMOTE_TERMINAL_STATUSES:
+            _REMOTE_STREAM_STATES.pop(stream_id, None)
+        elif current and streamed:
+            for key, count in checkpoint_counts.items():
+                current[key] = (current.get(key) or [])[count:]
+            current["_live_protocol_event_count"] = max(0,
+                int(current.get("_live_protocol_event_count") or 0) - checkpoint_counts["_protocol_events"])
 
 
 def request_hosted_turn_cancellation(
@@ -16286,8 +16351,21 @@ def _public_hosted_turns(hosted_turns: Any) -> dict[str, dict[str, Any]]:
     }
 
 
+def _conversation_runtime_aliases(conversation: dict[str, Any]) -> dict[str, str]:
+    from hermes_cli.managed_installations import _account_profile_name
+    owner = str(conversation.get("owner_id") or "")
+    generation = str(conversation.get("account_generation") or "")
+    if not owner or not generation or owner == LOCAL_OWNER_ID:
+        return {}
+    return {_account_profile_name(owner, generation, profile): session_id
+            for profile, session_id in (conversation.get("runtime_sessions") or {}).items()
+            if session_id and not profile.startswith("acct-")}
+
+
 def _public_conversation(conversation: dict[str, Any]) -> dict[str, Any]:
     projected = dict(conversation)
+    projected["runtime_session_aliases"] = _conversation_runtime_aliases(conversation)
+    projected["archived"] = bool(conversation.get("session_archived"))
     # Keep account Sessions-page flags in a separate storage namespace from
     # the collaboration archive marker.  The latter is an internal archive
     # placeholder consumed by `_conversation_by_id`; reusing `archived=True`
@@ -16707,6 +16785,7 @@ class RenameSingleConversationBody(BaseModel):
     archived: bool | None = None
     pinned: bool | None = None
     unread: bool | None = None
+    history_category: str | None = Field(default=None, pattern=r"^(chat|test|runtime)$")
 
 
 class AdoptSingleConversationBody(BaseModel):
@@ -18728,6 +18807,8 @@ def compact_hosted_turns_for_index(
 
 def _conversation_index_projection(conversation: dict[str, Any]) -> dict[str, Any]:
     projected = dict(conversation)
+    projected["runtime_session_aliases"] = _conversation_runtime_aliases(conversation)
+    projected["archived"] = bool(conversation.get("session_archived"))
     # The index response uses a lighter projection than `_public_conversation`
     # but must expose the same account Sessions flags. Keep the internal
     # storage keys out of the mobile payload so list and detail snapshots
@@ -18807,6 +18888,7 @@ def get_single_conversations(request: Request = None):
                 changed = True
             changed = reconcile_conversation_runtime_results(conversation) or changed
             changed = reconcile_stale_hosted_turns(conversation) or changed
+            changed = _repair_conversation_index_metadata(conversation) or changed
             changed = compact_conversation_title(conversation) or changed
             owned.append(conversation)
         if changed or _prune_deletion_tombstones(state):
@@ -18829,6 +18911,7 @@ def get_single_conversations(request: Request = None):
                 **_conversation_index_projection(conversation),
                 "messages": ([last_message] if last_message else []),
                 "message_count": message_count,
+                "preview": " ".join(str((last_message or {}).get("content") or conversation.get("preview") or "").split())[:240],
                 "hosted_turns": compact_hosted_turns_for_index(
                     conversation.get("hosted_turns")
                 ),
@@ -18929,8 +19012,14 @@ def adopt_single_chat(
     with _STATE_LOCK:
         state = load_single_state()
         for conversation in state.get("conversations") or []:
+            if str(conversation.get("owner_id") or "").strip() != owner_id:
+                continue
+            _repair_conversation_index_metadata(conversation)
             runtime_sessions = conversation.get("runtime_sessions") or {}
-            if runtime_sessions.get(payload.profile) == session_id:
+            if (runtime_sessions.get(payload.profile) == session_id
+                    or _conversation_runtime_aliases(conversation).get(payload.profile) == session_id):
+                if conversation.get("archived"):
+                    conversation = _restore_archived_conversation(state, str(conversation["id"])) or conversation
                 existing_owner = str(conversation.get("owner_id") or "").strip()
                 if conversation.get("delete_requested"):
                     raise HTTPException(status_code=404, detail="Conversation not found")
@@ -19011,10 +19100,11 @@ def rename_single_conversation(
         and payload.archived is None
         and payload.pinned is None
         and payload.unread is None
+        and payload.history_category is None
     ):
         raise HTTPException(
             status_code=400,
-            detail="Nothing to update; provide 'title', 'archived', 'pinned', or 'unread'.",
+            detail="Nothing to update; provide title, archived, pinned, unread, or history_category.",
         )
     with _STATE_LOCK:
         state = load_single_state()
@@ -19025,6 +19115,9 @@ def rename_single_conversation(
         )
         if title is not None:
             conversation["title"] = title
+            conversation["title_source"] = "user"
+        if payload.history_category is not None:
+            conversation["history_category"] = payload.history_category
         if payload.archived is not None:
             conversation["session_archived"] = bool(payload.archived)
         if payload.pinned is not None:
