@@ -62,6 +62,7 @@ class _TurnSink:
     events: queue.Queue[dict[str, Any] | None] = field(default_factory=queue.Queue)
     result: str = ""
     error: BaseException | None = None
+    assistant_segment: str = ""
 
 
 @dataclass
@@ -181,6 +182,15 @@ class _GatewayProcess:
                 event_session_id = str(params.get("session_id") or "")
                 payload = params.get("payload")
                 payload = dict(payload) if isinstance(payload, dict) else {}
+                if event_type == "tool.complete" and not payload.get("error"):
+                    result = payload.get("result")
+                    if isinstance(result, str):
+                        try:
+                            result = json.loads(result)
+                        except ValueError:
+                            pass
+                    if isinstance(result, dict) and result.get("error"):
+                        payload["error"] = str(result["error"])
                 state: _HostedSessionState | None = None
                 if event_type == "session.ready":
                     # The gateway emits this lightweight boundary before it
@@ -261,6 +271,16 @@ class _GatewayProcess:
                 sink = state.current_sink if state is not None else None
                 if sink is None:
                     continue
+                if event_type == "message.delta":
+                    sink.assistant_segment += str(payload.get("text") or "")
+                elif event_type == "reasoning.available":
+                    text = str(payload.get("text") or "").strip()
+                    if text and sink.assistant_segment.strip().startswith(text):
+                        # The official fallback can echo assistant content as
+                        # reasoning. It is already displayed in its own channel.
+                        continue
+                elif event_type == "message.interim":
+                    sink.assistant_segment = ""
                 if event_type == "message.complete":
                     status = str(payload.get("status") or "complete")
                     if status == "complete":

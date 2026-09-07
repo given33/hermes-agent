@@ -57,6 +57,9 @@ def test_reader_marks_turn_idle_only_after_post_completion_session_info():
         stdout=io.StringIO(
             "\n".join(
                 (
+                    _event("tool.complete", {"name": "write_file", "result": {"error": "Permission denied"}}),
+                    _event("message.delta", {"text": "ok"}),
+                    _event("reasoning.available", {"text": "ok"}),
                     _event("message.complete", {"text": "ok", "status": "complete"}),
                     _event("session.info", {"running": False}),
                     "",
@@ -86,6 +89,9 @@ def test_reader_marks_turn_idle_only_after_post_completion_session_info():
 
     assert state.message_complete_seen.is_set()
     assert state.idle_after_turn.is_set()
+    delivered = [event for event in state.current_sink.events.queue if event is not None]
+    assert next(event for event in delivered if event["type"] == "tool.complete")["payload"]["error"] == "Permission denied"
+    assert not any(event["type"] == "reasoning.available" for event in delivered)
     assert state.latest_session_info == {
         "type": "session.info",
         "payload": {
