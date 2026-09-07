@@ -93,6 +93,11 @@ def test_simple_calculation_does_not_create_workflow_or_call_router_model():
         "查询一下今天的天气",
         "先简短说明正在搜索，然后用 web_search 搜索 Hermes Agent 官方 profiles 文档，读取其中一个官方页面，用中文说明独立配置的作用并给出来源链接。直接完成，不派发成员。",
         "搜索最新资料并整理来源，不分派任务，直接完成。",
+        "算了叫我皇上。然后还有个点，你现在运行在那个服务器上。",
+        "你现在运行在哪个服务器上？",
+        "当前会话用的什么模型？",
+        "以后称呼我皇上。",
+        "Which server are you running on? Call me Alex.",
     ):
         def unexpected_model(_):
             raise AssertionError("A simple turn must bypass the router model")
@@ -100,6 +105,9 @@ def test_simple_calculation_does_not_create_workflow_or_call_router_model():
         assert result["mode"] == "chat", prompt
         assert result["lock_level"] == "hard_chat", prompt
         assert result["profiles"] == ["default"], prompt
+
+    for prompt in ("叫我皇上，然后在 DBB3 部署项目并测试。", "请重启 DBB3 服务器上的服务并验证。"):
+        assert module._rule_based_user_intent(prompt)["mode"] == "work"
 
 
 def test_state_snapshot_isolates_containers_without_copying_transcript_text():
@@ -145,6 +153,58 @@ def test_live_checkpoint_does_not_restore_archived_event_history(monkeypatch, tm
     assert json.loads(archive.read_text()) == original
 
 
+def test_chat_milestones_stream_before_checkpoint_and_survive_reload(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    module = load_module()
+    conversation = module.create_single_conversation("default")
+    module.create_hosted_turn_record(
+        conversation, turn_id="live-milestones", content="Check two files",
+        title="Check files", profiles=["default"], artifact_required=False, mode="chat",
+    )
+    document = tmp_path / "state.json"
+    writes = []
+
+    def save(state):
+        document.write_text(json.dumps(state), encoding="utf-8")
+        writes.append(1)
+        module._publish_live_conversations(state)
+
+    save({"conversations": [conversation]})
+    monkeypatch.setattr(module, "load_single_state", lambda: json.loads(document.read_text(encoding="utf-8")))
+    monkeypatch.setattr(module, "save_single_state", save)
+
+    def runner(_profile, _prompt, *, event_callback, **_kwargs):
+        write_count = len(writes)
+        for index in range(2):
+            report = f"Checking file {index}."
+            event_callback({"type": "message.delta", "payload": {"text": report}})
+            event_callback({"type": "message.interim", "payload": {"text": report}})
+            live = module._HOSTED_LIVE_CONVERSATIONS[conversation["id"]]
+            assert live["hosted_events"][-1]["event_type"] == "message.interim"
+            tool = {"tool_id": f"read-{index}", "name": "read_file"}
+            event_callback({"type": "tool.start", "payload": tool})
+            live = module._HOSTED_LIVE_CONVERSATIONS[conversation["id"]]
+            assert live["hosted_events"][-1]["event_type"] == "tool.started"
+            assert live["hosted_turns"]["live-milestones"]["role_events"]["chat"]["status"] == "streaming"
+            milestone = [m for m in live["messages"] if m.get("meta", {}).get("phase") == "milestone"][-1]
+            assert milestone["content"] == report
+            event_callback({"type": "tool.complete", "payload": {**tool, "result_text": "ok"}})
+            assert len(writes) == write_count, "An event callback must not wait for durable milestones"
+        return "Both files verified."
+
+    result, status, _ = module._run_hosted_role(
+        conversation["id"], "live-milestones", profile="default", role_stage="chat",
+        role_label="Hermes", prompt="Check two files", runner=runner,
+        kanban_task_id="", start_text="",
+    )
+    assert (result, status) == ("Both files verified.", "completed")
+    saved = json.loads(document.read_text(encoding="utf-8"))["conversations"][0]
+    milestones = [m for m in saved["messages"] if m.get("meta", {}).get("phase") == "milestone"]
+    assert [m["content"] for m in milestones] == ["Checking file 0.", "Checking file 1."]
+    assert saved["messages"][-1]["content"] == result
+    assert milestones[0]["created_at"] <= milestones[1]["created_at"] <= saved["messages"][-1]["created_at"]
+
+
 def test_connector_run_reads_do_not_clone_account_and_keep_owner_checks(monkeypatch):
     module = load_module()
     remote = {"id": "remote-1", "connector_id": "dbb3-primary", "status": "running", "deadline_at": 10**15}
@@ -162,6 +222,52 @@ def test_connector_run_reads_do_not_clone_account_and_keep_owner_checks(monkeypa
     with pytest.raises(module.HTTPException) as error:
         module._remote_run_for_connector(None, "remote-1")
     assert error.value.status_code == 404
+
+
+def test_remote_heartbeat_keeps_tools_and_does_not_extend_progress(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    module = load_module()
+    activity = {"id": "read-1", "kind": "tool", "name": "read_file", "status": "running"}
+    remote = {"id": "remote-1", "status": "running", "checkpoint_cursor": 2,
+              "execution_progress_at": 1000, "activities": [activity], "summary": "Reading",
+              "result": "First report", "deadline_at": 10**15}
+    conversation = {"id": "c", "hosted_turns": {"t": {"turn_id": "t", "status": "running",
+                                                            "remote_runs": {"worker": remote}}}}
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _: None)
+    monkeypatch.setattr(module, "_require_connector_account_boundary", lambda *args: None)
+    monkeypatch.setattr(module, "_require_remote_run_claim", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_remote_run_state_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module.time, "time", lambda: 100)
+    module._apply_remote_checkpoint("remote-1", {"status": "running", "terminal": False,
+                                               "checkpoint_cursor": 2, "summary": "Reading"})
+    assert remote["activities"] == [activity]
+    assert remote["result"] == "First report"
+    assert remote["execution_progress_at"] == 1000
+    assert remote["lease_until"] > 100000
+    module._apply_remote_checkpoint("remote-1", {"status": "running", "terminal": False,
+        "checkpoint_cursor": 3, "activities": [{**activity, "status": "completed"}]})
+    assert remote["execution_progress_at"] == 100000
+    assert remote["activities"][0]["status"] == "completed"
+
+
+def test_remote_stall_distinguishes_execution_from_heartbeats():
+    module = load_module()
+    remote = {"status": "running", "started_at": 1000, "execution_progress_at": 1000,
+              "updated_at": 90000, "checkpoint_cursor": 1, "execution_state": "triage"}
+    assert module._remote_execution_stalled(remote, now=90000)
+    remote.update(execution_state="running", checkpoint_cursor=3, execution_progress_at=89000)
+    assert not module._remote_execution_stalled(remote, now=90000)
+    remote.update(status="awaiting_input")
+    assert not module._remote_execution_stalled(remote, now=900000)
+    hosted = {"status": "running"}
+    remote.update(status="cancelling", cancel_requested=True, cancel_kind="server_fallback",
+                  cancel_force_terminal_at=1000, claim_token="old", lease_owner="worker")
+    assert module._request_remote_timeout_locked(hosted, remote, now=2000)
+    assert remote["status"] == "cancelled"
+    assert not remote.get("claim_token")
+    assert not hosted.get("cancel_requested")
 
 
 def test_overdue_connector_run_still_commits_timeout_from_private_snapshot(monkeypatch):
@@ -1050,6 +1156,27 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual([item["method"] for item in calls], ["prompt.btw", "config.set"])
         self.assertEqual(calls[0]["params"], {"text": "what changed?"})
         self.assertEqual(calls[1]["params"], {"key": "busy", "value": "queue"})
+
+    def test_mobile_model_pick_preserves_official_deferred_and_confirmation_results(self):
+        module = load_module()
+        module._owned_conversation = lambda *args: ("owner", {"profile": "default"})
+        module._account_generation_for_request = lambda *args: "generation"
+        module._hosted_runtime_home = lambda *args: "/tmp/owner"
+        calls = []
+
+        def command(**kwargs):
+            calls.append(kwargs)
+            return {"value": "next-model", "deferred": True, "confirm_required": False}
+
+        module.run_hosted_gateway_command = command
+        result = module.mobile_hosted_command("c", module.MobileHostedCommandBody(
+            command="model", text="configured:next-model", confirm_expensive_model=True,
+        ), SimpleNamespace())
+        self.assertTrue(result["deferred"])
+        self.assertTrue(result["accepted"])
+        self.assertEqual(calls[0]["method"], "config.set")
+        self.assertEqual(calls[0]["params"], {"key": "model", "value": "configured:next-model", "confirm_expensive_model": True})
+        self.assertEqual(calls[0]["conversation_id"], "c")
 
     def test_short_chinese_greeting_keeps_its_first_character_in_title(self):
         module = load_module()

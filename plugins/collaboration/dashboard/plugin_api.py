@@ -885,6 +885,7 @@ def _publish_live_hosted_role_projection(
     *,
     patch: Optional[dict[str, Any]] = None,
     message: Optional[dict[str, Any]] = None,
+    preceding_messages: Optional[list[dict[str, Any]]] = None,
     protocol_events: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     """Publish a small hosted-chat projection without touching durable state.
@@ -951,15 +952,18 @@ def _publish_live_hosted_role_projection(
         run["updated_at"] = now
         conversation["updated_at"] = now
 
+        incoming_messages = list(preceding_messages or [])
         if isinstance(message, dict):
+            incoming_messages.append(message)
+        if incoming_messages:
+            conversation["messages"] = list(current.get("messages") or [])
+        for message in incoming_messages:
             incoming = deepcopy(message)
             incoming_meta = dict(incoming.get("meta") or {})
             incoming_meta.setdefault("runtime_turn_id", normalized_turn_id)
             incoming["meta"] = incoming_meta
             message_key = str(incoming_meta.get("message_key") or "")
-            current_messages = current.get("messages")
-            messages = list(current_messages) if isinstance(current_messages, list) else []
-            conversation["messages"] = messages
+            messages = conversation["messages"]
             existing_index: Optional[int] = None
             for index, item in enumerate(messages):
                 if not isinstance(item, dict):
@@ -7701,6 +7705,15 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         r"(?:不要|无需|不用|不必|不)(?:创建|使用|启动|进行)?(?:团队|群聊|派发|分派|拆分|委派)"
         r"|(?:no|without) (?:team|delegation|group chat)", lowered
     ))
+    current_session_question = bool(re.search(
+        r"(?:你|当前会话|刚才(?:回复|回答)我的(?:模型|助手)).{0,20}(?:运行|部署|所在|用的).{0,12}(?:哪|那|什么|哪个).{0,8}(?:服务器|主机|模型|节点)"
+        r"|(?:你|当前会话).{0,12}(?:哪|那|什么).{0,8}(?:服务器|主机|模型|节点)"
+        r"|(?:叫我|称呼我|call me|address me as)"
+        r"|(?:where are you running|which (?:server|host|model) are you)", lowered
+    )) and not explicit_workflow and not re.search(
+        r"(?:部署|重启|安装|修复|迁移|删除|创建|构建|发布|测试|deploy|restart|install|migrate)"
+        r"|(?:修改|更新).{0,12}(?:代码|文件|配置|服务)", lowered
+    )
     single_turn_tools = any(
         marker in lowered for marker in _SINGLE_TURN_TOOL_MARKERS
     )
@@ -7722,7 +7735,7 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         and not ambiguous_delegation
         and not requires_artifact_delivery(text)
     )
-    hard_chat = explicit_single or (
+    hard_chat = explicit_single or current_session_question or (
         not hard_work
         and len(text) <= 80
         and (explicit_chat or trivial_chat or plain_chat or single_turn_tools)
@@ -7738,7 +7751,7 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         score = max(score, 4)
     if explicit_chat and len(text) < 30:
         score -= 3
-    if explicit_single:
+    if explicit_single or current_session_question:
         score = min(score, 3)
 
     if score < 4:
@@ -7750,7 +7763,9 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
             confidence = 0.82
         else:
             confidence = 0.68
-        if trivial_chat:
+        if current_session_question:
+            rationale_code = "rule.current_session_question"
+        elif trivial_chat:
             rationale_code = "rule.trivial_chat"
         elif explicit_chat:
             rationale_code = "rule.explicit_chat"
@@ -7811,6 +7826,8 @@ def classify_intent_with_model(content: str) -> Optional[dict[str, Any]]:
                 "content": (
                     "你是 Hermes 任务路由器。判断用户请求应走 simple 还是 workflow。"
                     "simple 表示普通聊天、问答、总结、搜索或一个 Hermes 可直接完成的单步任务；"
+                    "称呼或偏好修改、询问你运行在哪台服务器或使用什么模型，均由当前会话助手直接回答，"
+                    "不能因为出现服务器、主机、记忆等词就派发成员；偏好记忆工具也不需要工作流。"
                     "workflow 表示多步骤执行、设备协作、修改代码、部署、测试、生成交付文件或长期任务。"
                     "只输出 JSON：{\"mode\":\"chat|work\",\"confidence\":0到1,"
                     "\"reason\":\"一句中文理由\"}。"
@@ -7876,6 +7893,9 @@ def classify_intent_with_context_model(
         "Classify this Hermes conversation turn from semantics and context. "
         "chat is ordinary conversation, explanation, translation, summary, search, or read-only analysis that one "
         "Hermes can answer directly, including arithmetic and a small number of tool calls. Tool use alone does not require work mode. "
+        "Changing how the current assistant addresses the user and asking where YOU run or which model YOU use are chat. "
+        "These refer to the existing conversation assistant, not a request to inspect or operate a remote worker. "
+        "Remembering a conversational preference is chat even if it calls a memory tool. "
         "work is concrete development/operations requiring remote workers, state mutation, deployment, "
         "multi-step execution, or creating a deliverable. An uploaded file is normally input, not a requested output. "
         "Repository edits do not imply a downloadable artifact. Resolve references such as continue or send that file "
@@ -10402,6 +10422,7 @@ def _persist_hosted_role_state(
                 str(state.get("runtime_session_id") or "").strip(),
             ),
             message=projected_message if visible else None,
+            preceding_messages=state.get("_pending_milestone_messages"),
             protocol_events=pending_protocol_events,
             session_entries=pending_session_entries,
         )
@@ -10410,6 +10431,7 @@ def _persist_hosted_role_state(
             state["_live_protocol_event_count"] = 0
         if pending_session_entries:
             state["_session_entry_events"] = []
+        state["_pending_milestone_messages"] = []
     else:
         live_event_offset = max(
             0,
@@ -10423,6 +10445,7 @@ def _persist_hosted_role_state(
             turn_id,
             patch=patch,
             message=projected_message if visible else None,
+            preceding_messages=state.get("_pending_milestone_messages"),
             protocol_events=pending_protocol_events[live_event_offset:],
         )
         state["_live_protocol_event_count"] = len(pending_protocol_events)
@@ -10820,15 +10843,18 @@ def _run_hosted_role(
                 else current_content
             )
             base_stage = role_stage.split(":", 1)[0]
-            _persist_hosted_turn(
-                conversation_id,
-                turn_id,
-                message={
+            # The gateway dispatches events serially. Saving a milestone here
+            # stalls all subsequent tool/reasoning deltas behind disk I/O.
+            # Publish it with the live projection and batch its durable write
+            # with the next regular checkpoint.
+            state.setdefault("_pending_milestone_messages", []).append(
+                {
                     "role": "assistant",
                     "name": profile,
                     "content": milestone_content,
                     "status": "completed",
                     "kind": "message",
+                    "created_at": int(time.time() * 1000),
                     "meta": {
                         "role_stage": f"{role_stage}.milestone.{milestone_count}",
                         "base_role_stage": base_stage,
@@ -10895,6 +10921,7 @@ def _run_hosted_role(
             "error",
             "message.complete",
             "message.delta",
+            "message.interim",
             "reasoning.available",
             "reasoning.delta",
             "request.accepted",
@@ -10914,6 +10941,7 @@ def _run_hosted_role(
             "connection.retry",
             "error",
             "message.complete",
+            "message.interim",
             "reasoning.available",
             "request.accepted",
             "session.info",
@@ -11495,12 +11523,6 @@ def _run_hosted_remote_role(
     fallback_deadline = time.monotonic() + float(
         min(configured_fallback or _REMOTE_SERVER_FALLBACK_SECONDS, 60)
     )
-    # Progress-based stall detection. A claimed remote run that stops updating
-    # (no status/checkpoint/activity change) is treated as stuck. This is not
-    # an arbitrary total-time cap; it reacts to actual liveness.
-    last_seen_remote_updated_at = -1
-    last_remote_progress_at = time.monotonic()
-
     while True:
         if not _renew_hosted_active_role(
             conversation_id,
@@ -11534,15 +11556,7 @@ def _run_hosted_remote_role(
             remote = dict(current)
             turn_cancel_requested = _coerce_flag(_hosted.get("cancel_requested"))
         status = str(remote.get("status") or "queued")
-        current_updated_at = int(remote.get("updated_at") or 0)
-        if current_updated_at != last_seen_remote_updated_at:
-            last_seen_remote_updated_at = current_updated_at
-            last_remote_progress_at = time.monotonic()
-        elif (
-            status not in _REMOTE_TERMINAL_STATUSES
-            and time.monotonic() - last_remote_progress_at
-            >= _HOSTED_REMOTE_ROLE_STALL_SECONDS
-        ):
+        if not turn_cancel_requested and _remote_execution_stalled(remote, now=int(time.time() * 1000)):
             now_ms = int(time.time() * 1000)
             with _STATE_LOCK:
                 stall_state = load_single_state()
@@ -11554,35 +11568,28 @@ def _run_hosted_remote_role(
                     _stall_conversation, _stall_hosted, _role_key, current = stall_location
                     current.update(
                         {
-                            "status": "timed_out",
-                            "terminal": True,
+                            "status": "cancelling",
                             "cancel_requested": True,
-                            "cancel_kind": "stall",
-                            "cancel_reason": "Remote run stopped advancing; liveness timeout",
-                            "error": "Remote run stalled (no persisted state update)",
-                            "summary": "Remote run stalled (no persisted state update)",
-                            "completed_at": now_ms,
+                            "cancel_kind": "server_fallback",
+                            "cancel_reason": "Remote execution stopped advancing; server takeover requested",
+                            "summary": "成员长时间没有执行进展，正在停止原任务并由服务器接管。",
+                            "cancel_requested_at": now_ms,
+                            "cancel_force_terminal_at": now_ms + _REMOTE_CANCELLATION_GRACE_SECONDS * 1000,
                             "updated_at": now_ms,
                         }
                     )
                     _stall_hosted.update(
                         {
-                            "stage": "failed",
+                            "stage": "server_fallback_pending",
                             "remote_cancel_pending": True,
-                            "cancel_requested": True,
-                            "cancel_kind": "stall",
                             "updated_at": now_ms,
                         }
                     )
                     save_single_state(stall_state)
+                    remote = dict(current)
+                    status = str(remote["status"])
             _notify_hosted_update(conversation_id)
-            release_remote_role_claim()
-            return "", "failed", {
-                "content": "",
-                "status": "failed",
-                "error": "Remote run stalled (no persisted state update)",
-                "activities": [],
-            }
+            _remote_run_state_message(conversation_id, turn_id, remote, role_label=role_label)
         pending_intervention = _pending_hosted_role_intervention(
             conversation_id,
             turn_id,
@@ -11679,7 +11686,18 @@ def _run_hosted_remote_role(
             and not str(remote.get("remote_task_id") or "").strip()
             and (not lease_owner or lease_expired)
         )
-        if unclaimed and time.monotonic() >= fallback_deadline:
+        if str(remote.get("cancel_kind") or "") == "server_fallback":
+            _advance_remote_run_deadline(active_remote_id)
+            with _STATE_LOCK:
+                location = _remote_run_location(load_single_state(), active_remote_id)
+                if location is not None:
+                    remote = dict(location[3])
+                    status = str(remote.get("status") or "")
+        takeover_ready = (
+            str(remote.get("cancel_kind") or "") == "server_fallback"
+            and status in {"cancelled", "timed_out"}
+        )
+        if (unclaimed and time.monotonic() >= fallback_deadline) or takeover_ready:
             now = int(time.time() * 1000)
             with _STATE_LOCK:
                 state = load_single_state()
@@ -11702,6 +11720,7 @@ def _run_hosted_remote_role(
                             "stage": "server_fallback",
                             "remote_fallback": True,
                             "remote_fallback_at": now,
+                            "remote_cancel_pending": False,
                             "updated_at": now,
                         }
                     )
@@ -11723,9 +11742,11 @@ def _run_hosted_remote_role(
                 role_stage=fallback_stage,
                 role_label="Hermes · 服务器兜底",
                 prompt=(
-                    "远程成员当前不可达。你是服务器 Hermes 兜底执行器；"
+                    "远程成员不可用或没有执行进展。原执行已停止，你是服务器 Hermes 兜底执行器；"
                     "请直接完成同一角色阶段，保留完整工具定义和用户目标，"
-                    "不要等待 DBB3 或 PC。\n\n"
+                    "不要等待 DBB3 或 PC。只汇报你实际完成的工作，不要把服务器自身说成原成员的主机。"
+                    "已完成的操作不要重复执行；目标主机无法访问时如实报告。\n\n"
+                    f"原成员已记录的进度：{str(remote.get('result') or remote.get('summary') or '')[:4000]}\n\n"
                     f"{prompt}"
                 ),
                 runner=run_profile_turn,
@@ -12806,6 +12827,7 @@ def _persist_hosted_turn(
     *,
     patch: Optional[dict[str, Any]] = None,
     message: Optional[dict[str, Any]] = None,
+    preceding_messages: Optional[list[dict[str, Any]]] = None,
     runtime_session: Optional[tuple[str, str]] = None,
     source_message_meta: Optional[dict[str, Any]] = None,
     protocol_events: Optional[list[dict[str, Any]]] = None,
@@ -13109,7 +13131,10 @@ def _persist_hosted_turn(
                 # transition below may commit the turn terminal.
                 continue
             append_protocol_event(protocol_event)
+        incoming_messages = list(preceding_messages or [])
         if message:
+            incoming_messages.append(message)
+        for message in incoming_messages:
             message_meta = dict(message.get("meta") or {})
             message_meta.setdefault("runtime_turn_id", turn_id)
             role_stage = str(message_meta.get("role_stage") or "")
@@ -13158,6 +13183,7 @@ def _persist_hosted_turn(
                     status=str(message.get("status") or "completed"),
                     kind=str(message.get("kind") or "message"),
                     meta=message_meta,
+                    created_at=message.get("created_at"),
                 )
             else:
                 existing = messages[existing_index]
@@ -13505,8 +13531,9 @@ def _request_remote_timeout_locked(
         # The hosted turn must also carry the cancellation flag so the
         # turn-level finisher converges even when the workflow thread that
         # originally observed the run is gone (crash / restart / gap).
-        hosted["cancel_requested"] = True
-        hosted.setdefault("cancel_kind", kind or "cancel")
+        if kind not in {"server_fallback", "intervention"}:
+            hosted["cancel_requested"] = True
+            hosted.setdefault("cancel_kind", kind or "cancel")
         return True
     if deadline_at is None or now < deadline_at:
         return False
@@ -13539,6 +13566,22 @@ def _request_remote_timeout_locked(
         }
     )
     return True
+
+
+def _remote_execution_stalled(remote: dict[str, Any], *, now: int) -> bool:
+    if (str(remote.get("status") or "") in _REMOTE_TERMINAL_STATUSES | {"awaiting_input"}
+            or _coerce_flag(remote.get("cancel_requested"))):
+        return False
+    # Transport heartbeats renew a lease; they do not prove that a queued
+    # model ever started or that its execution made progress.
+    progress_at = _nonnegative_int(remote.get("execution_progress_at")) or _nonnegative_int(
+        remote.get("started_at") or remote.get("created_at")
+    )
+    startup = str(remote.get("execution_state") or "") in {"triage", "todo", "ready", "queued"} or (
+        not remote.get("activities") and _nonnegative_int(remote.get("checkpoint_cursor")) <= 1
+    )
+    limit = 60 if startup else _HOSTED_REMOTE_ROLE_STALL_SECONDS
+    return bool(progress_at and now - progress_at >= limit * 1000)
 
 
 def _remote_queue_needs_transaction(
@@ -13894,7 +13937,13 @@ def _remote_run_state_message(
             else "远程执行已结束。"
         )
     elif status == "running":
-        content = result or "已连接远程执行器，正在执行。"
+        content = result or (
+            "成员已接收任务，等待本机调度。"
+            if str(remote_run.get("execution_state") or "") in {"triage", "todo", "ready", "queued"}
+            else "已连接远程执行器，正在执行。"
+        )
+    elif str(remote_run.get("cancel_kind") or "") == "server_fallback":
+        content = "成员长时间没有执行进展，正在停止原任务并由服务器接管。"
     else:
         content = "已排队等待远程执行器领取。"
     activities = [
@@ -16516,6 +16565,7 @@ def _append_message(
     status: str = "completed",
     kind: str = "message",
     meta: Optional[dict[str, Any]] = None,
+    created_at: Optional[int] = None,
 ) -> dict[str, Any]:
     message = {
         "id": f"msg_{uuid.uuid4().hex[:14]}",
@@ -16524,7 +16574,7 @@ def _append_message(
         "content": content,
         "status": status,
         "kind": kind,
-        "created_at": int(time.time() * 1000),
+        "created_at": int(created_at or time.time() * 1000),
     }
     if meta:
         message["meta"] = meta
@@ -16800,6 +16850,7 @@ class ConnectorStatusBody(BaseModel):
     actual_model: str = ""
     actual_provider: str = ""
     observed_at: str = ""
+    execution_state: str = ""
     # ``None`` distinguishes legacy connectors (which did not send steer
     # acknowledgements) from current connectors explicitly reporting an empty
     # acknowledgement set.  The distinction prevents a heartbeat from
@@ -17081,22 +17132,27 @@ def _apply_remote_checkpoint(
             )
         if cursor < current_cursor:
             return dict(remote_run), False
+        if cursor > current_cursor or status != current_status:
+            remote_run["execution_progress_at"] = now
+        # Same-cursor heartbeats omit tool snapshots. Preserve the last
+        # checkpoint instead of blanking a member's reasoning and tools.
+        heartbeat = cursor == current_cursor and status == current_status and not terminal
         remote_run.update(
             {
                 "status": status,
                 "checkpoint_cursor": cursor,
-                "summary": str(payload.get("summary") or "")[:20000],
-                "result": str(payload.get("result") or "")[:50000],
-                "error": str(payload.get("error") or "")[:4000],
-                "activities": _sanitize_remote_activities(payload.get("activities")),
-                "subagents": _sanitize_remote_subagents(payload.get("subagents")),
+                "summary": remote_run.get("summary", "") if heartbeat else str(payload.get("summary") or "")[:20000],
+                "result": remote_run.get("result", "") if heartbeat else str(payload.get("result") or "")[:50000],
+                "error": remote_run.get("error", "") if heartbeat else str(payload.get("error") or "")[:4000],
+                "activities": remote_run.get("activities", []) if heartbeat or "activities" not in payload else _sanitize_remote_activities(payload.get("activities")),
+                "subagents": remote_run.get("subagents", []) if heartbeat or "subagents" not in payload else _sanitize_remote_subagents(payload.get("subagents")),
                 "context_used_percent": _positive_int_or_none(
                     payload.get("context_used_percent")
                 ),
                 "updated_at": now,
             }
         )
-        for key in ("remote_task_id", "root_task_id", "session_id", "actual_model", "actual_provider"):
+        for key in ("remote_task_id", "root_task_id", "session_id", "actual_model", "actual_provider", "execution_state"):
             value = str(payload.get(key) or "").strip()
             if value:
                 remote_run[key] = value[:512]
@@ -17963,7 +18019,8 @@ def connector_status_run(remote_run_id: str, payload: ConnectorStatusBody, reque
     _rate_limit_connector(request, connector_id, "status")
     _remote_run_for_connector(request, remote_run_id)
     _validate_connector_claim(payload.connector_id, connector_id)
-    checkpoint_payload = payload.model_dump()
+    checkpoint_payload = payload.model_dump(exclude_unset=True)
+    checkpoint_payload.update(status=payload.status, terminal=payload.terminal, connector_id=payload.connector_id)
     if payload.applied_steer_ids is None:
         # Preserve the pre-ack behavior for old connectors that omit this
         # field entirely. Current connectors send [] or a concrete list.
@@ -27756,6 +27813,7 @@ class MobileHostedCommandBody(BaseModel):
     command: str = Field(max_length=32)
     text: str = Field(default="", max_length=64_000)
     value: str = Field(default="", max_length=64)
+    confirm_expensive_model: bool = False
 
 
 def _persist_mobile_gateway_event(
@@ -27848,7 +27906,7 @@ def mobile_hosted_command(
     command = str(body.command or "").strip().lower().lstrip("/")
     aliases = {"background": "bg", "side-question": "btw", "side_question": "btw"}
     command = aliases.get(command, command)
-    if command not in {"bg", "btw", "busy"}:
+    if command not in {"bg", "btw", "busy", "model"}:
         raise HTTPException(status_code=422, detail="Unsupported hosted command")
     profile = str(conversation.get("profile") or "default").strip() or "default"
     runtime_context = {
@@ -27857,6 +27915,19 @@ def mobile_hosted_command(
     }
     runtime_home = _hosted_runtime_home(profile, runtime_context)
     artifact_root = str(get_hermes_home())
+    if command == "model":
+        selection = str(body.text or "").strip()
+        if not selection or len(selection) > 512:
+            raise HTTPException(status_code=422, detail="A configured model selection is required")
+        result = run_hosted_gateway_command(
+            method="config.set",
+            params={"key": "model", "value": selection,
+                    "confirm_expensive_model": body.confirm_expensive_model},
+            runtime_home=runtime_home, owner_id=owner_id,
+            account_generation=account_generation, conversation_id=conversation_id,
+            profile=profile, artifact_root=artifact_root, import_root=_RUNTIME_IMPORT_ROOT,
+        )
+        return {**result, "accepted": not bool(result.get("confirm_required")), "command": command}
     if command == "busy":
         value = str(body.value or body.text or "").strip().lower()
         if value not in {"status", "queue", "steer", "interrupt"}:

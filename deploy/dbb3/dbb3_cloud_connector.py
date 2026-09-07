@@ -2921,6 +2921,7 @@ class DBB3CloudConnector:
             "actual_model": actual_model,
             "actual_provider": actual_provider,
             "observed_at": self.clock(),
+            "execution_state": raw_status,
             # Steer acks: which durable steers this connector has applied.
             # The server keeps unapplied pending_steers for the next pull
             # instead of dropping a second answer that arrived while the
