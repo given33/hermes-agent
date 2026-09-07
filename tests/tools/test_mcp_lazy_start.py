@@ -78,8 +78,12 @@ class TestLazyMcpRegistration:
         loop.assert_not_called()
         run.assert_not_called()
 
-    def test_registers_from_cache_without_connect(self):
+    @pytest.mark.parametrize("worker", [False, True])
+    def test_registers_from_cache_without_connect(self, monkeypatch, worker):
         config = _lazy_config()
+        if worker:
+            monkeypatch.setenv("HERMES_KANBAN_TASK", "t_assigned")
+            config["playwright"].pop("lazy")
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_schema_cache.config_fingerprint", return_value="abc"), \
              patch("tools.mcp_schema_cache.get_cached_entry", return_value=_fake_cache_entry()), \
@@ -98,8 +102,12 @@ class TestLazyMcpRegistration:
         mock_run.assert_not_called()
         mock_loop.assert_not_called()
 
-    def test_cache_miss_falls_back_to_eager_connect(self):
+    @pytest.mark.parametrize("worker", [False, True])
+    def test_cache_miss_falls_back_to_eager_connect(self, monkeypatch, worker):
         config = _lazy_config()
+        if worker:
+            monkeypatch.setenv("HERMES_KANBAN_TASK", "t_assigned")
+            config["playwright"].pop("lazy")
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_schema_cache.config_fingerprint", return_value="abc"), \
              patch("tools.mcp_schema_cache.get_cached_entry", return_value=None), \
@@ -339,6 +347,12 @@ class TestCacheLoadDescriptionScan:
 
 
 class TestResolveServerLazy:
+    def test_worker_honors_explicit_eager_setting(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_assigned")
+        assert mcp._resolve_server_lazy("s", {"command": "npx"}) is True
+        assert mcp._resolve_server_lazy("s", {"command": "npx", "lazy": False}) is False
+        assert mcp._resolve_server_lazy("s", {"command": "npx", "lazy_start": False}) is False
+
     def test_default_off(self):
         assert mcp._resolve_server_lazy("s", {"command": "npx"}) is False
 

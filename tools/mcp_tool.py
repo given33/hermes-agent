@@ -5908,11 +5908,16 @@ def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
 def _resolve_server_lazy(name: str, config: dict) -> bool:
     """True when this server defers spawn/connect until first tool use.
 
-    Gated per-server by ``mcp_servers.<name>.lazy`` in config (default OFF),
-    following the same per-server key pattern as ``idle_timeout_seconds``.
-    Design from #56832 (Vansh5632).
+    Per-server settings take precedence. Short-lived Kanban workers reuse a
+    valid profile-local schema cache by default so unrelated MCP processes do
+    not delay every assignment. A cache miss still performs normal discovery;
+    the first real tool call still connects and checks the live server.
     """
-    return _parse_boolish(config.get("lazy", config.get("lazy_start", False)), default=False)
+    worker_default = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    return _parse_boolish(
+        config.get("lazy", config.get("lazy_start", worker_default)),
+        default=worker_default,
+    )
 
 
 def _ensure_lazy_server_connected(server_name: str) -> bool:
