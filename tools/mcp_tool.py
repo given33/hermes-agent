@@ -5929,6 +5929,8 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     cooldown bookkeeping stays in one place. Returns True when a live
     session is available afterwards.
     """
+    if not _ensure_mcp_sdk():
+        return False
     with _lock:
         server = _servers.get(server_name)
         if server is not None and server.session is not None:
@@ -7659,7 +7661,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     Returns:
         List of all currently registered MCP tool names.
     """
-    if not _ensure_mcp_sdk():
+    if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
 
@@ -7774,6 +7776,13 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 "(no processes spawned)",
                 lazy_registered,
             )
+        return _existing_tool_names()
+
+    # Cached schemas are plain JSON and need no SDK transport or Pydantic
+    # model construction. Load those only for an actual connection.
+    if not _ensure_mcp_sdk():
+        with _lock:
+            _server_connecting.difference_update(new_servers)
         return _existing_tool_names()
 
     # Start the background event loop for MCP connections
@@ -8026,9 +8035,9 @@ def discover_mcp_tools(
         logger.debug("No MCP servers configured")
         return []
 
-    # SDK import is deferred to HERE so a config with zero MCP servers (the
-    # default) never pays the ~260ms `mcp` import on CLI startup.
-    if not _ensure_mcp_sdk():
+    # Cache-backed discovery can advertise tools without importing the SDK.
+    # The eager and first-use connection paths perform the actual import.
+    if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
 

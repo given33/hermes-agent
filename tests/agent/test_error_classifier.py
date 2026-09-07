@@ -580,6 +580,16 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_fallback is False
 
+    @pytest.mark.parametrize("message", [
+        "No endpoints found for nvidia/nemotron-nano-9b-v2:free.",
+        "This model is unavailable for free. The paid version is available now.",
+    ])
+    def test_unavailable_openrouter_model_does_not_repeat_the_same_request(self, message):
+        result = classify_api_error(MockAPIError(message, status_code=404), provider="openrouter")
+        assert result.reason == FailoverReason.model_not_found
+        assert result.should_fallback is True
+        assert result.retryable is False
+
     def test_404_bare_model_id_missing_prefix_is_model_not_found(self):
         """A bare id the provider only serves as ``vendor/id`` is malformed.
 
@@ -1578,5 +1588,4 @@ class TestServerInjectedParameterRejection:
         result = classify_api_error(e, provider="custom", model="m")
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
-
 

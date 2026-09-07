@@ -73,3 +73,23 @@ def test_connector_assignment_uses_its_owned_board_without_second_triage():
     command = build_root_task_command({"profile": "dbb3-worker", "board": "hosted-test", "objective": "Read report"})
     assert "--triage" not in command
     assert command[command.index("kanban") + 1:command.index("kanban") + 3] == ["--board", "hosted-test"]
+    selected = build_root_task_command({"profile": "pc-worker", "objective": "Read report",
+        "model_override": "selected-model", "provider_override": "custom:configured"})
+    assert selected[selected.index("--model") + 1] == "selected-model"
+    assert selected[selected.index("--provider") + 1] == "custom:configured"
+
+
+def test_worker_api_errors_stream_without_provider_secrets_or_fake_reasoning(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_retry")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    plugin = _load("worker_stream_retry", "plugins/collaboration/worker-stream/__init__.py")
+    hooks = {}
+    plugin.register(SimpleNamespace(register_hook=lambda name, callback: hooks.setdefault(name, callback)))
+    hooks["api_request_error"](session_id="s", status_code=404, retry_count=0,
+        max_retries=5, retryable=False, error={"message": "secret account details"})
+    records = [json.loads(line) for line in (tmp_path / "collaboration-streams/t_retry.jsonl").read_text().splitlines()]
+    assert records[0]["type"] == "connection.retry"
+    assert records[0]["payload"]["status_code"] == 404
+    assert "备用模型" in records[0]["payload"]["message"]
+    assert "secret" not in json.dumps(records)

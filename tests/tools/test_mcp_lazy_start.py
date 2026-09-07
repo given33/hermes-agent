@@ -85,6 +85,7 @@ class TestLazyMcpRegistration:
             monkeypatch.setenv("HERMES_KANBAN_TASK", "t_assigned")
             config["playwright"].pop("lazy")
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_tool._ensure_mcp_sdk", side_effect=AssertionError("Cached discovery must not import the transport SDK")), \
              patch("tools.mcp_schema_cache.config_fingerprint", return_value="abc"), \
              patch("tools.mcp_schema_cache.get_cached_entry", return_value=_fake_cache_entry()), \
              patch(

@@ -9999,7 +9999,7 @@ def apply_profile_event(
             activities.append(activity)
         activity.update(
             {
-                "name": f"正在重新连接 ({attempt}/{max_attempts})",
+                "name": str(payload.get("message") or f"正在重新连接 ({attempt}/{max_attempts})")[:160],
                 # Intermediate causes stay server-side. The fifth failure is
                 # persisted once as the terminal assistant error.
                 "output": "",
@@ -13482,6 +13482,8 @@ def _remote_run_public(remote_run: dict[str, Any]) -> dict[str, Any]:
             "local_task_id",
             "attempt",
             "max_runtime_seconds",
+            "model_override",
+            "provider_override",
             "deadline_at",
             "artifact_required",
             "created_at",
@@ -13973,6 +13975,10 @@ def _ensure_remote_run(
             "updated_at": now,
         }
         record["deadline_at"] = deadline_at
+        binding = hosted.get("runtime_binding")
+        if isinstance(binding, dict) and binding.get("model") and binding.get("provider"):
+            record["model_override"] = str(binding["model"])[:256]
+            record["provider_override"] = str(binding["provider"])[:128]
         remote_runs[role_stage] = record
         save_single_state(state)
     # The durable remote-run record is authoritative.  When the matching
@@ -21061,6 +21067,7 @@ def enqueue_hosted_turn(
                 output_dir=str(output_dir),
                 attachment_ids=attachment_ids,
             )
+            hosted["runtime_binding"] = dict(runtime_binding)
             if slash_directive:
                 # Persist the directive on the run record itself: the router
                 # may rewrite route_metadata, and the workflow must not lose

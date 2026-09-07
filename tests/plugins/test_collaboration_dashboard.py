@@ -495,7 +495,7 @@ def test_connector_pull_exposes_worker_runs_and_rejects_non_worker_runs():
     module._account_generation_for_owner = lambda _owner: "generation-1"
 
     def enqueue(turn_id, profile, role_stage):
-        module.create_hosted_turn_record(
+        hosted = module.create_hosted_turn_record(
             conversation,
             turn_id=turn_id,
             content="execute",
@@ -503,6 +503,7 @@ def test_connector_pull_exposes_worker_runs_and_rejects_non_worker_runs():
             profiles=[profile],
             artifact_required=False,
         )
+        hosted["runtime_binding"] = {"provider": "custom:configured", "model": "selected-model"}
         return module._ensure_remote_run(
             conversation["id"],
             turn_id,
@@ -530,6 +531,8 @@ def test_connector_pull_exposes_worker_runs_and_rejects_non_worker_runs():
 
     pulled_ids = {item["remote_run_id"] for item in pulled["runs"]}
     assert worker["id"] in pulled_ids
+    assert pulled["runs"][0]["model_override"] == "selected-model"
+    assert pulled["runs"][0]["provider_override"] == "custom:configured"
     with pytest.raises(RuntimeError, match="requires a worker profile"):
         module._ensure_remote_run(
             conversation["id"],

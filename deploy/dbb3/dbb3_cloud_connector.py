@@ -2068,6 +2068,12 @@ def build_root_task_command(run_payload: dict[str, Any]) -> list[str]:
         board=_text(run_payload.get("board"), 128),
     )
     max_runtime = run_payload.get("max_runtime_seconds")
+    model = _text(run_payload.get("model_override"), 256)
+    provider = _text(run_payload.get("provider_override"), 128)
+    if model:
+        command.extend(["--model", model])
+        if provider:
+            command.extend(["--provider", provider])
     try:
         if max_runtime:
             command.extend(["--max-runtime", f"{max(60, int(max_runtime))}s"])
@@ -2657,6 +2663,8 @@ class DBB3CloudConnector:
                     workspace_kind="dir" if workspace else "scratch", workspace_path=workspace,
                     idempotency_key=_text(run_payload.get("idempotency_key"), 512) or None,
                     max_runtime_seconds=maximum,
+                    model_override=_text(run_payload.get("model_override"), 256) or None,
+                    provider_override=_text(run_payload.get("provider_override"), 128) or None,
                 )
         code, output = self.command_runner(build_root_task_command(run_payload), timeout=60)
         if code != 0:
@@ -3552,7 +3560,24 @@ class DBB3CloudConnector:
             detail = {}
         task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
         local_task_status = _text(task.get("status"), 64).lower()
-        if local_task_status in {
+        if (self.command_runner is run and self.cancel_command == _DEFAULT_CANCEL_COMMAND
+                and local_task_status in {"running", "ready"}):
+            # `kanban block` changes the row but does not stop its process.
+            # Stop the exact host-owned worker before releasing its claim;
+            # otherwise API retries can continue after cancellation is ACKed.
+            from hermes_cli import kanban_db
+            pid = task.get("worker_pid")
+            if pid:
+                stopped = kanban_db._terminate_reclaimed_worker(pid, task.get("claim_lock"))
+                if not stopped.get("host_local") or not stopped.get("terminated"):
+                    return 0
+            with kanban_db.connect_closing(board=_text(local.get("board"), 128) or None) as connection:
+                blocked = kanban_db.block_task(connection, root_id, reason=reason,
+                    expected_run_id=task.get("current_run_id"))
+                fresh = kanban_db.get_task(connection, root_id)
+            code = 0 if blocked or (fresh and fresh.status in {"blocked", "done", "failed"}) else 1
+            output = reason
+        elif local_task_status in {
             "blocked", "cancelled", "canceled", "done", "completed", "failed",
         }:
             code, output = 0, _text(

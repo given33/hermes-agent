@@ -419,6 +419,8 @@ _MODEL_NOT_FOUND_PATTERNS = [
     # and the error surfaces as a confusing "model not found" message
     # instead of automatically failing over.  See PR #58446.
     "no endpoints found that support tool use",
+    "no endpoints found for ",
+    "this model is unavailable for free",
 ]
 
 

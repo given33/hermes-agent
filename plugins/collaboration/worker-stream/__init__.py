@@ -51,6 +51,19 @@ def _delta(delta="", kind="text", session_id="", iteration=0, **_):
                    "entity_id": f"{session_id}:{iteration}:{kind}"})
 
 
+def _api_error(session_id="", status_code=None, retry_count=None, max_retries=None, retryable=None, reason=None, **_):
+    # Observe the official error hook immediately. Raw provider errors may
+    # contain credentials or account data; emit only bounded status metadata.
+    labels = {401: "模型账号未激活或认证失败", 402: "模型账户额度不足",
+              403: "模型访问被拒绝", 404: "模型或接口不可用", 429: "模型请求受到限流"}
+    code = status_code if isinstance(status_code, int) else 0
+    label = labels.get(code, "模型请求暂时失败")
+    _emit("connection.retry", {"session_id": session_id,
+        "attempt": max(1, int(retry_count or 0) + 1), "max_attempts": max(1, int(max_retries or 1)),
+        "retryable": retryable, "status_code": code,
+        "message": label + ("，正在尝试已配置的备用模型" if retryable is False else "，正在恢复连接")})
+
+
 def _tool_start(tool_name="", args=None, tool_call_id="", session_id="", task_id="", **_):
     key = tool_call_id or f"{session_id}:{task_id}:{tool_name}"
     started = int(time.time() * 1000)
@@ -85,5 +98,6 @@ def register(ctx):
         return
     ctx.register_hook("on_stream_start", _start)
     ctx.register_hook("on_stream_delta", _delta)
+    ctx.register_hook("api_request_error", _api_error)
     ctx.register_hook("pre_tool_call", _tool_start)
     ctx.register_hook("post_tool_call", _tool_complete)

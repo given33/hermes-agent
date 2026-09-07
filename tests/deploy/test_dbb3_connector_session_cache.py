@@ -16,14 +16,43 @@ def test_direct_kanban_creation_and_observation_preserve_task_contract(monkeypat
     kanban_db.create_board("hosted-test", name="Test assignments")
     connector = connector_module.DBB3CloudConnector(SimpleNamespace(), state_file=tmp_path / "state.json")
     payload = {"board": "hosted-test", "objective": "Run the assigned command", "title": "Assigned task",
-               "profile": "default", "remote_run_id": "run-test", "idempotency_key": "one-assignment"}
+               "profile": "default", "remote_run_id": "run-test", "idempotency_key": "one-assignment",
+               "model_override": "selected-model", "provider_override": "custom:configured"}
     task_id = connector._create_root(payload)
     assert connector._create_root(payload) == task_id
     observed = connector._show_task(task_id, payload)
     assert observed["task"]["body"].startswith("Run the assigned command")
     assert observed["task"]["assignee"] == "default"
     assert observed["task"]["status"] == "ready"
+    assert observed["task"]["model_override"] == "selected-model"
+    assert observed["task"]["provider_override"] == "custom:configured"
     assert observed["runs"] == []
+
+
+def test_cancellation_waits_for_the_actual_worker_to_stop(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kanban_db.create_board("hosted-cancel", name="Cancel check")
+    acknowledgements = []
+    cloud = SimpleNamespace(connector_id="pc-primary", acknowledge_cancel=lambda *args:
+        acknowledgements.append(args) or {"run": {"status": "cancelled"}})
+    connector = connector_module.DBB3CloudConnector(cloud, state_file=tmp_path / "state.json")
+    task_id = connector._create_root({"board": "hosted-cancel", "profile": "default", "objective": "check"})
+    state = {"runs": {"r": {"root_task_id": task_id, "board": "hosted-cancel"}}}
+    detail = connector._show_task(task_id, state["runs"]["r"])
+    detail["task"].update(status="running", worker_pid=123, claim_lock="owned")
+    monkeypatch.setattr(connector, "_show_task", lambda *args: detail)
+    monkeypatch.setattr(kanban_db, "_terminate_reclaimed_worker", lambda *args:
+        {"host_local": True, "terminated": False})
+    assert connector._process_cancellation({"remote_run_id": "r"}, state) == 0
+    assert not acknowledgements
+    monkeypatch.setattr(kanban_db, "_terminate_reclaimed_worker", lambda *args:
+        {"host_local": True, "terminated": True})
+    assert connector._process_cancellation({"remote_run_id": "r"}, state) == 1
+    assert len(acknowledgements) == 1
+    assert state["runs"]["r"]["cancel_acked"]
+    with kanban_db.connect_closing(board="hosted-cancel") as connection:
+        assert kanban_db.get_task(connection, task_id).status == "blocked"
 
 
 def test_execution_stream_enable_uses_official_atomic_config_api(monkeypatch, tmp_path):
