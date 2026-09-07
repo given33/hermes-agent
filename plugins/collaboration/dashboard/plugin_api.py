@@ -775,6 +775,16 @@ def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
                 previous = _HOSTED_LIVE_CONVERSATIONS.get(conversation_id)
                 if previous is not None:
                     _merge_published_hosted_events(snapshot, previous)
+            # Checkpoint the same ledger clients have already consumed. Saving
+            # an older cursor makes subsequent HTTP snapshots lag forever.
+            for item in state.get("conversations") or []:
+                snapshot = snapshots.get(str(item.get("id") or "")) if isinstance(item, dict) else None
+                if snapshot is None:
+                    continue
+                for key in ("hosted_events", "hosted_event_cursor", "hosted_event_min_cursor",
+                            "hosted_event_sequences", "hosted_event_terminals"):
+                    if key in snapshot:
+                        item[key] = deepcopy(snapshot[key])
             _HOSTED_LIVE_CONVERSATIONS.clear()
             _HOSTED_LIVE_CONVERSATIONS.update(snapshots)
         pub.attr("conversations", len(snapshots))
@@ -792,11 +802,14 @@ def _merge_published_hosted_events(snapshot: dict[str, Any], previous: dict[str,
     events = list(previous.get("hosted_events") or [])
     if not events:
         return
-    keys = {str(event.get("idempotency_key") or event.get("event_id")) for event in events}
+    def event_key(event):
+        return (event.get("turn_id"), event.get("role_stage"),
+                str(event.get("idempotency_key") or event.get("event_id")))
+    keys = {event_key(event) for event in events}
     cursor = int(previous.get("hosted_event_cursor") or 0)
     sequences = dict(previous.get("hosted_event_sequences") or {})
     for event in snapshot.get("hosted_events") or []:
-        key = str(event.get("idempotency_key") or event.get("event_id"))
+        key = event_key(event)
         if key in keys:
             continue
         cursor += 1
@@ -10278,7 +10291,9 @@ def _persist_hosted_role_state(
         },
     }
     pending_protocol_events = [
-        {**dict(item), "role_stage": role_stage}
+        {**dict(item), "role_stage": role_stage,
+         "idempotency_key": f"{turn_id}:{role_stage}:{item['idempotency_key']}"
+         if item.get("idempotency_key") else ""}
         for item in state.get("_protocol_events") or []
         if isinstance(item, dict)
     ]

@@ -1128,6 +1128,8 @@ def test_background_checkpoint_cannot_rewind_live_tokens_or_reuse_their_cursor()
     project(1)
     first = deepcopy(module._live_conversation_snapshot(conversation["id"], "owner"))
     module._publish_live_conversations(state)
+    assert conversation["hosted_event_cursor"] == first["hosted_event_cursor"]
+    assert conversation["hosted_events"] == first["hosted_events"]
     project(2)
     live = module._live_conversation_snapshot(conversation["id"], "owner")
     assert [event["payload"]["text"] for event in live["hosted_events"]] == ["1", "2"]
@@ -1139,6 +1141,21 @@ def test_background_checkpoint_cannot_rewind_live_tokens_or_reuse_their_cursor()
                               idempotency_key="delta-1", payload={"text": "1"})
     module._publish_live_conversations(state)
     assert len(module._live_conversation_snapshot(conversation["id"], "owner")["hosted_events"]) == 2
+    assert conversation["hosted_event_cursor"] == 2
+
+
+def test_checkpoint_does_not_deduplicate_different_turns_with_legacy_event_keys():
+    module = _load_module()
+    def conversation(turn):
+        return {"owner_id": "owner", "account_generation": "g", "hosted_event_cursor": 1,
+                "hosted_events": [{"turn_id": turn, "role_stage": "chat", "cursor": 1,
+                                   "sequence": 1, "idempotency_key": "profile-event:1:thinking.delta"}],
+                "hosted_event_sequences": {f"{turn}:chat": 1}}
+    previous = conversation("first")
+    snapshot = conversation("second")
+    module._merge_published_hosted_events(snapshot, previous)
+    assert [event["turn_id"] for event in snapshot["hosted_events"]] == ["first", "second"]
+    assert snapshot["hosted_event_cursor"] == 2
 
 
 def test_empty_intervention_check_does_not_block_gateway_event_dispatch(monkeypatch):
