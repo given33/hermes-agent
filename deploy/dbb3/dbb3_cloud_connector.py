@@ -642,13 +642,17 @@ def _iter_sse_events(response: Any) -> Iterable[tuple[str | None, str, str]]:
 
 
 class _FileBody:
-    """File-like request body accepted by urllib without base64 buffering."""
+    """Stream file uploads without base64 buffering."""
 
     def __init__(self, path: Path) -> None:
         self._handle = path.open("rb")
 
     def read(self, size: int = -1) -> bytes:
         return self._handle.read(size)
+
+    def __iter__(self):
+        while chunk := self.read(64 * 1024):
+            yield chunk
 
     def close(self) -> None:
         self._handle.close()
@@ -696,6 +700,13 @@ class CloudRelayClient:
         self._stream_ws: Any | None = None
         self._worker_runtime_provider: Callable[[], dict[str, Any]] | None = None
         self._ssl_context = ssl.create_default_context()
+        import httpx
+        self._http = httpx.Client(verify=self._ssl_context, timeout=self.timeout,
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=8, keepalive_expiry=60))
+
+    def close(self) -> None:
+        self.close_stream()
+        self._http.close()
 
     def _default_worker_node_id(self) -> str:
         normalized = self.connector_id.lower()
@@ -782,6 +793,7 @@ class CloudRelayClient:
         body_path: Path | None = None,
         headers: dict[str, str] | None = None,
     ) -> Any:
+        import httpx
         body: bytes | None = None
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -799,24 +811,23 @@ class CloudRelayClient:
                 request_headers["Content-Type"] = "application/json; charset=utf-8"
             if body_path is not None:
                 request_headers.setdefault("Content-Length", str(body_path.stat().st_size))
-            request = urllib.request.Request(
-                self.base_url + path,
-                data=body if payload is not None else file_body,
-                method=method,
-                headers=request_headers,
-            )
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout, context=self._ssl_context) as response:
-                    return _json_body(response.read())
-            except urllib.error.HTTPError as exc:
-                detail = exc.read(4096).decode("utf-8", "replace")
-                if exc.code == 401 and attempt == 0 and self._reload_token():
+                response = self._http.request(method, self.base_url + path,
+                    content=body if payload is not None else file_body, headers=request_headers)
+                if 200 <= response.status_code < 300:
+                    return _json_body(response.content)
+                detail = response.content[:4096].decode("utf-8", "replace")
+                if response.status_code == 401 and attempt == 0 and self._reload_token():
                     continue
-                if exc.code == 401:
-                    raise ConnectorAuthError(exc.code, detail) from exc
-                if exc.code in {409, 422}:
-                    raise ConnectorContractError(exc.code, detail) from exc
-                raise CloudHTTPError(exc.code, detail) from exc
+                if response.status_code == 401:
+                    raise ConnectorAuthError(response.status_code, detail)
+                if response.status_code in {409, 422}:
+                    raise ConnectorContractError(response.status_code, detail)
+                raise CloudHTTPError(response.status_code, detail)
+            except httpx.RequestError as exc:
+                # Preserve the retry contract at the durable queue boundary;
+                # a dropped connection must not silently replay a mutation.
+                raise urllib.error.URLError(str(exc)) from exc
             except (OSError, urllib.error.URLError):
                 raise
             finally:
@@ -2190,6 +2201,9 @@ class DBB3CloudConnector:
         execution_stream = self._execution_stream_thread
         if execution_stream is not None and execution_stream is not threading.current_thread():
             execution_stream.join(timeout=max(0.0, timeout))
+        close_client = getattr(self.cloud_client, "close", None)
+        if callable(close_client):
+            close_client()
 
     def _watch_execution(self, local: dict[str, Any]) -> None:
         if self.command_runner is not run or not callable(getattr(self.cloud_client, "report_events", None)):
@@ -2937,7 +2951,8 @@ class DBB3CloudConnector:
         from hermes_cli import kanban_db
         with kanban_db.connect_closing(board=board) as connection:
             kanban_db.dispatch_once(connection, board=board, max_spawn=1,
-                                   max_in_progress=1, max_in_progress_per_profile=1)
+                max_in_progress=kanban_db.resolve_max_in_progress(kanban_db.configured_max_in_progress()),
+                max_in_progress_per_profile=1)
 
     def _compact_status(self, detail: dict[str, Any], local: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
@@ -3135,6 +3150,8 @@ class DBB3CloudConnector:
         permanent_errors: list[str] = []
         transient_failure = False
         root_id = _text(local.get("root_task_id"), 256)
+        if not any(self._allowed_artifact(path) is not None for path in paths):
+            return 0, False, [f"Artifact is missing or outside allowed roots: {path}" for path in paths], False
         try:
             existing_attachments = self.cloud_client.list_run_attachments(remote_id)
         except (CloudHTTPError, ConnectorContractError, OSError, urllib.error.URLError):
@@ -3678,8 +3695,10 @@ class DBB3CloudConnector:
                     for path in local.get("artifact_paths") or []
                     if _text(path, 2048)
                 ]
-                if artifact_paths and not _coerce_flag(local.get("artifacts_synced")):
-                    uploaded, complete, _errors, _transient = self._upload_artifacts(
+                if (artifact_paths and not _coerce_flag(local.get("artifacts_synced"))
+                        and not self._wake_event.is_set()
+                        and time.time() >= float(local.get("artifact_retry_after") or 0)):
+                    uploaded, complete, errors, transient = self._upload_artifacts(
                         remote_id,
                         local,
                         artifact_paths,
@@ -3688,7 +3707,11 @@ class DBB3CloudConnector:
                     artifacts += uploaded
                     if complete:
                         local["artifacts_synced"] = True
-                        self.checkpoints.save(state)
+                        local.pop("artifact_retry_after", None)
+                    else:
+                        local["artifact_retry_after"] = time.time() + (30 if transient else 300)
+                        local["artifact_errors"] = errors
+                    self.checkpoints.save(state)
                 continue
             try:
                 made, uploaded = self._sync_local_run(remote_id, local, state)
