@@ -60,6 +60,17 @@ def test_official_worker_hooks_publish_before_tool_completion_and_replay(monkeyp
         events=[{**final, "cursor": 5}]), SimpleNamespace())
     assert stream["activities"][1]["status"] == "failed"
     assert stream["activities"][1]["error"] == "Permission denied"
+    # A retry and the following real tokens may share a transport batch.
+    # Accept both, and reject invalid batches without consuming half of one.
+    invalid = [{"cursor": 6, "type": "message.delta", "payload": {"text": "lost"}},
+               {"cursor": 7, "type": "unknown", "payload": {}}]
+    with pytest.raises(api.HTTPException):
+        api.connector_stream_run("r", body.model_copy(update={"events": invalid}), SimpleNamespace())
+    assert stream["remote_stream_cursor"] == 5
+    retry = [{"cursor": 6, "type": "connection.retry", "payload": {"message": "模型请求受到限流"}},
+             {"cursor": 7, "type": "message.delta", "payload": {"text": "Recovered"}}]
+    assert api.connector_stream_run("r", body.model_copy(update={"events": retry}), SimpleNamespace())["cursor"] == 7
+    assert stream["content"] == "Recovered"
     with pytest.raises(api.HTTPException) as error:
         api.connector_stream_run("r", body.model_copy(update={"claim_token": "old"}), SimpleNamespace())
     assert error.value.status_code == 409

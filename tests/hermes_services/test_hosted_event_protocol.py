@@ -18,6 +18,19 @@ def _conversation() -> dict:
     }
 
 
+def test_json_snapshot_preserves_json_coercion_and_mutation_isolation():
+    from hermes_services.hosted_event_protocol import _json_copy, HostedEventProtocolError
+    text = "long immutable transcript " * 1000
+    source = {"messages": [{"text": text}]}
+    cloned = _json_copy(source)
+    assert cloned["messages"][0]["text"] is text
+    cloned["messages"].append({})
+    assert len(source["messages"]) == 1
+    assert _json_copy({1: (True, None)}) == {"1": [True, None]}
+    with pytest.raises(HostedEventProtocolError):
+        _json_copy({"bad": object()})
+
+
 def test_progress_is_idempotent_and_rejected_after_terminal():
     conversation = _conversation()
     first = append_hosted_event(

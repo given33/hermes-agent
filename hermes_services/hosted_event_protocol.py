@@ -1297,6 +1297,25 @@ def _sanitize_runtime_refs(values: Iterable[Any], kind: str) -> tuple[str, ...]:
 
 
 def _json_copy(value: Any) -> Any:
+    # Transcripts are already JSON values. Copy their mutable containers
+    # without encoding and decoding every immutable token on each checkpoint.
+    # Unusual inputs still use JSON's exact coercion/validation rules below.
+    def clone(item):
+        kind = type(item)
+        if kind is dict:
+            if not all(type(key) is str for key in item):
+                raise TypeError
+            return {key: clone(child) for key, child in item.items()}
+        if kind is list:
+            return [clone(child) for child in item]
+        if item is None or kind in (str, int, float, bool):
+            return item
+        raise TypeError
+
+    try:
+        return clone(value)
+    except (TypeError, RecursionError):
+        pass
     try:
         return json.loads(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
     except (TypeError, ValueError) as exc:

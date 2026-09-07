@@ -4271,6 +4271,17 @@ def save_single_state(state: dict[str, Any], path: Optional[Path] = None) -> Non
                 "conversations",
                 previous_state=previous_state,
             )
+            if fast_loaded_state and not state.get("_hosted_event_persistence_outbox"):
+                # Reuse the just-committed normalized document. Fingerprints
+                # still invalidate this cache if another process replaces it.
+                fingerprint = _single_state_fingerprint(Path(target))
+                if fingerprint is not None:
+                    snapshot = _copy_state_document(state)
+                    with _SINGLE_STATE_CACHE_LOCK:
+                        for dispatch in (False, True):
+                            key = _single_state_cache_key(Path(target), dispatch)
+                            if key is not None:
+                                _SINGLE_STATE_CACHE[key] = (fingerprint, snapshot)
             if path is None:
                 _STATE_THREAD_LOCAL.last_single_state = None
 
@@ -18264,6 +18275,12 @@ def connector_stream_run(remote_run_id: str, body: ConnectorStreamBody, request:
             stream["_protocol_events"] = []
             _REMOTE_STREAM_STATES[remote_run_id] = stream
         cursor = int(stream.get("remote_stream_cursor") or 0)
+        # Validate the whole batch before advancing the cursor. A newly
+        # observed retry must not strand all later tokens behind a 422 loop.
+        allowed = {"request.accepted", "reasoning.delta", "message.delta",
+                   "tool.start", "tool.complete", "connection.retry"}
+        if any(str(item.get("type") or "") not in allowed for item in body.events):
+            raise HTTPException(status_code=422, detail="Unsupported worker event")
         expected = cursor + 1
         for item in body.events:
             sequence = int(item.get("cursor") or 0)
@@ -18279,8 +18296,6 @@ def connector_stream_run(remote_run_id: str, body: ConnectorStreamBody, request:
             if sequence != cursor + 1:
                 return {"cursor": cursor, "resync": True}
             event_type = str(item.get("type") or "")
-            if event_type not in {"request.accepted", "reasoning.delta", "message.delta", "tool.start", "tool.complete"}:
-                raise HTTPException(status_code=422, detail="Unsupported worker event")
             payload = _redact_sensitive(dict(item.get("payload") or {}))
             event = {"type": event_type, "payload": payload}
             if event_type == "tool.start":

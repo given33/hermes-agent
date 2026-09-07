@@ -1191,6 +1191,26 @@ def test_normalized_state_preserves_migration_marker_across_a_write(monkeypatch,
     assert module.load_single_state(path)[module._HOSTED_ROLE_MIGRATION_MARKER] == module._HOSTED_ROLE_MIGRATION_VERSION
 
 
+def test_committed_state_cache_isolated_and_invalidated_by_external_replace(monkeypatch, tmp_path):
+    module = _load_module()
+    path = tmp_path / "single.json"
+    monkeypatch.setattr(module, "single_state_path", lambda: path)
+    monkeypatch.setattr(module, "_persist_conversation_histories", lambda _: None)
+    module.save_single_state({"conversations": []})
+    state = module.load_single_state()
+    module.save_single_state(state)
+    original = module._read_state_document
+    monkeypatch.setattr(module, "_read_state_document", lambda *_: pytest.fail("reparsed committed state"))
+    loaded = module.load_single_state()
+    loaded["conversations"].append({"id": "not-saved"})
+    assert module.load_single_state()["conversations"] == []
+    monkeypatch.setattr(module, "_read_state_document", original)
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(json.dumps({"conversations": [{"id": "external", "messages": []}]}))
+    replacement.replace(path)
+    assert module.load_single_state()["conversations"][0]["id"] == "external"
+
+
 def test_single_agent_tool_request_is_not_promoted_to_a_team_due_to_command_length():
     module = _load_module()
     route = module._rule_based_user_intent(
