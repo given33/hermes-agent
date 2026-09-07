@@ -80,6 +80,12 @@ def digest_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def reusable_environment(original: Path, dependency_lock: Path) -> bool:
+    ready = original.resolve().parent / '.dependencies-ready'
+    return bool((original / 'bin/python').is_file() and ready.is_file()
+                and ready.read_text().strip() == digest_file(dependency_lock))
+
+
 def extract_runtime(archive: Path, destination: Path) -> dict[str, str]:
     files = {}
     with tarfile.open(archive) as source:
@@ -229,12 +235,19 @@ def main():
             raise ValueError('GitHub code version does not match the hub release')
         environment = generation / '.venv'
         original = root / node['environment']
-        if not environment.exists():
-            shutil.copytree(original.resolve(), environment, symlinks=True)
-        python = str(environment / 'bin/python')
         dependency_lock = generation / 'deploy/public/runtime-requirements.lock'
+        reuse_environment = reusable_environment(original, dependency_lock)
+        if not environment.exists():
+            if reuse_environment:
+                environment.symlink_to(original.resolve(), target_is_directory=True)
+            else:
+                shutil.copytree(original.resolve(), environment, symlinks=True, copy_function=shutil.copy)
+        reuse_environment = environment.is_symlink() and reuse_environment
+        python = str(environment / 'bin/python')
         ready = generation / '.dependencies-ready'
-        if not ready.exists() or ready.read_text().strip() != digest_file(dependency_lock):
+        if reuse_environment:
+            ready.write_text(digest_file(dependency_lock))
+        elif not ready.exists() or ready.read_text().strip() != digest_file(dependency_lock):
             if run([python, '-m', 'pip', '--version'], check=False).returncode:
                 run([python, '-m', 'ensurepip', '--upgrade'])
             result = run([python, '-m', 'pip', 'install', '--disable-pip-version-check', '--require-hashes',
@@ -243,7 +256,7 @@ def main():
             run([python, '-m', 'pip', 'install', '--no-deps', '-e', str(generation)], timeout=180)
             ready.write_text(digest_file(dependency_lock))
         environment_owner = original.stat()
-        for directory, subdirectories, filenames in os.walk(environment):
+        for directory, subdirectories, filenames in (() if reuse_environment else os.walk(environment)):
             os.chown(directory, environment_owner.st_uid, environment_owner.st_gid)
             for filename in subdirectories + filenames:
                 os.chown(Path(directory) / filename, environment_owner.st_uid, environment_owner.st_gid,
@@ -301,7 +314,8 @@ def main():
             # separately built dashboard assets. The candidate import check
             # above uses the isolated generation; activation binds its venv
             # to the now-verified stable code path.
-            run([python, '-m', 'pip', 'install', '--no-deps', '-e', str(root)], timeout=180)
+            if not reuse_environment:
+                run([python, '-m', 'pip', 'install', '--no-deps', '-e', str(root)], timeout=180)
             for name, destination in [(node['environment'], environment), ('.fabric-current', generation)]:
                 link = root / name
                 saved = link_backup / name

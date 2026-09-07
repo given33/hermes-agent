@@ -1112,6 +1112,42 @@ def test_gap_forces_authoritative_snapshot_even_for_incremental_frame():
     assert "conversation" in frame
 
 
+def test_background_checkpoint_cannot_rewind_live_tokens_or_reuse_their_cursor():
+    from copy import deepcopy
+    module = _load_module()
+    conversation = module.create_single_conversation(profile="default")
+    conversation.update(owner_id="owner", account_generation="generation")
+    module.create_hosted_turn_record(conversation, turn_id="t", content="hello", title="hello",
+                                    profiles=["default"], artifact_required=False, mode="chat")
+    state = {"conversations": [conversation]}
+    module._publish_live_conversations(state)
+    def project(index):
+        module._publish_live_hosted_role_projection(conversation["id"], "t", protocol_events=[{
+            "event_type": "message.delta", "payload": {"text": str(index)}, "entity_id": "m",
+            "idempotency_key": f"delta-{index}", "occurred_at": index, "role_stage": "chat"}])
+    project(1)
+    first = deepcopy(module._live_conversation_snapshot(conversation["id"], "owner"))
+    module._publish_live_conversations(state)
+    project(2)
+    live = module._live_conversation_snapshot(conversation["id"], "owner")
+    assert [event["payload"]["text"] for event in live["hosted_events"]] == ["1", "2"]
+    assert live["hosted_events"][0] == first["hosted_events"][0]
+    frame, _ = module._hosted_event_stream_frame(live, delivered_cursor=1, include_snapshot=False)
+    assert [event["payload"]["text"] for event in frame["events"]] == ["2"]
+    module.append_hosted_event(conversation, conversation_id=conversation["id"], turn_id="t",
+                              role_stage="chat", event_type="message.delta", entity_id="m",
+                              idempotency_key="delta-1", payload={"text": "1"})
+    module._publish_live_conversations(state)
+    assert len(module._live_conversation_snapshot(conversation["id"], "owner")["hosted_events"]) == 2
+
+
+def test_empty_intervention_check_does_not_block_gateway_event_dispatch(monkeypatch):
+    module = _load_module()
+    module._HOSTED_LIVE_CONVERSATIONS["c"] = {"hosted_turns": {"t": {"interventions": []}}}
+    monkeypatch.setattr(module, "_load_single_state_for_event_stream", lambda: pytest.fail("read durable state"))
+    assert module._pending_hosted_role_intervention("c", "t", role_stage="chat", profile="default") is None
+
+
 def test_future_hosted_cursor_returns_an_explicit_authoritative_reset():
     module = _load_module()
     conversation = module.create_single_conversation(profile="default")

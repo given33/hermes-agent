@@ -1017,14 +1017,15 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
                             _get_enabled_set,
                             _get_disabled_set,
                         )
-                        enabled_set = _get_enabled_set()
-                        disabled_set = _get_disabled_set()
+                        enabled_set, disabled_set = await asyncio.to_thread(
+                            lambda: (_get_enabled_set(), _get_disabled_set())
+                        )
                     except Exception:
                         enabled_set = set()
                         disabled_set = set()
                     # Determine plugin source.  Check the cached plugin list;
                     # if not found, assume user plugin (safe default — blocks).
-                    plugins = _get_dashboard_plugins()
+                    plugins = await asyncio.to_thread(_get_dashboard_plugins)
                     plugin = next(
                         (p for p in plugins if p.get("name") == plugin_name),
                         None,
@@ -3925,7 +3926,7 @@ async def get_status(profile: Optional[str] = None):
         status_scope.__enter__()
 
     try:
-        current_ver, latest_ver = check_config_version()
+        current_ver, latest_ver = await asyncio.to_thread(check_config_version)
         # --- Gateway liveness detection ---
         # Delegated to the single shared ladder in gateway.status so this
         # endpoint and /api/messaging/platforms can never disagree about

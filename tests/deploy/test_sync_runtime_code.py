@@ -101,3 +101,17 @@ def test_backup_retention_keeps_current_rollback_and_unrelated_data(updater, tmp
         assert (parent / 'profile').is_dir()
         assert len(list(parent.iterdir())) == 5
     assert updater.prune_backups(root, state, receipt) == []
+
+
+def test_code_only_update_reuses_only_a_verified_dependency_environment(updater, tmp_path):
+    environment = tmp_path / 'generation' / '.venv'
+    (environment / 'bin').mkdir(parents=True)
+    (environment / 'bin/python').write_text('python')
+    lock = tmp_path / 'requirements.lock'
+    lock.write_text('same dependencies')
+    assert not updater.reusable_environment(environment, lock)
+    ready = environment.parent / '.dependencies-ready'
+    ready.write_text(updater.digest_file(lock))
+    assert updater.reusable_environment(environment, lock)
+    lock.write_text('new dependencies')
+    assert not updater.reusable_environment(environment, lock)

@@ -771,10 +771,73 @@ def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
                 continue
             snapshots[conversation_id] = deepcopy(item)
         with _HOSTED_LIVE_STATE_LOCK:
+            for conversation_id, snapshot in snapshots.items():
+                previous = _HOSTED_LIVE_CONVERSATIONS.get(conversation_id)
+                if previous is not None:
+                    _merge_published_hosted_events(snapshot, previous)
             _HOSTED_LIVE_CONVERSATIONS.clear()
             _HOSTED_LIVE_CONVERSATIONS.update(snapshots)
         pub.attr("conversations", len(snapshots))
         return set(snapshots)
+
+
+def _merge_published_hosted_events(snapshot: dict[str, Any], previous: dict[str, Any]) -> None:
+    """Keep the stream cursor and uncheckpointed deltas across unrelated saves."""
+    if (snapshot.get("owner_id") != previous.get("owner_id")
+            or snapshot.get("account_generation") != previous.get("account_generation")
+            or snapshot.get("delete_requested")):
+        return
+    from hermes_services.hosted_event_protocol import MAX_RETAINED_EVENTS
+
+    events = list(previous.get("hosted_events") or [])
+    if not events:
+        return
+    keys = {str(event.get("idempotency_key") or event.get("event_id")) for event in events}
+    cursor = int(previous.get("hosted_event_cursor") or 0)
+    sequences = dict(previous.get("hosted_event_sequences") or {})
+    for event in snapshot.get("hosted_events") or []:
+        key = str(event.get("idempotency_key") or event.get("event_id"))
+        if key in keys:
+            continue
+        cursor += 1
+        scope = f"{event.get('turn_id')}:{event.get('role_stage')}"
+        sequence = int(sequences.get(scope) or 0) + 1
+        sequences[scope] = sequence
+        events.append({**event, "cursor": cursor, "sequence": sequence})
+        keys.add(key)
+    snapshot["hosted_events"] = events[-MAX_RETAINED_EVENTS:]
+    snapshot["hosted_event_cursor"] = cursor
+    snapshot["hosted_event_min_cursor"] = snapshot["hosted_events"][0]["cursor"]
+    snapshot["hosted_event_sequences"] = sequences
+    snapshot["hosted_event_terminals"] = {
+        **(previous.get("hosted_event_terminals") or {}),
+        **(snapshot.get("hosted_event_terminals") or {}),
+    }
+    # Control state (cancellation, interventions, membership) stays durable.
+    # Only retain a newer visible role projection while its checkpoint lags.
+    previous_turns = previous.get("hosted_turns") or {}
+    for turn_id, run in (snapshot.get("hosted_turns") or {}).items():
+        old_run = previous_turns.get(turn_id) or {}
+        if run.get("status") in _HOSTED_TERMINAL_STATUSES:
+            continue
+        roles = run.setdefault("role_events", {})
+        for stage, role in (old_run.get("role_events") or {}).items():
+            if int(role.get("updated_at") or 0) > int((roles.get(stage) or {}).get("updated_at") or 0):
+                roles[stage] = role
+    messages = snapshot.setdefault("messages", [])
+    by_key = {str((item.get("meta") or {}).get("message_key")): index
+              for index, item in enumerate(messages) if (item.get("meta") or {}).get("message_key")}
+    for item in previous.get("messages") or []:
+        meta = item.get("meta") or {}
+        key = str(meta.get("message_key") or "")
+        run = (snapshot.get("hosted_turns") or {}).get(str(meta.get("runtime_turn_id") or ""))
+        if not key or not run or run.get("status") in _HOSTED_TERMINAL_STATUSES:
+            continue
+        index = by_key.get(key)
+        if index is None:
+            messages.append(item)
+        elif int(item.get("updated_at") or 0) > int(messages[index].get("updated_at") or 0):
+            messages[index] = {**item, "id": messages[index]["id"]}
 
 
 def _live_conversation_snapshot(
@@ -6349,6 +6412,14 @@ def _pending_hosted_role_intervention(
     include_processing: bool = False,
     deliveries: Optional[set[str]] = None,
 ) -> Optional[dict[str, Any]]:
+    # Enqueue/intervention commits publish this immutable projection before
+    # returning. The common negative check must not queue behind disk writes
+    # on the gateway's single event-dispatch thread.
+    with _HOSTED_LIVE_STATE_LOCK:
+        live = _HOSTED_LIVE_CONVERSATIONS.get(conversation_id)
+        live_run = ((live or {}).get("hosted_turns") or {}).get(turn_id)
+        if isinstance(live_run, dict) and not live_run.get("interventions"):
+            return None
     with _STATE_LOCK:
         state = _load_single_state_for_event_stream()
         conversation = _conversation_by_id(state, conversation_id)
