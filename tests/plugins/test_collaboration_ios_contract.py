@@ -137,6 +137,36 @@ def test_listing_migrates_legacy_room_transcript_into_mobile_conversation_index(
     assert len(single_saves) == len(room_saves) == 1
 
 
+def test_unchanged_history_skips_full_merge_and_invalidates_on_disk_change(tmp_path, monkeypatch):
+    module = load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    conversation = {
+        "id": "chat_history_cache", "owner_id": "owner-a", "account_generation": "generation-a",
+        "messages": [{"id": f"m-{index}", "role": "assistant", "content": str(index)} for index in range(50)],
+        "session_entries": [],
+    }
+    state = {"conversations": [conversation]}
+    module._persist_conversation_histories(state)
+    original = module._write_conversation_history
+    calls = []
+
+    def write(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_write_conversation_history", write)
+    module._persist_conversation_histories(state)
+    assert not calls
+    conversation["messages"][-1]["content"] = "updated"
+    module._persist_conversation_histories(state)
+    assert len(calls) == 1
+    target = module._conversation_history_path(conversation["id"])
+    target.write_text(target.read_text() + "\n")
+    module._persist_conversation_histories(state)
+    assert len(calls) == 2
+    assert module._read_conversation_history(conversation["id"])["messages"][-1]["content"] == "updated"
+
+
 def test_full_history_sidecar_survives_hot_state_trim_and_drives_mobile_pages(
     tmp_path: Path,
     monkeypatch,

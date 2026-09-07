@@ -2936,6 +2936,11 @@ def _load_state_store(
     return result
 
 
+def _copy_state_document(state: dict[str, Any]) -> dict[str, Any]:
+    """Clone persisted JSON without Python's recursive deepcopy hot path."""
+    return json.loads(json.dumps(state, ensure_ascii=False, separators=(",", ":")))
+
+
 _HOSTED_ROLE_MIGRATION_MARKER = "_hosted_role_migration_version"
 _HOSTED_ROLE_MIGRATION_VERSION = 2
 
@@ -3114,7 +3119,7 @@ def _save_state_store_locked(
             collection_key,
         )
         state.clear()
-        state.update(deepcopy(committed_state))
+        state.update(_copy_state_document(committed_state))
     except Exception:
         # The target write is already authoritative. Persistence observers are
         # fail-open and must never turn a committed state transition into a
@@ -3176,7 +3181,7 @@ def load_single_state(
                     # view of the last committed document.  The event stream
                     # is read-only and can share its normalized snapshot.
                     result = (
-                        deepcopy(cached[1])
+                        _copy_state_document(cached[1])
                         if dispatch_persistence_hooks
                         else cached[1]
                     )
@@ -3255,7 +3260,7 @@ def load_single_state(
             with _SINGLE_STATE_CACHE_LOCK:
                 _SINGLE_STATE_CACHE[cache_key] = (
                     fingerprint,
-                    deepcopy(result)
+                    _copy_state_document(result)
                     if dispatch_persistence_hooks
                     else result,
                 )
@@ -3684,6 +3689,10 @@ def _rewrite_conversation_history_messages(
     })
 
 
+_HISTORY_PERSIST_CACHE: dict[str, tuple[Any, dict[str, Any]]] = {}
+_HISTORY_PERSIST_CACHE_LOCK = threading.Lock()
+
+
 def _persist_conversation_histories(state: dict[str, Any]) -> None:
     """Persist complete transcripts before trimming the hot single-state file."""
 
@@ -3696,6 +3705,25 @@ def _persist_conversation_histories(state: dict[str, Any]) -> None:
             continue
         conversation_id = str(conversation.get("id") or "").strip()
         if not conversation_id:
+            continue
+        target = _conversation_history_path(conversation_id)
+        meta_target = _conversation_history_meta_path(conversation_id)
+        if target is None or meta_target is None:
+            continue
+        # Most saves update one turn. Unchanged transcripts must not repeatedly
+        # read, merge and clone every other conversation's complete history.
+        projection = {key: conversation.get(key) for key in (
+            "owner_id", "account_generation", "messages", "session_entries",
+        )}
+        digest = hashlib.sha256(json.dumps(
+            projection, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")).digest()
+        cache_key = str(target)
+        signature = (digest, _single_state_fingerprint(target), _single_state_fingerprint(meta_target))
+        with _HISTORY_PERSIST_CACHE_LOCK:
+            cached = _HISTORY_PERSIST_CACHE.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            conversation.update(_copy_state_document(cached[1]))
             continue
         previous = _read_conversation_history(conversation_id)
         # Avoid touching disk for the common short-conversation case until a
@@ -3710,6 +3738,14 @@ def _persist_conversation_histories(state: dict[str, Any]) -> None:
         # committed. Raising keeps the previous hot state and deletion intent
         # durable, instead of silently destroying the only older messages.
         _write_conversation_history(conversation, existing=previous)
+        summary = {key: conversation[key] for key in (
+            "history_message_count", "history_last_message", "history_session_entry_count",
+        ) if key in conversation}
+        signature = (digest, _single_state_fingerprint(target), _single_state_fingerprint(meta_target))
+        with _HISTORY_PERSIST_CACHE_LOCK:
+            if len(_HISTORY_PERSIST_CACHE) >= 512:
+                _HISTORY_PERSIST_CACHE.pop(next(iter(_HISTORY_PERSIST_CACHE)))
+            _HISTORY_PERSIST_CACHE[cache_key] = (signature, _copy_state_document(summary))
 
 
 def _hydrate_conversation_history(conversation: dict[str, Any]) -> dict[str, Any]:

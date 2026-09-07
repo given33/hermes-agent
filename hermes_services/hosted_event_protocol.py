@@ -484,7 +484,7 @@ def state_with_persistence_hook_outbox(
 ) -> dict[str, Any]:
     """Promote staged callbacks into an event-ID-keyed durable outbox."""
 
-    persisted = deepcopy(dict(state))
+    persisted = _json_copy(dict(state))
     raw_outbox = persisted.get(_PERSISTENCE_HOOK_OUTBOX)
     outbox = deepcopy(raw_outbox) if isinstance(raw_outbox, dict) else {}
     raw_acks = persisted.get(_PERSISTENCE_HOOK_ACKS)
@@ -569,7 +569,7 @@ def dispatch_persisted_hosted_event_hooks(
 
     from hermes_services.internal_hooks import has_internal_hooks, run_internal_hooks
 
-    working = deepcopy(dict(state))
+    working = _json_copy(dict(state))
     # A deletion tombstone is authoritative even when this is a restart
     # recovery read.  Purge before checking hook availability so an empty
     # registry cannot accidentally preserve old-account deliveries.
