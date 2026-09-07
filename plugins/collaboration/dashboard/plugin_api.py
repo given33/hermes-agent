@@ -3495,7 +3495,9 @@ _MAX_ROLE_EVENT_ACTIVITY_CHARS = 4000
 # document quickly, keeping the every-write round-trip cheap; access is
 # invisible to callers because _conversation_by_id restores on demand.
 _ARCHIVE_IDLE_AGE_SECONDS = 600
-_ARCHIVE_RESTORE_GRACE_SECONDS = 3600
+# A detail read may temporarily restore an old transcript, but it must not
+# retain megabytes of completed runs in every unrelated state transaction.
+_ARCHIVE_RESTORE_GRACE_SECONDS = 30
 
 
 def _conversation_history_path(conversation_id: str) -> Optional[Path]:
@@ -13561,7 +13563,13 @@ def _request_remote_timeout_locked(
         # offline past it, the run is sealed here so the hosted bookkeeping
         # converges instead of hanging in `cancelling` for the full deadline.
         force_terminal_at = _positive_int(remote_run.get("cancel_force_terminal_at"))
-        if force_terminal_at is None or now < force_terminal_at:
+        if force_terminal_at is None:
+            requested_at = _positive_int(remote_run.get("cancel_requested_at")) or now
+            force_terminal_at = requested_at + _REMOTE_CANCELLATION_GRACE_SECONDS * 1000
+            remote_run["cancel_force_terminal_at"] = force_terminal_at
+            if now < force_terminal_at:
+                return True
+        if now < force_terminal_at:
             return False
         kind = str(remote_run.get("cancel_kind") or "")
         final_status = "timed_out" if kind == "timeout" else "cancelled"

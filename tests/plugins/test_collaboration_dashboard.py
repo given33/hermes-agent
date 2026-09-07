@@ -183,6 +183,22 @@ def test_history_metadata_batch_does_not_restore_transcripts_or_change_activity_
     assert all(row["history_category"] == "test" and row["updated_at"] == 200 for row in rows)
 
 
+def test_completed_history_read_does_not_pin_large_transcript_for_an_hour(monkeypatch, tmp_path):
+    module = load_module()
+    monkeypatch.setattr(module, "_archive_root", lambda: tmp_path)
+    monkeypatch.setattr(module.time, "time", lambda: 10000)
+    monkeypatch.setattr(module, "_conversation_history_summary", lambda c: (2, c["messages"][-1]))
+    source = {"id": "old-history", "owner_id": "owner", "created_at": 1000, "updated_at": 2000,
+              "restored_from_archive_at": 9900000, "hosted_turns": {"old": {"status": "completed"}},
+              "messages": [{"role": "user", "content": "question"}, {"role": "assistant", "content": "answer"}]}
+    state = {"conversations": [source]}
+    module._archive_completed_conversations(state)
+    assert state["conversations"][0]["archived"]
+    assert state["conversations"][0]["message_count"] == 2
+    restored = module._restore_archived_conversation(state, source["id"])
+    assert restored["messages"] == source["messages"]
+
+
 def test_live_checkpoint_does_not_restore_archived_event_history(monkeypatch, tmp_path):
     module = load_module()
     archive = tmp_path / "archived.json"
@@ -314,6 +330,18 @@ def test_remote_stall_distinguishes_execution_from_heartbeats():
     assert remote["status"] == "cancelled"
     assert not remote.get("claim_token")
     assert not hosted.get("cancel_requested")
+
+
+def test_legacy_remote_cancellation_gains_bounded_terminal_deadline():
+    module = load_module()
+    hosted = {"status": "running"}
+    remote = {"status": "running", "cancel_requested": True}
+    assert module._request_remote_timeout_locked(hosted, remote, now=1000)
+    deadline = remote["cancel_force_terminal_at"]
+    assert deadline > 1000
+    assert not module._request_remote_timeout_locked(hosted, remote, now=1001)
+    assert module._request_remote_timeout_locked(hosted, remote, now=deadline)
+    assert remote["status"] == "cancelled"
 
 
 def test_overdue_connector_run_still_commits_timeout_from_private_snapshot(monkeypatch):
