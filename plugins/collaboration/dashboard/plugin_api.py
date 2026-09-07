@@ -569,7 +569,8 @@ class _AccountStateLock:
 
     def __enter__(self):
         guard = _backend_api().account_lifecycle_commit_guard()
-        guard.__enter__()
+        with _latency_trace.lock_wait("account_lifecycle"):
+            guard.__enter__()
         try:
             # Latency instrumentation: measure pure acquisition wait (including
             # re-entrant instant acquires, which cost ~zero and stay quiet).
@@ -19913,18 +19914,17 @@ def _required_runtime_binding(
         )
     requested_profile = str(profile or "").strip()
     runtime_profile = _legacy_hosted_request_profile(requested_profile) or requested_profile
-    record = next(
-        (
-            item
-            for item in available_profiles()
-            if str(item.get("name") or "").strip() == runtime_profile
-        ),
-        None,
-    )
-    if record is None:
+    if (runtime_profile.lower() in _RETIRED_AI_PROFILES
+            or runtime_profile.lower() == _LEGACY_DBB3_MANAGER_PROFILE
+            or not profile_exists(runtime_profile)):
         raise HTTPException(status_code=400, detail="Hermes Profile does not exist")
-    actual_provider = str(record.get("provider") or "").strip()
-    actual_model = str(record.get("model") or "").strip()
+    from hermes_cli.profiles import _read_config_model, resolve_profile_env
+
+    # Use the same official profile reader as the catalog, without scanning
+    # every other profile's skills, aliases and gateway processes per send.
+    model, provider = _read_config_model(Path(resolve_profile_env(runtime_profile)))
+    actual_provider = str(provider or "").strip()
+    actual_model = str(model or "").strip()
     verified = bool(required_provider and required_model)
     if verified and (
         actual_provider.casefold() != required_provider.casefold()

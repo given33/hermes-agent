@@ -3118,21 +3118,19 @@ class CollaborationDashboardTests(unittest.TestCase):
 
     def test_hosted_chat_preserves_one_valid_selected_profile(self):
         module = load_module()
-        module.available_profiles = lambda: [
-            {"name": "default"},
-            {"name": "reviewer"},
-        ]
+        module.list_profile_names = lambda: ["default", "my-assistant"]
+        module.profile_exists = lambda name: name in {"default", "my-assistant"}
 
         route, mode, profiles, artifact_required = module._hosted_route_parameters(
-            route_metadata={"mode": "chat", "profiles": ["reviewer"]},
+            route_metadata={"mode": "chat", "profiles": ["my-assistant"]},
             content="继续之前的审阅会话",
             requested_mode="chat",
-            requested_profiles=["reviewer"],
+            requested_profiles=["my-assistant"],
         )
 
         self.assertEqual(mode, "chat")
-        self.assertEqual(profiles, ["reviewer"])
-        self.assertEqual(route["profiles"], ["reviewer"])
+        self.assertEqual(profiles, ["my-assistant"])
+        self.assertEqual(route["profiles"], ["my-assistant"])
         self.assertFalse(artifact_required)
 
     def test_artifact_delivery_requires_an_explicit_file_deliverable(self):

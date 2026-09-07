@@ -892,17 +892,14 @@ def test_account_lifecycle_guard_serializes_write_and_deletion_commit(
         module.save_single_state(late)
 
 
-def test_behavior_eval_runtime_binding_fails_closed_on_profile_mismatch(monkeypatch):
+def test_behavior_eval_runtime_binding_fails_closed_on_profile_mismatch(monkeypatch, tmp_path):
+    from hermes_cli import profiles
+
     module = _load_module()
-    monkeypatch.setattr(
-        module,
-        "available_profiles",
-        lambda: [{
-            "name": "default",
-            "provider": "provider-a",
-            "model": "model-a",
-        }],
-    )
+    (tmp_path / "config.yaml").write_text("model:\n  provider: provider-a\n  default: model-a\n", encoding="utf-8")
+    monkeypatch.setattr(module, "profile_exists", lambda name: name == "default")
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda _: str(tmp_path))
+    monkeypatch.setattr(module, "available_profiles", lambda: pytest.fail("A send must not scan every profile"))
 
     binding = module._required_runtime_binding(
         "default",
