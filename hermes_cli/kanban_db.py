@@ -10776,12 +10776,21 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import _get_platform_tools, enabled_mcp_server_names
+        from agent.skill_utils import parse_config_string_list
 
         token = set_hermes_home_override(hermes_home)
         try:
             cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            selected = _get_platform_tools(cfg, "cli")
+            disabled = set(parse_config_string_list((cfg.get("agent") or {}).get("disabled_toolsets") or []))
+            # Settings use MCP server names; the registry and --toolsets scope
+            # use mcp-<server>. Preserve native names too when they collide.
+            selected.update(
+                f"mcp-{name}" for name in (set(selected) & enabled_mcp_server_names(cfg))
+                if f"mcp-{name}" not in disabled
+            )
+            toolsets = sorted(selected)
         finally:
             reset_hermes_home_override(token)
         return toolsets or None

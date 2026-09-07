@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import pytest
 
 
 def _make_task(kb, *, assignee: str):
@@ -161,3 +162,22 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+@pytest.mark.parametrize("disabled, expected", [([], True), (["mcp-filesystem"], False), (["filesystem"], False)])
+def test_worker_mcp_scope_follows_profile_selection(monkeypatch, tmp_path, disabled, expected):
+    import yaml
+    from hermes_cli import kanban_db as kb
+    profile = tmp_path / 'profile'
+    profile.mkdir()
+    (profile / 'config.yaml').write_text(yaml.safe_dump({
+        'platform_toolsets': {'cli': ['terminal', 'filesystem']},
+        'mcp_servers': {'filesystem': {'command': 'npx', 'enabled': True},
+                        'private': {'command': 'npx', 'enabled': False}},
+        'agent': {'disabled_toolsets': disabled},
+    }))
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    resolved = kb._resolve_worker_cli_toolsets(str(profile))
+    assert ('mcp-filesystem' in resolved) is expected
+    assert 'terminal' in resolved
+    assert 'mcp-private' not in resolved

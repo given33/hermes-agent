@@ -214,7 +214,8 @@ def publish_release(role: str, state: Path, receipt: dict) -> None:
     os.replace(temporary, evidence_path)
 
 
-def prune_backups(root: Path, state: Path, receipt: dict, keep: int = 3) -> list[str]:
+def prune_backups(root: Path, state: Path, receipt: dict, keep: int = 3,
+                  generation_root: Path | None = None) -> list[str]:
     protected = {Path(item[1]).parent.name for key in ('file_backups', 'link_backups')
                  for item in receipt.get(key, []) if isinstance(item, list) and len(item) == 3}
     removed = []
@@ -230,6 +231,40 @@ def prune_backups(root: Path, state: Path, receipt: dict, keep: int = 3) -> list
             if path.name not in protected:
                 shutil.rmtree(path)
                 removed.append(str(path))
+    if state.is_dir() and state.resolve() == state:
+        archives = [path for path in state.iterdir() if path.is_file() and not path.is_symlink()
+                    and re.fullmatch(r'[0-9a-f]{40}\.tar\.(gz|download|invalid)', path.name)]
+        complete = sorted((path for path in archives if path.suffix == '.gz'),
+                          key=lambda path: path.stat().st_mtime_ns, reverse=True)
+        keep_commits = {str(receipt.get('commit') or ''), *(path.name[:40] for path in complete[:keep])}
+        for path in archives:
+            if path.name[:40] not in keep_commits:
+                path.unlink()
+                removed.append(str(path))
+    generations = generation_root or root / '.fabric-generations'
+    if generations.is_dir() and generations.resolve() == generations:
+        candidates = sorted((path for path in generations.iterdir()
+                             if re.fullmatch(r'[0-9a-f]{40}', path.name)
+                             and path.is_dir() and not path.is_symlink()),
+                            key=lambda path: path.stat().st_mtime_ns, reverse=True)
+        protected_generations = {str(receipt.get('commit') or ''), *(path.name for path in candidates[:keep])}
+        references = [root / '.fabric-current', root / '.venv', root / 'venv']
+        references.extend(Path(item[1]) for key in ('file_backups', 'link_backups')
+                          for item in receipt.get(key, []) if isinstance(item, list) and len(item) == 3)
+        for reference in references:
+            try:
+                protected_generations.add(reference.resolve().relative_to(generations).parts[0])
+            except (ValueError, IndexError, OSError):
+                pass
+        for path in candidates:
+            # A dependency environment can be shared by newer generations.
+            # Retain real environments conservatively; never follow their
+            # symlinks or remove profile directories outside this code cache.
+            environment = path / '.venv'
+            if path.name in protected_generations or (environment.is_dir() and not environment.is_symlink()):
+                continue
+            shutil.rmtree(path)
+            removed.append(str(path))
     return removed
 
 
@@ -245,6 +280,7 @@ def main():
         parser.error('This system updater must run as root')
     node = NODES[args.role]
     root = Path(node['root'])
+    generation_root = Path(node.get('generation_root', root / '.fabric-generations'))
     if root.resolve() != root:
         raise ValueError('Runtime root must be canonical')
     state = Path('/var/lib/hermes-agent-fabric-update') / args.role
@@ -257,7 +293,7 @@ def main():
         receipt_path = state / 'runtime-release.json'
         receipt = json.loads(receipt_path.read_text()) if receipt_path.is_file() else {}
         if args.prune_only:
-            print(json.dumps({'role': args.role, 'removed_backups': prune_backups(root, state, receipt)}))
+            print(json.dumps({'role': args.role, 'removed_backups': prune_backups(root, state, receipt, generation_root=generation_root)}))
             return
         if not args.check and has_active_execution(node['homes']):
             print(json.dumps({'role': args.role, 'status': 'deferred', 'reason': 'execution_active'}))
@@ -269,13 +305,13 @@ def main():
         if runtime_is_current(root, receipt, commit):
             if not args.check:
                 publish_release(args.role, state, receipt)
-                prune_backups(root, state, receipt)
+                prune_backups(root, state, receipt, generation_root=generation_root)
             print(json.dumps({'role': args.role, 'commit': commit, 'status': 'current'}))
             return
         if not args.check:
-            prune_backups(root, state, receipt)
+            prune_backups(root, state, receipt, generation_root=generation_root)
         verify_approved_commit(commit)
-        generation = Path(node.get('generation_root', root / '.fabric-generations')) / commit
+        generation = generation_root / commit
         if generation.resolve() != generation:
             raise ValueError('Release generation must not be a symlink')
         generation.mkdir(parents=True, exist_ok=True)
@@ -453,7 +489,7 @@ def main():
             (backup / 'transaction.json').write_text(json.dumps(report, indent=2))
         receipt_path.write_text(json.dumps(report, indent=2))
         publish_release(args.role, state, report)
-        prune_backups(root, state, report)
+        prune_backups(root, state, report, generation_root=generation_root)
         print(json.dumps({'role': args.role, 'commit': commit, 'version': version,
                           'status': 'committed', 'config_unchanged': protected_config_hashes(node['homes']) == before}))
 

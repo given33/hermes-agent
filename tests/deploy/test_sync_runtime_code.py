@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tarfile
 import subprocess
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -162,3 +163,35 @@ def test_code_only_update_reuses_only_a_verified_dependency_environment(updater,
     assert updater.reusable_environment(environment, lock)
     lock.write_text('new dependencies')
     assert not updater.reusable_environment(environment, lock)
+
+
+def test_retention_reclaims_archives_and_code_without_removing_live_environment(updater, tmp_path):
+    root, state, generations = tmp_path / 'root', tmp_path / 'state', tmp_path / 'native-code'
+    for parent in (root, state, generations):
+        parent.mkdir()
+    commits = [str(index) * 40 for index in range(1, 8)]
+    for index, commit in enumerate(commits):
+        archive = state / (commit + '.tar.gz')
+        archive.write_bytes(b'archive')
+        generation = generations / commit
+        generation.mkdir()
+        (generation / 'code.py').write_text('pass')
+        os.utime(archive, (index, index))
+        os.utime(generation, (index, index))
+    # A real environment belongs to an old generation and is shared by the
+    # current one. A still-live older code generation must also survive.
+    environment = generations / commits[0] / '.venv'
+    environment.mkdir()
+    (environment / 'python').write_text('runtime')
+    os.utime(generations / commits[0], (0, 0))
+    (root / 'venv').symlink_to(environment, target_is_directory=True)
+    (root / '.fabric-current').symlink_to(generations / commits[1], target_is_directory=True)
+    (state / 'user-upload.tar.gz').write_bytes(b'user data')
+    receipt = {'commit': commits[-1]}
+    updater.prune_backups(root, state, receipt, generation_root=generations)
+    assert (environment / 'python').read_text() == 'runtime'
+    assert (root / '.fabric-current' / 'code.py').is_file()
+    assert not (generations / commits[2]).exists()
+    assert not (generations / commits[3]).exists()
+    assert len(list(state.glob('*.tar.gz'))) == 4  # 3 releases + unrelated upload
+    assert (state / 'user-upload.tar.gz').read_bytes() == b'user data'
