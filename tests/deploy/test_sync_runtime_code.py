@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 import tarfile
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -79,6 +80,22 @@ def test_runtime_symlink_is_rejected_before_it_can_touch_a_profile(updater, tmp_
         output.addfile(member)
     with pytest.raises(ValueError, match='cannot contain links'):
         updater.extract_runtime(archive, tmp_path / 'stage')
+
+
+def test_github_git_timeout_uses_independent_verified_ref_api(updater, monkeypatch):
+    commit = 'b' * 40
+    def unavailable(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs['timeout'])
+    monkeypatch.setattr(updater, 'run', unavailable)
+    monkeypatch.setattr(updater, 'request_json', lambda url: {
+        'ref': 'refs/heads/main', 'object': {'type': 'commit', 'sha': commit},
+    })
+    updater.verify_approved_commit(commit)
+    monkeypatch.setattr(updater, 'request_json', lambda url: {
+        'ref': 'refs/heads/unapproved', 'object': {'type': 'commit', 'sha': commit},
+    })
+    with pytest.raises(ValueError, match='approved main branch'):
+        updater.github_main_commit()
 
 
 def test_each_machine_keeps_a_distinct_home_and_existing_profile_content(updater, tmp_path):

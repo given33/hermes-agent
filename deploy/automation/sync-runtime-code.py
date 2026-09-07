@@ -80,8 +80,20 @@ def run(args: list[str], *, check: bool = True, **kwargs):
 
 def github_main_commit() -> str:
     # Git's read-only refs endpoint is independent of the shared REST quota.
-    result = run(['git', 'ls-remote', '--exit-code', f'https://github.com/{REPOSITORY}.git',
-                  'refs/heads/main'], timeout=45)
+    try:
+        result = run(['git', 'ls-remote', '--exit-code', f'https://github.com/{REPOSITORY}.git',
+                      'refs/heads/main'], timeout=12)
+    except (OSError, subprocess.SubprocessError):
+        # Some node routes intermittently stall Git's smart-HTTP endpoint.
+        # Verify against GitHub's independent refs API before deferring an
+        # otherwise available release. Never trust a local or Hub-only SHA.
+        ref = request_json(f'https://api.github.com/repos/{REPOSITORY}/git/ref/heads/main')
+        target = ref.get('object') if isinstance(ref, dict) else None
+        if (isinstance(target, dict) and ref.get('ref') == 'refs/heads/main'
+                and target.get('type') == 'commit'
+                and re.fullmatch('[0-9a-f]{40}', str(target.get('sha') or ''))):
+            return target['sha']
+        raise ValueError('GitHub API did not return the approved main branch')
     rows = [line.split() for line in result.stdout.splitlines()]
     for row in rows:
         if len(row) == 2 and row[1] == 'refs/heads/main' and re.fullmatch('[0-9a-f]{40}', row[0]):
