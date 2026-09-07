@@ -106,7 +106,8 @@ def test_simple_calculation_does_not_create_workflow_or_call_router_model():
         assert result["lock_level"] == "hard_chat", prompt
         assert result["profiles"] == ["default"], prompt
 
-    for prompt in ("叫我皇上，然后在 DBB3 部署项目并测试。", "请重启 DBB3 服务器上的服务并验证。"):
+    for prompt in ("叫我皇上，然后在 DBB3 部署项目并测试。", "请重启 DBB3 服务器上的服务并验证。",
+                   "让dbb3给我发送一句你好", "请 dbb3-worker 回复一句你好"):
         assert module._rule_based_user_intent(prompt)["mode"] == "work"
 
 

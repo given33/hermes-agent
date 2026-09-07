@@ -7756,7 +7756,12 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         marker in lowered
         for marker in ("帮我", "请你", "直接", "现在", "完成", "执行", "go ahead")
     )
-    hard_work = explicit_workflow or (
+    explicit_member_request = bool(device_matches) and bool(re.search(
+        r"(?:让|叫|请|派发|分派|交给|委派|ask|assign|delegate).{0,16}"
+        r"(?:dbb3|pc-worker|hk-worker|windows|香港|本地电脑).{0,12}"
+        r"(?:发送|回复|回答|执行|完成|处理|运行|send|reply|run|do)", lowered
+    ))
+    hard_work = explicit_workflow or explicit_member_request or (
         any(marker in lowered for marker in _HARD_WORK_MARKERS)
         and (imperative or not explanatory)
     )
@@ -7809,7 +7814,7 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         score = max(score, 4)
     if hard_work:
         score = max(score, 4)
-    if explicit_chat and len(text) < 30:
+    if explicit_chat and len(text) < 30 and not hard_work:
         score -= 3
     if explicit_single or current_session_question:
         score = min(score, 3)
@@ -15130,8 +15135,8 @@ def execute_hosted_workflow(
             "role": "assistant",
             "name": dispatcher_profile,
             "content": (
-                f"任务已由 DBB3 托管并拆分为 {len(todo_items)} 个 Todo 项，"
-                f"无依赖的项已并行派发给 {', '.join(worker_profiles)}，完成后我直接汇总汇报。"
+                f"已将 {len(todo_items)} 项任务派发给 {', '.join(worker_profiles)}。"
+                "成员执行完成后，由当前会话的 Hermes 汇总并给出最终结果。"
             ),
             "status": "completed",
             "kind": "message",
