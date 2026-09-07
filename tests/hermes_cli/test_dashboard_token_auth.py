@@ -9,6 +9,7 @@ behaviour.
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Optional
 
 import pytest
@@ -235,3 +236,28 @@ def test_seam_rejects_wrong_token_401():
     assert resp.status_code == 401
 
 
+@pytest.mark.parametrize("registered_route", [False, True])
+def test_slow_authentication_does_not_block_live_streams(registered_route):
+    heartbeat = threading.Event()
+
+    class SlowProvider(_TokenProvider):
+        def verify_token(self, *, token):
+            # An active stream must be able to make progress during a DB wait.
+            assert heartbeat.wait(timeout=1), "Authentication blocked the event loop"
+            return super().verify_token(token=token)
+
+    register_provider(SlowProvider(secret="good", scopes=("chat",)))
+    path = "/api/chat"
+    if registered_route:
+        token_auth.register_token_route(path)
+    else:
+        token_auth.register_optional_token_prefix(path, required_scope="chat")
+    request = _FakeRequest(path=path, headers={"authorization": "Bearer good"})
+
+    async def verify():
+        asyncio.get_running_loop().call_later(0.01, heartbeat.set)
+        return await token_auth.token_auth_middleware(request, _call_next_ok)
+
+    response = _run(verify())
+    assert response.status_code == 200
+    assert request.state.token_authenticated is True

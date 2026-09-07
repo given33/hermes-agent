@@ -43,7 +43,7 @@ def _isolated_owner_account(tmp_path, monkeypatch):
     clear_providers()
     token_auth.clear_optional_token_prefixes()
     _reset_password_rate_limit()
-    hermes_home = tmp_path / ".hermes"
+    hermes_home = tmp_path / "isolated-hermes-home"
     hermes_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("HOME", str(tmp_path))

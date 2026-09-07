@@ -336,6 +336,10 @@ class MobileDeviceStore:
                     "mobile-auth.db was created by a newer Hermes version "
                     f"(schema {current_version} > {SCHEMA_VERSION})"
                 )
+            # Authentication reads must not contend with writers for schema DDL.
+            if current_version == SCHEMA_VERSION:
+                self._restrict_permissions(path, 0o600)
+                return conn
             session_columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(mobile_sessions)").fetchall()

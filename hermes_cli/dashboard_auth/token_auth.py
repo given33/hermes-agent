@@ -38,6 +38,7 @@ seam remembers and surfaces as 503 only if NO provider accepts the token.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import hmac
 import threading
@@ -257,7 +258,7 @@ async def token_auth_middleware(
             ):
                 return await call_next(request)
             if raw_authorization:
-                principal, unreachable = authenticate_token(request)
+                principal, unreachable = await asyncio.to_thread(authenticate_token, request)
                 if principal is None:
                     if unreachable:
                         return JSONResponse(
@@ -277,7 +278,8 @@ async def token_auth_middleware(
                         )
 
                         try:
-                            session = _verify_bearer(
+                            session = await asyncio.to_thread(
+                                _verify_bearer,
                                 request,
                                 access_token=extract_bearer_token(request),
                             )
@@ -331,7 +333,7 @@ async def token_auth_middleware(
                 request.state.token_authenticated = True
         return await call_next(request)
 
-    principal, unreachable = authenticate_token(request)
+    principal, unreachable = await asyncio.to_thread(authenticate_token, request)
     if principal is not None:
         request.state.token_principal = principal
         request.state.token_authenticated = True

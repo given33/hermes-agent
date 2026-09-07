@@ -23,10 +23,10 @@ SUPPORT = {'pyproject.toml', 'uv.lock', 'README.md', 'LICENSE',
            'deploy/automation/sync-runtime-code.py'}
 NODES = {
     'hub': {'root': '/opt/hermes-agent', 'environment': '.venv',
-            'units': ['hermes-agent', 'hermes-gateway', 'hermes-studio'], 'user_units': [],
+            'units': ['hermes-gateway', 'hermes-studio', 'hermes-agent'], 'user_units': [],
             'homes': ['/var/lib/hermes-agent']},
     'dbb3': {'root': '/usr/local/lib/hermes-agent', 'environment': 'venv',
-             'units': ['hermes-dashboard', 'hermes-gateway'], 'user_units': ['dbb3-cloud-connector'],
+             'units': ['hermes-gateway', 'hermes-dashboard'], 'user_units': ['dbb3-cloud-connector'],
              'homes': ['/home/hermes/.hermes'], 'connector': '/opt/dbb3-team/dbb3_cloud_connector.py'},
     'wsl': {'root': '/mnt/d/Hermes/hermes-agent', 'environment': 'venv', 'units': [],
             'user_units': ['hermes-wsl-gateway', 'pc-cloud-connector'],

@@ -27529,12 +27529,14 @@ def _recover_mobile_write_approvals(
 
 def _recover_all_mobile_write_approvals() -> int:
     recovered = 0
-    for profile in list_profiles():
+    for profile_name in list_profile_names():
+        if not profile_exists(profile_name):
+            continue
         try:
-            recovered += _recover_mobile_write_approvals(profile.name)
+            recovered += _recover_mobile_write_approvals(profile_name)
         except Exception:
             logging.getLogger(__name__).exception(
-                "Failed to scan write approvals for profile %s", profile.name
+                "Failed to scan write approvals for profile %s", profile_name
             )
     return recovered
 

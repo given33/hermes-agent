@@ -1021,3 +1021,21 @@ def test_newer_schema_is_rejected_without_overwriting_version(tmp_path):
 
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 999
+
+
+def test_current_database_can_be_opened_without_schema_writes(tmp_path, monkeypatch):
+    db_path = tmp_path / "mobile-auth.db"
+    with MobileDeviceStore(db_path).connection():
+        pass
+    import hermes_state
+
+    original_apply_wal = hermes_state.apply_wal_with_fallback
+
+    def read_only_connection(conn, **kwargs):
+        result = original_apply_wal(conn, **kwargs)
+        conn.execute("PRAGMA query_only=ON")
+        return result
+
+    monkeypatch.setattr(hermes_state, "apply_wal_with_fallback", read_only_connection)
+    with MobileDeviceStore(db_path).connection() as conn:
+        assert conn.execute("SELECT count(*) FROM mobile_sessions").fetchone()[0] == 0

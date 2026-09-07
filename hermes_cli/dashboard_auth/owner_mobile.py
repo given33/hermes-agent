@@ -78,9 +78,9 @@ def mobile_handshake(request: Request) -> dict[str, Any]:
     principal = getattr(request.state, "token_principal", None)
     session = _current_mobile_session(request) if principal is not None else None
     if session is not None or principal is not None:
-        from hermes_cli.profiles import list_profiles
+        from hermes_cli.profiles import list_profile_names, profile_exists
 
-        profiles = [profile.name or "default" for profile in list_profiles()] or ["default"]
+        profiles = [name for name in list_profile_names() if profile_exists(name)] or ["default"]
     else:
         profiles = []
     return {
