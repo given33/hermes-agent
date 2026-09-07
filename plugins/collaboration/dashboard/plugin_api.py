@@ -15575,6 +15575,7 @@ def _next_hosted_turn_id(
             if isinstance(run, dict)
             and str(run.get("status") or "queued") in {"queued", "running"}
             and not run.get("paused")
+            and not _coerce_flag(run.get("cancel_requested"))
             and str(run.get("stage") or "") not in {"routing_pending", "routing_failed"}
             and str(candidate_turn_id) not in (excluded or set())
         ]
@@ -15849,6 +15850,14 @@ def resume_unfinished_hosted_workflows(
             if not isinstance(run, dict):
                 continue
             if run.get("status") in {"queued", "running"}:
+                if _coerce_flag(run.get("cancel_requested")):
+                    if not any(
+                        isinstance(remote, dict)
+                        and str(remote.get("status") or "queued") not in _REMOTE_TERMINAL_STATUSES
+                        for remote in (run.get("remote_runs") or {}).values()
+                    ):
+                        _finish_hosted_turn_if_cancelled(conversation_id, str(turn_id))
+                    continue
                 if str(run.get("stage") or "") in {"routing_pending", "routing_failed"}:
                     start_hosted_routing(conversation_id, str(turn_id))
                 else:

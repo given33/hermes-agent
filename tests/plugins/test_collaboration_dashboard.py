@@ -6014,6 +6014,21 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertNotIn("role_events", hosted)
         self.assertIn("role_events", conversation["hosted_turns"]["turn-heavy"])
 
+    def test_cancelled_work_waiting_for_remote_ack_is_not_restarted(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["hosted_turns"] = {
+            "cancelled-work": {"status": "running", "cancel_requested": True,
+                               "remote_runs": {"worker": {"status": "running"}}},
+            "next-work": {"status": "queued", "created_at": 10},
+        }
+        module.load_single_state = lambda: {"conversations": [conversation]}
+        started = []
+        module.start_hosted_workflow = lambda cid, tid: started.append(tid)
+        module.resume_unfinished_hosted_workflows([conversation])
+        self.assertEqual(started, ["next-work"])
+        self.assertEqual(module._next_hosted_turn_id(conversation["id"]), "next-work")
+
     def test_hosted_roles_run_with_non_root_kanban_task_scopes(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
