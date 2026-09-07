@@ -7474,6 +7474,7 @@ def _hosted_final_message(turn_id, run, worker_profiles, dispatcher_profile,
         (stage, state) for stage, state in (run.get("role_events") or {}).items()
         if stage.split(":", 1)[0] == "worker" and isinstance(state, dict)
         and state.get("status") in _HOSTED_TERMINAL_STATUSES
+        and not state.get("server_fallback")
     ]
     stage, state = "aggregator", {}
     if len(set(worker_profiles)) == 1 and candidates:
@@ -10459,6 +10460,7 @@ def _persist_hosted_role_state(
         "request_accepted": _coerce_flag(state.get("request_accepted")),
         "request_accepted_at": int(state.get("request_accepted_at") or 0),
         "remote_phase": str(state.get("remote_phase") or ""),
+        "server_fallback": _coerce_flag(state.get("server_fallback")),
         "dispatched_at": int(state.get("dispatched_at") or 0),
         "accepted_at": int(state.get("accepted_at") or 0),
         "model_retry_attempt": int(state.get("model_retry_attempt") or 0),
@@ -13314,6 +13316,8 @@ def _persist_hosted_turn(
             else:
                 existing = messages[existing_index]
                 previous_content = str(existing.get("content") or "")
+                final_speaker_selected = bool(message_meta.get("final_report")) and not bool(
+                    (existing.get("meta") or {}).get("final_report"))
                 # Replace the snapshot instead of mutating it in place. Event
                 # consumers may still hold the pre-token object; mutating that
                 # object makes a blank processing snapshot appear to have
@@ -13327,6 +13331,17 @@ def _persist_hosted_turn(
                 }
                 _project_native_message(existing)
                 messages[existing_index] = existing
+                if final_speaker_selected:
+                    append_hosted_event(
+                        conversation, conversation_id=conversation_id, turn_id=turn_id,
+                        role_stage=role_stage, event_type="message.completed",
+                        entity_id=str(existing.get("id") or ""),
+                        idempotency_key=f"final-speaker:{turn_id}",
+                        account_generation=expected_generation, occurred_at=now,
+                        payload={"entity_id": str(existing.get("id") or ""),
+                                 "profile": message_meta.get("profile"), "member_id": message_meta.get("member_id"),
+                                 "final_report": True, "text": str(existing.get("content") or "")},
+                    )
                 message_status = str(existing.get("status") or "completed").lower()
                 message_content = str(existing.get("content") or "")
                 stream_entries = append_message_stream_entries(
@@ -13358,6 +13373,9 @@ def _persist_hosted_turn(
                         "status": message_status,
                         "role": str(existing.get("role") or "assistant"),
                         "name": str(existing.get("name") or ""),
+                        "profile": message_meta.get("profile"),
+                        "member_id": message_meta.get("member_id"),
+                        "final_report": bool(message_meta.get("final_report")),
                         "operation": operation,
                         "content_sha256": str(
                             stream_payload.get("content_sha256") or ""
@@ -16806,6 +16824,9 @@ def _append_message(
                 "entity_id": message["id"],
                 "role": role,
                 "name": name,
+                "profile": message_meta.get("profile"),
+                "member_id": message_meta.get("member_id"),
+                "final_report": bool(message_meta.get("final_report")),
                 "content": content,
                 "status": status,
                 "kind": kind,

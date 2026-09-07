@@ -19,6 +19,7 @@ same ``custom > ai > fallback`` precedence in its session importer.
 
 import json
 import logging
+import os
 import re
 import threading
 from typing import Any, Callable, Optional
@@ -169,6 +170,10 @@ def _title_language() -> str:
 
 def _auto_title_enabled() -> bool:
     """Return whether automatic session title generation is enabled."""
+    # Assigned executions already have a durable Kanban title. Avoid a
+    # competing model request for the internal "work kanban task" session.
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return False
     try:
         # Lazy imports, matching _title_language(): title_generator is imported
         # from agent code paths where a module-level hermes_cli import risks

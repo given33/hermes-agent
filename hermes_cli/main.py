@@ -3365,6 +3365,10 @@ def cmd_chat(args):
             skills_dir = Path(get_hermes_home()) / "skills"
             if not skills_dir.is_dir():
                 return True
+            # External skill directories can satisfy the whole catalog while
+            # leaving this directory empty. A completed sync is not first run.
+            if (skills_dir / ".bundled_manifest").is_file():
+                return False
             return next(skills_dir.rglob("SKILL.md"), None) is None
         except Exception:
             return False

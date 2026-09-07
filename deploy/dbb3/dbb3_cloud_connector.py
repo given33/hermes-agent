@@ -16,6 +16,7 @@ import contextlib
 from collections import OrderedDict
 from dataclasses import asdict
 import hashlib
+import importlib.util
 import inspect
 import json
 import math
@@ -36,6 +37,15 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
+
+# Connectors live outside the checkout. Older editable installs omit newly
+# added runtime packages from their import map; resolve the same installed
+# core's directory before importing any runtime modules.
+_core_spec = importlib.util.find_spec("hermes_cli")
+if _core_spec is not None and _core_spec.origin:
+    _core_root = str(Path(_core_spec.origin).resolve().parent.parent)
+    if _core_root not in sys.path:
+        sys.path.insert(0, _core_root)
 
 # Optional latency-trace integration. The connector must stay runnable as a
 # standalone deploy script, so a missing package or disabled tracing degrades

@@ -130,6 +130,7 @@ def test_final_speaker_reuses_single_worker_delivery_and_preserves_fallback_iden
     assert message["meta"]["message_key"] == "turn:worker:handoff"
     assert message["meta"]["activities"] == [{"tool_name": "terminal"}]
     run["role_events"]["worker:server-fallback"] = {"profile": "default", "status": "completed", "updated_at": 20}
+    run["role_events"]["worker"].update(server_fallback=True, updated_at=30)
     message = module._hosted_final_message("turn", run, ["dbb3-worker"], "default", "done", "completed", [], "task")
     assert message["name"] == "default"
     assert message["meta"]["message_key"] == "turn:worker:server-fallback:handoff"

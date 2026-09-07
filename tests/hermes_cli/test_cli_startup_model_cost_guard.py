@@ -110,6 +110,26 @@ def test_cmd_chat_rejects_noninteractive_gpt55_pro_startup_override(
     assert "non-interactive" in err
 
 
+def test_external_skill_manifest_does_not_repeat_foreground_seed(main_mod, fake_cli, monkeypatch, tmp_path):
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    (skills / ".bundled_manifest").write_text("\n")
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+    _set_startup_config(monkeypatch)
+    syncs = []
+    scheduled = []
+    monkeypatch.setattr(main_mod, "_sync_bundled_skills_for_startup", lambda: syncs.append(True))
+    original = main_mod.threading.Thread
+    def thread(*args, **kwargs):
+        if kwargs.get("name") == "bundled-skills-sync":
+            return types.SimpleNamespace(start=lambda: scheduled.append(kwargs["target"]))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(main_mod.threading, "Thread", thread)
+    main_mod.cmd_chat(_chat_args())
+    assert len(scheduled) == 1
+    assert not syncs
+
+
 def test_cmd_chat_rejects_noninteractive_gpt55_pro_even_with_yolo(
     main_mod, fake_cli, codex_config, monkeypatch, capsys
 ):
