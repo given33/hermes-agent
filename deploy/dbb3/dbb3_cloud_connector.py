@@ -2891,6 +2891,8 @@ class DBB3CloudConnector:
                 + "\n\n"
                 "Before exiting, finish the root task by calling kanban_complete "
                 "with the verified result, or kanban_block with a concrete blocker. "
+                "The result passed to kanban_complete is your final user-visible delivery: "
+                "include the requested outputs and format, not an internal bookkeeping summary. "
                 "A comment alone is not a terminal outcome. "
                 "After completion, return your result and exit. If the task is already terminal "
                 "or cancelled, stop; never reopen it or edit orchestration databases, locks, or run records."

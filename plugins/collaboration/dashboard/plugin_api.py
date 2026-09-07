@@ -7586,6 +7586,8 @@ def _persist_hosted_plan_snapshot(
         worker_statuses=worker_statuses,
         final_status=final_status,
     )
+    if manager_plan.get("direct_assignment"):
+        return snapshot
     now = int(time.time() * 1000)
     activity_id = f"{turn_id}:manager-plan:todo"
     with _STATE_LOCK:
@@ -7649,7 +7651,7 @@ def _persist_hosted_plan_snapshot(
                 ),
                 None,
             )
-        plan_count = max(0, int(snapshot["summary"]["total"]) - 2)
+        plan_count = len(manager_plan.get("plan") or [])
         if target is None:
             target = _append_message(
                 conversation,
@@ -7770,12 +7772,14 @@ def _direct_member_plan(content: str, workers: list[str]) -> dict[str, Any]:
         r"拆分|规划|评审|审核|多个成员|并行|团队|plan|review|parallel", content, re.I
     ):
         return {}
-    return _normalize_manager_plan({
+    plan = _normalize_manager_plan({
         "difficulty": "simple", "workers": workers,
         "reason": "用户已明确指定执行成员，直接派发原始任务。",
         "plan": [{"id": "step-1", "title": summarize_task_title(content),
                   "objective": content, "assignee": workers[0], "depends_on": []}],
     }, content=content, fallback_workers=workers)
+    plan["direct_assignment"] = True
+    return plan
 
 
 def _rule_based_user_intent(content: str) -> dict[str, Any]:
@@ -13334,13 +13338,14 @@ def _persist_hosted_turn(
                 if final_speaker_selected:
                     append_hosted_event(
                         conversation, conversation_id=conversation_id, turn_id=turn_id,
-                        role_stage=role_stage, event_type="message.completed",
+                        role_stage=role_stage, event_type="role.handoff",
                         entity_id=str(existing.get("id") or ""),
                         idempotency_key=f"final-speaker:{turn_id}",
                         account_generation=expected_generation, occurred_at=now,
                         payload={"entity_id": str(existing.get("id") or ""),
                                  "profile": message_meta.get("profile"), "member_id": message_meta.get("member_id"),
-                                 "final_report": True, "text": str(existing.get("content") or "")},
+                                 "action": "final_report", "final_report": True,
+                                 "text": str(existing.get("content") or "")},
                     )
                 message_status = str(existing.get("status") or "completed").lower()
                 message_content = str(existing.get("content") or "")

@@ -117,6 +117,9 @@ def test_direct_member_assignment_preserves_objective_without_model_planning():
     plan = module._direct_member_plan(objective, ["dbb3-worker"])
     assert plan["plan"][0]["objective"] == objective
     assert plan["workers"] == ["dbb3-worker"]
+    assert plan["direct_assignment"]
+    module.load_single_state = lambda: pytest.fail("Direct assignment needs no synthetic plan bubble")
+    module._persist_hosted_plan_snapshot("chat", "turn", plan, stage="dispatching")
     assert not module._direct_member_plan("请 dbb3-worker 规划并执行多成员审核", ["dbb3-worker"])
     assert not module._direct_member_plan(objective, ["dbb3-worker", "pc-worker"])
 
@@ -146,6 +149,33 @@ def test_single_prompt_includes_real_member_registry_and_report_ownership():
     assert "Windows PC + WSL (pc-worker)" in prompt
     assert "最终结果由当前会话的 Hermes 汇总" in prompt
     assert "不依赖飞书群或 Telegram" in prompt
+
+
+def test_final_speaker_handoff_survives_a_previously_completed_message():
+    module = load_module()
+    conversation = module.create_single_conversation("default")
+    state = {"conversations": [conversation]}
+    module.load_single_state = lambda: state
+    module.save_single_state = lambda _: None
+    module.create_hosted_turn_record(conversation, turn_id="delivery", content="hostname",
+                                    title="hostname", profiles=["default", "pc-worker"],
+                                    artifact_required=False, mode="work", route_metadata={"mode": "work"})
+    message = {"role": "assistant", "name": "pc-worker", "content": "real hostname", "status": "completed",
+               "meta": {"role_stage": "worker", "phase": "handoff", "profile": "pc-worker",
+                        "message_key": "delivery:worker:handoff", "final_report": False}}
+    module._persist_hosted_turn(conversation["id"], "delivery", message=message)
+    assert any(event["event_type"] == "message.completed" and event["role_stage"] == "worker"
+               for event in conversation["hosted_events"])
+    message["meta"]["final_report"] = True
+    module._persist_hosted_turn(conversation["id"], "delivery", message=message,
+                                patch={"status": "completed", "stage": "completed"})
+    handoffs = [event for event in conversation["hosted_events"]
+                if event.get("payload", {}).get("action") == "final_report"]
+    assert len(handoffs) == 1
+    assert handoffs[0]["event_type"] == "role.handoff"
+    assert handoffs[0]["payload"]["profile"] == "pc-worker"
+    assert handoffs[0]["payload"]["final_report"] is True
+    assert len([message for message in conversation["messages"] if message["name"] == "pc-worker"]) == 1
 
 
 def test_state_snapshot_isolates_containers_without_copying_transcript_text():
