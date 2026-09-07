@@ -113,6 +113,20 @@ def test_state_snapshot_isolates_containers_without_copying_transcript_text():
     assert state["conversations"][0]["messages"][0]["content"] == text
 
 
+def test_archived_preview_save_does_not_reopen_full_history(monkeypatch, tmp_path):
+    module = load_module()
+    monkeypatch.setattr(module, "_archive_root", lambda: tmp_path)
+    monkeypatch.setattr(module, "_conversation_history_path", lambda _: pytest.fail("Archived history is immutable"))
+    monkeypatch.setattr(module, "_conversation_archive_path", lambda _: pytest.fail("Clean archive needs no repair"))
+    preview = {"id": "old", "archived": True, "messages": [{"content": "preview"}]}
+    state = {"conversations": [preview]}
+    module._persist_conversation_histories(state)
+    module._archive_completed_conversations(state)
+    module._publish_live_conversations(state)
+    preview["messages"][0]["content"] = "changed"
+    assert module._HOSTED_LIVE_CONVERSATIONS["old"]["messages"][0]["content"] == "preview"
+
+
 def test_live_checkpoint_does_not_restore_archived_event_history(monkeypatch, tmp_path):
     module = load_module()
     archive = tmp_path / "archived.json"

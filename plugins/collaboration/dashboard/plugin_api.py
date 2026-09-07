@@ -771,7 +771,7 @@ def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
             conversation_id = str(item.get("id") or "").strip()
             if not conversation_id:
                 continue
-            snapshots[conversation_id] = deepcopy(item)
+            snapshots[conversation_id] = _copy_state_document(item)
         with _HOSTED_LIVE_STATE_LOCK:
             for conversation_id, snapshot in snapshots.items():
                 previous = _HOSTED_LIVE_CONVERSATIONS.get(conversation_id)
@@ -786,7 +786,7 @@ def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
                 for key in ("hosted_events", "hosted_event_cursor", "hosted_event_min_cursor",
                             "hosted_event_sequences", "hosted_event_terminals"):
                     if key in snapshot:
-                        item[key] = deepcopy(snapshot[key])
+                        item[key] = _copy_state_document(snapshot[key])
             _HOSTED_LIVE_CONVERSATIONS.clear()
             _HOSTED_LIVE_CONVERSATIONS.update(snapshots)
         pub.attr("conversations", len(snapshots))
@@ -2939,7 +2939,7 @@ def _load_state_store(
     return result
 
 
-def _copy_state_document(state: dict[str, Any]) -> dict[str, Any]:
+def _copy_state_document(state: Any) -> Any:
     """Isolate mutable JSON containers while sharing immutable transcript text."""
     def clone(value):
         if isinstance(value, dict):
@@ -3709,6 +3709,10 @@ def _persist_conversation_histories(state: dict[str, Any]) -> None:
     for conversation in state.get("conversations") or []:
         if not isinstance(conversation, dict):
             continue
+        # An archive index contains only a preview. Its full transcript is
+        # already durable and cannot change until the conversation is restored.
+        if conversation.get("archived"):
+            continue
         messages = conversation.get("messages")
         entries = conversation.get("session_entries")
         if not isinstance(messages, list) and not isinstance(entries, list):
@@ -3882,6 +3886,10 @@ def _archive_completed_conversations(state: dict[str, Any]) -> None:
         if conversation.get("archived"):
             # Older live-ledger merges reattached the archived event history
             # to its index placeholder. The full archive remains authoritative.
+            if not any(conversation.get(key) for key in (
+                "hosted_events", "hosted_event_sequences", "hosted_event_terminals",
+            )):
+                continue
             target = _conversation_archive_path(str(conversation.get("id") or ""))
             if target is not None and target.is_file():
                 for key in ("hosted_events", "hosted_event_sequences", "hosted_event_terminals"):
