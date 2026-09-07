@@ -91,6 +91,8 @@ def test_simple_calculation_does_not_create_workflow_or_call_router_model():
         "E2E-20260906-02：这是一条普通聊天验收。请直接计算 137×29，只回复计算结果，不调用工具，不分派任务。",
         "Summarize this sentence: The train arrives at noon.",
         "查询一下今天的天气",
+        "先简短说明正在搜索，然后用 web_search 搜索 Hermes Agent 官方 profiles 文档，读取其中一个官方页面，用中文说明独立配置的作用并给出来源链接。直接完成，不派发成员。",
+        "搜索最新资料并整理来源，不分派任务，直接完成。",
     ):
         def unexpected_model(_):
             raise AssertionError("A simple turn must bypass the router model")

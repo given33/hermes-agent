@@ -20,6 +20,7 @@ def test_runtime_archive_contains_code_but_never_instance_state(updater, tmp_pat
     sources = {'run_agent.py': b'answer = 3973', 'hermes_cli/main.py': b'pass',
                'pyproject.toml': b'[project]\nversion = "0.21.0"',
                'deploy/public/runtime-requirements.lock': b'',
+               'deploy/recovery/hermes-fabric-peer-watchdog.sh': b'#!/usr/bin/env bash\nexit 0\n',
                '.env': b'PRIVATE', '.hermes-home/config.yaml': b'PRIVATE',
                'profiles/worker/SOUL.md': b'PRIVATE', 'workspace/result.txt': b'PRIVATE'}
     with tarfile.open(archive, 'w:gz') as output:

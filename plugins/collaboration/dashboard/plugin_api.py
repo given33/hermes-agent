@@ -7698,7 +7698,7 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
     )
     explicit_chat = any(marker in lowered for marker in _SIMPLE_CHAT_MARKERS)
     explicit_single = bool(re.search(
-        r"(?:不要|无需|不用)(?:创建|使用|启动|进行)?(?:团队|群聊|派发|拆分)"
+        r"(?:不要|无需|不用|不必|不)(?:创建|使用|启动|进行)?(?:团队|群聊|派发|分派|拆分|委派)"
         r"|(?:no|without) (?:team|delegation|group chat)", lowered
     ))
     single_turn_tools = any(

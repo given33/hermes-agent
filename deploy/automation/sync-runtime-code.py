@@ -20,7 +20,8 @@ PACKAGES = {'agent', 'gateway', 'hermes_cli', 'hermes_runtime', 'hermes_services
             'tools', 'tui_gateway', 'providers', 'cron', 'acp_adapter', 'plugins'}
 SUPPORT = {'pyproject.toml', 'uv.lock', 'README.md', 'LICENSE',
            'deploy/public/runtime-requirements.lock', 'deploy/dbb3/dbb3_cloud_connector.py',
-           'deploy/automation/sync-runtime-code.py'}
+           'deploy/automation/sync-runtime-code.py',
+           'deploy/recovery/hermes-fabric-peer-watchdog.sh'}
 NODES = {
     'hub': {'root': '/opt/hermes-agent', 'environment': '.venv',
             'units': ['hermes-gateway', 'hermes-studio', 'hermes-agent'], 'user_units': [],
@@ -289,13 +290,17 @@ def main():
         report = {'commit': commit, 'version': version, 'files': files, 'configs': before, 'status': 'preparing'}
         try:
             pairs = [(generation / name, root / name) for name in files]
+            watchdog = Path('/usr/local/sbin/hermes-fabric-peer-watchdog')
+            if watchdog.is_file() and not watchdog.is_symlink():
+                pairs.append((generation / 'deploy/recovery/hermes-fabric-peer-watchdog.sh', watchdog))
             for name in ['.hermes-source-commit', '.hermes-product-commit']:
                 (generation / name).write_text(commit + '\n')
                 pairs.append((generation / name, root / name))
             if node.get('connector'):
                 pairs.append((generation / 'deploy/dbb3/dbb3_cloud_connector.py', Path(node['connector'])))
             for index, (source, destination) in enumerate(pairs):
-                if not destination.resolve().is_relative_to(root) and str(destination) != node.get('connector'):
+                if (not destination.resolve().is_relative_to(root)
+                        and str(destination) != node.get('connector') and destination != watchdog):
                     raise ValueError('Runtime file escapes the configured code directory')
                 saved = backup / str(index)
                 exists = destination.exists()
@@ -333,6 +338,8 @@ def main():
                     raise RuntimeError('Runtime checksum mismatch: ' + name)
             for prefix, unit in reversed(active):
                 run(prefix + ['start', unit])
+            if watchdog.is_file():
+                run(['systemctl', 'try-restart', 'hermes-fabric-peer-watchdog.service'], check=False)
             for prefix, unit in active:
                 deadline = time.monotonic() + 90
                 while run(prefix + ['is-active', unit], check=False).stdout.strip() != 'active':
