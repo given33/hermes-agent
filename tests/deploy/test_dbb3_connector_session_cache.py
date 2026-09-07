@@ -10,6 +10,22 @@ import pytest
 from deploy.dbb3 import dbb3_cloud_connector as connector_module
 
 
+def test_direct_kanban_creation_and_observation_preserve_task_contract(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kanban_db.create_board("hosted-test", name="Test assignments")
+    connector = connector_module.DBB3CloudConnector(SimpleNamespace(), state_file=tmp_path / "state.json")
+    payload = {"board": "hosted-test", "objective": "Run the assigned command", "title": "Assigned task",
+               "profile": "default", "remote_run_id": "run-test", "idempotency_key": "one-assignment"}
+    task_id = connector._create_root(payload)
+    assert connector._create_root(payload) == task_id
+    observed = connector._show_task(task_id, payload)
+    assert observed["task"]["body"].startswith("Run the assigned command")
+    assert observed["task"]["assignee"] == "default"
+    assert observed["task"]["status"] == "ready"
+    assert observed["runs"] == []
+
+
 def test_execution_stream_enable_uses_official_atomic_config_api(monkeypatch, tmp_path):
     import yaml
     from hermes_cli import profiles

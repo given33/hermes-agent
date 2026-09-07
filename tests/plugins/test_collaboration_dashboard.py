@@ -121,6 +121,23 @@ def test_direct_member_assignment_preserves_objective_without_model_planning():
     assert not module._direct_member_plan(objective, ["dbb3-worker", "pc-worker"])
 
 
+def test_final_speaker_reuses_single_worker_delivery_and_preserves_fallback_identity():
+    module = load_module()
+    run = {"role_events": {"worker": {"profile": "dbb3-worker", "status": "completed", "updated_at": 10,
+                                    "activities": [{"tool_name": "terminal"}], "first_token_at": 5}}}
+    message = module._hosted_final_message("turn", run, ["dbb3-worker"], "default", "done", "completed", [], "task")
+    assert message["name"] == "dbb3-worker"
+    assert message["meta"]["message_key"] == "turn:worker:handoff"
+    assert message["meta"]["activities"] == [{"tool_name": "terminal"}]
+    run["role_events"]["worker:server-fallback"] = {"profile": "default", "status": "completed", "updated_at": 20}
+    message = module._hosted_final_message("turn", run, ["dbb3-worker"], "default", "done", "completed", [], "task")
+    assert message["name"] == "default"
+    assert message["meta"]["message_key"] == "turn:worker:server-fallback:handoff"
+    message = module._hosted_final_message("turn", run, ["dbb3-worker", "pc-worker"], "default", "all done", "completed", [], "task")
+    assert message["meta"]["role_stage"] == "aggregator"
+    assert message["meta"]["role_label"] == "Hermes"
+
+
 def test_single_prompt_includes_real_member_registry_and_report_ownership():
     module = load_module()
     prompt = module.build_single_prompt({"messages": []}, "default", "你知道 DBB3 吗？")
@@ -3470,7 +3487,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("你是执行者", worker)
         self.assertIn("完成后把结果直接交给调度员", worker)
         self.assertIn("不得创建或上传交付文件", worker)
-        self.assertIn("你是唯一调度员", dispatcher)
+        self.assertIn("你是调度员", dispatcher)
         self.assertIn("不设置监督者或审阅者角色", dispatcher)
 
     def test_progress_protocol_uses_adaptive_event_and_time_cadence(self):
@@ -4245,8 +4262,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                message.get("meta", {}).get("role_stage")
-                == "aggregator"
+                message.get("meta", {}).get("final_report")
+                and message.get("meta", {}).get("role_stage") == "worker"
                 for message in conversation["messages"]
             )
         )

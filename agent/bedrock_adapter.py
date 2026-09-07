@@ -41,16 +41,10 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Ensure boto3/botocore are installed before any code in this module runs.
+# Install boto3/botocore only when a Bedrock client is requested.
 # Upstream removed boto3 from [all] extras (PRs #24220, #24515); lazy_deps
-# handles on-demand installation so the Bedrock provider still works in the
-# EKS deployment without baking boto3 into the base image.
+# handles on-demand installation without blocking imports by other providers.
 # ---------------------------------------------------------------------------
-try:
-    from tools.lazy_deps import ensure
-    ensure("provider.bedrock", prompt=False)
-except Exception:
-    pass  # lazy_deps unavailable or install failed — let downstream imports surface the real error
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +85,11 @@ _MIN_BOTO3_VERSION = (1, 34, 59)
 
 def _require_boto3():
     """Import boto3, raising a clear error if not installed or too old."""
+    try:
+        from tools.lazy_deps import ensure
+        ensure("provider.bedrock", prompt=False)
+    except Exception:
+        pass  # Preserve the actionable import error below when installation fails.
     try:
         import boto3
     except ImportError:

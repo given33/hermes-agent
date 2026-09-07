@@ -14,6 +14,7 @@ import argparse
 import codecs
 import contextlib
 from collections import OrderedDict
+from dataclasses import asdict
 import hashlib
 import inspect
 import json
@@ -23,6 +24,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -683,6 +685,7 @@ class CloudRelayClient:
         self._stream_ws_lock = threading.Lock()
         self._stream_ws: Any | None = None
         self._worker_runtime_provider: Callable[[], dict[str, Any]] | None = None
+        self._ssl_context = ssl.create_default_context()
 
     def _default_worker_node_id(self) -> str:
         normalized = self.connector_id.lower()
@@ -793,7 +796,7 @@ class CloudRelayClient:
                 headers=request_headers,
             )
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(request, timeout=self.timeout, context=self._ssl_context) as response:
                     return _json_body(response.read())
             except urllib.error.HTTPError as exc:
                 detail = exc.read(4096).decode("utf-8", "replace")
@@ -2419,6 +2422,22 @@ class DBB3CloudConnector:
         return paths
 
     def _show_task(self, task_id: str, local: dict[str, Any]) -> dict[str, Any]:
+        if self.command_runner is run:
+            from hermes_cli import kanban_db
+            board = _text(local.get("board"), 128) or None
+            with kanban_db.connect_closing(board=board) as connection:
+                task = kanban_db.get_task(connection, task_id)
+                if task is None:
+                    raise RuntimeError(f"No such assigned task: {task_id}")
+                return {
+                    "task": asdict(task),
+                    "latest_summary": kanban_db.latest_summary(connection, task_id),
+                    "parents": kanban_db.parent_ids(connection, task_id),
+                    "children": kanban_db.child_ids(connection, task_id),
+                    "comments": [asdict(item) for item in kanban_db.list_comments(connection, task_id)],
+                    "events": [asdict(item) for item in kanban_db.list_events(connection, task_id)],
+                    "runs": [asdict(item) for item in kanban_db.list_runs(connection, task_id)],
+                }
         execution_profile = _text(local.get("execution_profile"), 128)
         code, output = self.command_runner(
             _profiled_hermes_command(
@@ -2594,6 +2613,27 @@ class DBB3CloudConnector:
         return snapshot
 
     def _create_root(self, run_payload: dict[str, Any]) -> str:
+        if self.command_runner is run:
+            from hermes_cli import kanban_db
+            board = _text(run_payload.get("board"), 128) or None
+            workspace = _text(run_payload.get("workspace_path"), 2048) or None
+            profile = _text(run_payload.get("execution_profile") or run_payload.get("profile"), 128) or "default"
+            maximum = None
+            try:
+                if run_payload.get("max_runtime_seconds"):
+                    maximum = max(60, int(run_payload["max_runtime_seconds"]))
+            except (TypeError, ValueError, OverflowError):
+                pass
+            with kanban_db.connect_closing(board=board) as connection:
+                return kanban_db.create_task(
+                    connection, board=board,
+                    title=_text(run_payload.get("title"), 120) or "Cloud hosted task",
+                    body=str(run_payload.get("objective") or "") + "\n\nCloud hosted run: " + _text(run_payload.get("remote_run_id"), 256),
+                    assignee=profile, created_by="dbb3-cloud-connector",
+                    workspace_kind="dir" if workspace else "scratch", workspace_path=workspace,
+                    idempotency_key=_text(run_payload.get("idempotency_key"), 512) or None,
+                    max_runtime_seconds=maximum,
+                )
         code, output = self.command_runner(build_root_task_command(run_payload), timeout=60)
         if code != 0:
             raise RuntimeError(output[-1000:] or "hermes kanban create failed")
@@ -2833,13 +2873,17 @@ class DBB3CloudConnector:
             prepared["title"] = "Hermes hosted run " + (
                 _text(run_payload.get("remote_run_id"), 64) or "task"
             )
+            objective = str(run_payload.get("objective") or "").strip()
             prepared["objective"] = (
-                "Read the authoritative UTF-8 user objective from this local path "
-                f"before executing: {objective_path}. "
-                "Do not infer or replace the user request. "
+                (objective if len(objective) <= 10000 else
+                 "Read the authoritative UTF-8 user objective from this local path "
+                 f"before executing: {objective_path}. Do not infer or replace the user request.")
+                + "\n\n"
                 "Before exiting, finish the root task by calling kanban_complete "
                 "with the verified result, or kanban_block with a concrete blocker. "
-                "A comment alone is not a terminal outcome."
+                "A comment alone is not a terminal outcome. "
+                "After completion, return your result and exit. If the task is already terminal "
+                "or cancelled, stop; never reopen it or edit orchestration databases, locks, or run records."
             )
             if _coerce_flag(run_payload.get("artifact_required")):
                 workspace = objective_path.parent / "workspace"

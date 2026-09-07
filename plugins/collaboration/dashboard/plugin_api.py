@@ -6191,7 +6191,7 @@ def hosted_role_delivery_contract(role_name: str) -> str:
             "清单项写具体动作和产物，保持 id 稳定；失败或阻断保留未完成状态并说明原因，禁止收到任务或发起工具后就标记完成。",
             "Worker 的更新必须把实际动作与证据绑定：说明验证了什么、观察到什么、这对任务结论有何影响，以及下一组操作是什么。",
             "修改、部署或生成产物后必须给出可复核位置、版本/哈希或测试结果；失败不得包装为完成，尚未运行的测试必须标为未验证。",
-            "完成后把结果、证据、产物、异常路径和明确未完成项提交给 Hermes 主助手；这只是本成员的完成回报。由主助手核验全部成员回报并向用户给出唯一的最终答复，不自行宣称整个任务完成。",
+            "完成后提交自己的结果、证据、产物、异常路径和明确未完成项。只有一个执行成员时，该成员的交付就是最终答复，不再由调度员重复转述；多个成员时，各成员只汇报自己的部分，由当前会话 Hermes 汇总一次。",
         )
     return "\n".join((f"【{role_name} 角色交付契约】", *rules))
 
@@ -7267,7 +7267,7 @@ def _manager_plan_prompt(
         for item in (
             "你是 Hermes Manager（调度员/规划者），是整个 agent team 的调度中枢。",
             *directive_lines,
-            "你只负责必要的任务分工。此处的 plan 是成员分工表，不是成员个人的 todo 清单。Hermes 主助手负责接收成员结果、核验并给用户最终答复。",
+            "你只负责必要的任务分工。此处的 plan 是成员分工表，不是成员个人的 todo 清单。一个成员由该成员直接交付；多个成员由当前会话 Hermes 汇总一次；调度员不重复发送最终答复。",
             "不做深度规划：不写 objective、验收标准、证据要求或测试方案；"
             "不调查环境、不派调查子代理、不调用任何工具，直接输出拆分结果。",
             "拆分要求：",
@@ -7465,6 +7465,37 @@ def _render_deterministic_hosted_report(
             lines.append(f"{item.get('assignee') or '执行成员'}：{label}。")
         lines.append(result or "执行成员尚未提交结果。")
     return "\n\n".join(lines)
+
+
+def _hosted_final_message(turn_id, run, worker_profiles, dispatcher_profile,
+                          result, status, attachments, task_id):
+    """Choose one final speaker, reusing a single worker's durable delivery."""
+    candidates = [
+        (stage, state) for stage, state in (run.get("role_events") or {}).items()
+        if stage.split(":", 1)[0] == "worker" and isinstance(state, dict)
+        and state.get("status") in _HOSTED_TERMINAL_STATUSES
+    ]
+    stage, state = "aggregator", {}
+    if len(set(worker_profiles)) == 1 and candidates:
+        stage, state = max(candidates, key=lambda item: int(item[1].get("updated_at") or 0))
+    profile = str(state.get("profile") or dispatcher_profile)
+    member_id = hosted_member_id(profile, stage)
+    meta = {
+        "role_stage": stage, "role_label": "Hermes" if stage == "aggregator" else profile,
+        "profile": profile, "member_id": member_id,
+        "message_key": f"{turn_id}:{stage}:handoff" if state else f"{turn_id}:aggregator:completed",
+        "phase": "handoff" if state else "completed", "final_report": True,
+        "collapse_activities": True, "attachments": attachments, "task_id": task_id,
+        "activities": list(state.get("activities") or []),
+        "actual_model": str(state.get("actual_model") or ""),
+        "actual_provider": str(state.get("actual_provider") or ""),
+    }
+    for key in ("started_at", "model_started_at", "first_token_at", "completed_at",
+                "runtime_session_id", "remote_phase", "dispatched_at", "accepted_at"):
+        if state.get(key):
+            meta[key] = state[key]
+    return {"role": "assistant", "name": profile, "content": result,
+            "status": status, "kind": "message", "meta": meta}
 
 
 def _hosted_manager_plan_todo_snapshot(
@@ -8689,7 +8720,7 @@ def build_group_prompt(
             "reason 用“问题 + 选项：A. ... B. ...”格式；能自行判断的不要打扰用户。"
         ),
         "dispatcher": (
-            "你是唯一调度员。负责理解用户目标、拆分 Todo、选择 worker、处理依赖并直接汇总结果；"
+            "你是调度员。负责必要的任务分工、选择 worker 和处理依赖；一个 worker 直接交付，多个 worker 由当前会话 Hermes 汇总一次，你不重复汇报最终结果；"
             "不设置监督者或审阅者角色，也不把任务再次转交给其他调度员。"
         ),
     }[prompt_role]
@@ -8770,7 +8801,7 @@ def build_single_prompt(
         "当前连接状态不代表任务已接单；不要把已配置成员说成不存在。"
         "称呼、问候、计算、询问你所在主机或模型由你直接回答；只有明确指定成员执行、"
         "或确有跨成员协作需求时才派发。调度员只汇报派发进展，成员报告自己的实际过程和证据，"
-        "最终结果由当前会话的 Hermes 汇总。不得声称未经执行确认的派发成功。\n"
+        "一个执行成员时由该成员直接返回最终结果，多个成员时最终结果由当前会话的 Hermes 汇总一次。不得声称未经执行确认的派发成功。\n"
         "请使用简体中文直接回答并执行用户请求。你仍可使用该 Profile 已配置的"
         "模型、Skill、MCP、记忆和工具。回复应清晰说明结果、关键过程与错误。\n\n"
         f"最近对话：\n{recent or '暂无'}\n\n"
@@ -15005,7 +15036,7 @@ def execute_hosted_workflow(
         "完成后必须对当前已分配根任务调用 kanban_complete 并附上实际结果，"
         "无法继续则调用 kanban_block 说明原因。只写评论或口头说完成不算交付。"
         "不得创建、改派、关闭或删除其他成员的任务，不得宣称整个用户任务已完成；"
-        "协作服务收到所有成员的交付后，由当前会话的 Hermes 向用户给出最终汇报。"
+        "单成员任务由该成员直接交付最终结果；多成员任务由当前会话 Hermes 汇总一次。"
         if remote_workers else
         "可以读取根任务和已分配工作项，也可以向已分配工作项写入进度、证据和交接评论；"
         "只能完成你获分配的工作项，不得关闭团队共享根任务或改派其他成员任务。"
@@ -15196,7 +15227,8 @@ def execute_hosted_workflow(
             "name": dispatcher_profile,
             "content": (
                 f"已将 {len(todo_items)} 项任务派发给 {', '.join(worker_profiles)}。"
-                "成员执行完成后，由当前会话的 Hermes 汇总并给出最终结果。"
+                + ("该成员直接返回最终结果。" if len(worker_profiles) == 1 else
+                   "全部成员完成后，由当前会话的 Hermes 汇总一次最终结果。")
             ),
             "status": "completed",
             "kind": "message",
@@ -15652,7 +15684,7 @@ def execute_hosted_workflow(
         artifacts=handoff_artifacts,
         failures=handoff_failures,
     )
-    _persist_hosted_turn(
+    run = _persist_hosted_turn(
         conversation_id,
         turn_id,
         patch={
@@ -15749,24 +15781,8 @@ def execute_hosted_workflow(
                 final_result,
             ),
         },
-        message={
-            "role": "assistant",
-            "name": dispatcher_profile,
-            "content": final_result,
-            "status": final_status,
-            "kind": "message",
-            "meta": {
-                "role_stage": "aggregator",
-                "role_label": "Hermes · 调度结果",
-                "collapse_activities": True,
-                "final_report": True,
-                "attachments": attachments,
-                "task_id": task_id,
-                "activities": [],
-                "actual_model": "",
-                "actual_provider": "",
-            },
-        },
+        message=_hosted_final_message(turn_id, run, worker_profiles, dispatcher_profile,
+                                      final_result, final_status, attachments, task_id),
     )
     _schedule_persisted_terminal_notification(
         conversation_id,
