@@ -100,6 +100,70 @@ def test_simple_calculation_does_not_create_workflow_or_call_router_model():
         assert result["profiles"] == ["default"], prompt
 
 
+def test_state_snapshot_isolates_containers_without_copying_transcript_text():
+    module = load_module()
+    text = "stored transcript " * 10000
+    state = {"conversations": [{"messages": [{"content": text}], "value": None}]}
+    cloned = module._copy_state_document(state)
+    assert cloned == state
+    assert cloned["conversations"][0]["messages"][0]["content"] is text
+    cloned["conversations"][0]["messages"][0]["content"] = "changed"
+    cloned["conversations"].append({})
+    assert len(state["conversations"]) == 1
+    assert state["conversations"][0]["messages"][0]["content"] == text
+
+
+def test_live_checkpoint_does_not_restore_archived_event_history(monkeypatch, tmp_path):
+    module = load_module()
+    archive = tmp_path / "archived.json"
+    original = {"id": "old", "messages": [{"content": "retained"}], "hosted_events": [{"cursor": 1}]}
+    archive.write_text(json.dumps(original), encoding="utf-8")
+    placeholder = {"id": "old", "owner_id": "owner", "archived": True, "messages": []}
+    previous = {**placeholder, "hosted_events": [{"cursor": 1}]}
+    module._merge_published_hosted_events(placeholder, previous)
+    assert "hosted_events" not in placeholder
+    monkeypatch.setattr(module, "_archive_root", lambda: tmp_path)
+    monkeypatch.setattr(module, "_conversation_archive_path", lambda _: archive)
+    module._archive_completed_conversations({"conversations": [previous]})
+    assert "hosted_events" not in previous
+    assert json.loads(archive.read_text()) == original
+
+
+def test_connector_run_reads_do_not_clone_account_and_keep_owner_checks(monkeypatch):
+    module = load_module()
+    remote = {"id": "remote-1", "connector_id": "dbb3-primary", "status": "running", "deadline_at": 10**15}
+    state = {"conversations": [{"id": "chat", "hosted_turns": {"turn": {"remote_runs": {"worker": remote}}}}]}
+    monkeypatch.setattr(module, "_load_single_state_for_event_stream", lambda: state)
+    monkeypatch.setattr(module, "_require_connector", lambda _: "dbb3-primary")
+    checked = []
+    monkeypatch.setattr(module, "_require_connector_account_boundary", lambda *args: checked.append(args))
+    def unexpected_mutable_read():
+        raise AssertionError("Read-only connector calls must not clone all conversations")
+    monkeypatch.setattr(module, "load_single_state", unexpected_mutable_read)
+    assert module._remote_run_for_connector(None, "remote-1")[2] == remote
+    assert len(checked) == 1
+    monkeypatch.setattr(module, "_require_connector", lambda _: "hk-primary")
+    with pytest.raises(module.HTTPException) as error:
+        module._remote_run_for_connector(None, "remote-1")
+    assert error.value.status_code == 404
+
+
+def test_overdue_connector_run_still_commits_timeout_from_private_snapshot(monkeypatch):
+    module = load_module()
+    remote = {"id": "remote-1", "connector_id": "dbb3-primary", "status": "running", "deadline_at": 1}
+    state = {"conversations": [{"id": "chat", "hosted_turns": {"turn": {"remote_runs": {"worker": remote}}}}]}
+    monkeypatch.setattr(module, "_load_single_state_for_event_stream", lambda: state)
+    monkeypatch.setattr(module, "load_single_state", lambda: module._copy_state_document(state))
+    writes = []
+    monkeypatch.setattr(module, "save_single_state", lambda value: writes.append(value))
+    monkeypatch.setattr(module, "_notify_hosted_update", lambda _: None)
+    result = module._advance_remote_run_deadline("remote-1")
+    assert result["cancel_requested"]
+    assert result["cancel_kind"] == "timeout"
+    assert len(writes) == 1
+    assert remote["status"] == "running"
+
+
 def test_parent_report_preserves_full_results_and_failure_without_board():
     module = load_module()
     long_result = "Verified result.\n" * 50

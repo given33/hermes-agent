@@ -482,6 +482,7 @@ async def _run_tool_artifact_cleanup_loop(stop: asyncio.Event) -> None:
 @asynccontextmanager
 async def collaboration_dashboard_lifespan(_app):
     """Resume persisted work as soon as the dashboard process starts."""
+    _latency_trace.configure()
     try:
         state = load_single_state()
         conversations = state.get("conversations") or []
@@ -793,7 +794,8 @@ def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
 
 def _merge_published_hosted_events(snapshot: dict[str, Any], previous: dict[str, Any]) -> None:
     """Keep the stream cursor and uncheckpointed deltas across unrelated saves."""
-    if (snapshot.get("owner_id") != previous.get("owner_id")
+    if (snapshot.get("archived")
+            or snapshot.get("owner_id") != previous.get("owner_id")
             or snapshot.get("account_generation") != previous.get("account_generation")
             or snapshot.get("delete_requested")):
         return
@@ -2937,8 +2939,15 @@ def _load_state_store(
 
 
 def _copy_state_document(state: dict[str, Any]) -> dict[str, Any]:
-    """Clone persisted JSON without Python's recursive deepcopy hot path."""
-    return json.loads(json.dumps(state, ensure_ascii=False, separators=(",", ":")))
+    """Isolate mutable JSON containers while sharing immutable transcript text."""
+    def clone(value):
+        if isinstance(value, dict):
+            return {key: clone(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [clone(item) for item in value]
+        return value
+
+    return clone(state)
 
 
 _HOSTED_ROLE_MIGRATION_MARKER = "_hosted_role_migration_version"
@@ -3870,6 +3879,12 @@ def _archive_completed_conversations(state: dict[str, Any]) -> None:
         if not isinstance(conversation, dict):
             continue
         if conversation.get("archived"):
+            # Older live-ledger merges reattached the archived event history
+            # to its index placeholder. The full archive remains authoritative.
+            target = _conversation_archive_path(str(conversation.get("id") or ""))
+            if target is not None and target.is_file():
+                for key in ("hosted_events", "hosted_event_sequences", "hosted_event_terminals"):
+                    conversation.pop(key, None)
             continue
         # A deletion tombstone is a durable operation, not an idle transcript.
         # Never replace it with an archive placeholder that omits the intent.
@@ -10424,6 +10439,7 @@ def _run_hosted_role(
     provider_max_attempts: Optional[int] = None,
     retry_sleeper: Callable[[float], None] = time.sleep,
 ) -> tuple[str, str, dict[str, Any]]:
+    _latency_trace.instant("hosted.role.enter", request_id=turn_id, stage=role_stage)
     execution_owner = str(execution_owner or f"local-{uuid.uuid4().hex}")
     with _STATE_LOCK:
         artifact_state = load_single_state()
@@ -10907,6 +10923,8 @@ def _run_hosted_role(
             )
         )
         if should_publish_live:
+            if first_visible_delta or event_type in {"tool.start", "tool.complete", "message.complete"}:
+                _latency_trace.instant("hosted.event.publish", request_id=turn_id, event=event_type)
             # Keep lifecycle/first-token rendering independent from the
             # durable JSON checkpoint.  The latter can take seconds under
             # load; the live projection is replaced by the next checkpoint.
@@ -10930,7 +10948,10 @@ def _run_hosted_role(
                 event_type == "request.accepted"
                 and not is_chat_role
             )
-            or event_type in {"error", "message.complete"}
+            # The runner persists the settled chat result immediately after
+            # its callback returns. Do not block the event-dispatch thread
+            # with a duplicate full-state checkpoint here.
+            or (event_type in {"error", "message.complete"} and not is_chat_role)
             or first_status_update
             or (first_visible_delta and not is_chat_role)
             or (
@@ -10985,6 +11006,7 @@ def _run_hosted_role(
             intervention = claim_pending_intervention({"steer"}, force=True)
             if isinstance(intervention, dict):
                 raise _HostedRoleIntervention(intervention)
+            _latency_trace.instant("hosted.runner.enter", request_id=turn_id, stage=role_stage)
             result = _invoke_profile_runner(
                 runner,
                 runtime_profile or profile,
@@ -13577,6 +13599,18 @@ def _advance_remote_run_deadline(remote_run_id: str) -> dict[str, Any] | None:
     persisted: dict[str, Any] | None = None
     now = int(time.time() * 1000)
     with _STATE_LOCK:
+        state = _load_single_state_for_event_stream()
+        location = _remote_run_location(state, remote_run_id)
+        if location is None:
+            return None
+        remote_run = location[3]
+        deadline = _positive_int(remote_run.get(
+            "cancel_force_terminal_at" if _coerce_flag(remote_run.get("cancel_requested")) else "deadline_at"
+        ))
+        if (str(remote_run.get("status") or "queued").strip().lower() in _REMOTE_TERMINAL_STATUSES
+                or deadline is None or now < deadline):
+            return dict(remote_run)
+        # Only overdue runs need a private writable account snapshot.
         state = load_single_state()
         location = _remote_run_location(state, remote_run_id)
         if location is None:
@@ -16890,7 +16924,7 @@ def _remote_run_for_connector(
     connector_id = _require_connector(request)
     _advance_remote_run_deadline(remote_run_id)
     with _STATE_LOCK:
-        state = load_single_state()
+        state = _load_single_state_for_event_stream()
         location = _remote_run_location(state, remote_run_id)
         if location is None:
             raise HTTPException(status_code=404, detail="Remote run not found")
@@ -20308,6 +20342,7 @@ def enqueue_hosted_turn(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     request_id = payload.request_id.strip()[:256]
     turn_id = payload.turn_id.strip()[:256]
+    _latency_trace.instant("hosted.enqueue.enter", request_id=turn_id)
     if not request_id:
         raise HTTPException(status_code=400, detail="request_id is required")
     if not turn_id:

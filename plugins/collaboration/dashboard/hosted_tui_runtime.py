@@ -537,12 +537,16 @@ class _GatewayProcess:
         conversation_id: str,
         artifact_context: dict[str, str],
     ) -> str:
+        from hermes_services import latency_trace
+
+        latency_trace.instant("hosted.gateway.enter", request_id=turn_id)
         state = self.ensure_session(
             conversation_id,
             requested_session_id,
             artifact_context=artifact_context,
         )
         with state.turn_lock:
+            latency_trace.instant("hosted.gateway.session_ready", request_id=turn_id)
             live_session_id = state.live_session_id
             stored_session_id = state.stored_session_id
             sink = _TurnSink(event_callback)
@@ -560,6 +564,7 @@ class _GatewayProcess:
             try:
                 if state.latest_session_info is not None and event_callback is not None:
                     event_callback(dict(state.latest_session_info))
+                latency_trace.instant("hosted.gateway.prompt_submit", request_id=turn_id)
                 response = self.rpc(
                     "prompt.submit",
                     {
@@ -583,6 +588,7 @@ class _GatewayProcess:
                         self._interrupt(live_session_id)
                         raise TimeoutError("Hermes 0.20 agent pre-warm timed out")
                 if not sink.done.is_set():
+                    latency_trace.instant("hosted.gateway.agent_ready", request_id=turn_id)
                     if event_callback is not None:
                         try:
                             event_callback(
