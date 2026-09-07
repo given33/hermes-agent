@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import atexit
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -46,6 +47,13 @@ def _allow_tools_from_context(artifact_context: dict[str, str]) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _conversation_workspace(runtime_home: str, conversation_id: str, context: dict[str, str]) -> Path:
+    identity = json.dumps([context.get("owner_id", ""), context.get("account_generation", ""), conversation_id])
+    workspace = Path(runtime_home).resolve() / "workspaces" / hashlib.sha256(identity.encode()).hexdigest()
+    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return workspace
+
+
 @dataclass
 class _TurnSink:
     callback: Optional[Callable[[dict[str, Any]], None]]
@@ -78,6 +86,7 @@ class _HostedSessionState:
 
 class _GatewayProcess:
     def __init__(self, *, env: dict[str, str], cwd: str) -> None:
+        self.runtime_home = env["HERMES_HOME"]
         self._write_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._session_lock = threading.Lock()
@@ -388,6 +397,10 @@ class _GatewayProcess:
                 "close_on_disconnect": False,
                 "tool_artifact_context": dict(artifact_context),
             }
+            if runtime_home := getattr(self, "runtime_home", ""):
+                # Code is imported through PYTHONPATH. Generated files belong
+                # to the account/profile's durable conversation workspace.
+                session_params["cwd"] = str(_conversation_workspace(runtime_home, conversation_id, artifact_context))
             if not _allow_tools_from_context(artifact_context):
                 # This is a plain mobile chat turn.  Let the official gateway
                 # build the persistent session without joining MCP discovery;
@@ -421,6 +434,10 @@ class _GatewayProcess:
             ).strip()
             if not live_session_id:
                 raise HostedTuiGatewayError("Hermes 0.20 did not return a live session id")
+            if requested_session_id and session_params.get("cwd"):
+                # Resume restores the old stored cwd; explicitly move hosted
+                # sessions created by older clients out of the code directory.
+                self.rpc("session.cwd.set", {"session_id": live_session_id, "cwd": session_params["cwd"]}, timeout=30.0)
             state = _HostedSessionState(
                 conversation_id=conversation_id,
                 live_session_id=live_session_id,
@@ -781,7 +798,7 @@ def _gateway_for(
         env["PYTHONPATH"] = os.pathsep.join(
             dict.fromkeys([import_root, *inherited.split(os.pathsep)])
         ).rstrip(os.pathsep)
-        gateway = _GatewayProcess(env=env, cwd=import_root)
+        gateway = _GatewayProcess(env=env, cwd=runtime_home)
         _POOL[key] = gateway
         return gateway
 

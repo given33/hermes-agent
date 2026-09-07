@@ -14,7 +14,27 @@ from plugins.collaboration.dashboard.hosted_tui_runtime import (
     _HostedSessionState,
     _TurnSink,
     _pool_key,
+    _conversation_workspace,
 )
+
+
+def test_conversation_workspace_is_writable_and_scoped_to_profile_owner_and_conversation(tmp_path):
+    context = {"owner_id": "alice", "account_generation": "generation-1"}
+    root = tmp_path / "profile"
+    workspace = _conversation_workspace(str(root), "conversation-1", context)
+    output = workspace / "report.md"
+    output.write_text("verified output", encoding="utf-8")
+    assert output.read_text(encoding="utf-8") == "verified output"
+    assert workspace == _conversation_workspace(str(root), "conversation-1", context)
+    variants = [
+        _conversation_workspace(str(root), "conversation-2", context),
+        _conversation_workspace(str(root), "conversation-1", {**context, "owner_id": "bob"}),
+        _conversation_workspace(str(root), "conversation-1", {**context, "account_generation": "generation-2"}),
+        _conversation_workspace(str(tmp_path / "other-profile"), "conversation-1", context),
+    ]
+    assert len({workspace, *variants}) == 5
+    assert all(not (variant / output.name).exists() for variant in variants)
+    assert _conversation_workspace(str(root), "../../escape", context).is_relative_to(root)
 
 
 def _event(event_type: str, payload: dict) -> str:
@@ -194,8 +214,9 @@ def test_model_events_are_delivered_before_delayed_prompt_ack():
     assert observed == ["thinking.delta", "message.complete"]
 
 
-def test_gateway_tracks_multiple_conversations_with_distinct_artifact_scopes():
+def test_gateway_tracks_multiple_conversations_with_distinct_artifact_scopes(tmp_path):
     gateway = _GatewayProcess.__new__(_GatewayProcess)
+    gateway.runtime_home = str(tmp_path)
     gateway._session_lock = threading.Lock()
     gateway._sessions_by_conversation = {}
     gateway._sessions_by_live = {}
@@ -234,6 +255,8 @@ def test_gateway_tracks_multiple_conversations_with_distinct_artifact_scopes():
     assert gateway._sessions_by_live == {"live-a": state_a, "live-b": state_b}
     assert calls[0][1]["tool_artifact_context"] == scope_a
     assert calls[1][1]["tool_artifact_context"] == scope_b
+    assert calls[0][1]["cwd"] != calls[1][1]["cwd"]
+    assert all(Path(call[1]["cwd"]).is_dir() for call in calls)
 
 
 def test_gateway_replays_session_ready_emitted_before_local_registration():
@@ -257,6 +280,25 @@ def test_gateway_replays_session_ready_emitted_before_local_registration():
 
     assert state.agent_ready.is_set()
     assert gateway._early_session_ready == set()
+
+
+def test_resumed_hosted_session_reanchors_file_tools_before_next_prompt(tmp_path):
+    gateway = _GatewayProcess.__new__(_GatewayProcess)
+    gateway.runtime_home = str(tmp_path)
+    gateway._session_lock = threading.Lock()
+    gateway._sessions_by_conversation = {}
+    gateway._sessions_by_live = {}
+    calls = []
+
+    def rpc(method, params, *, timeout):
+        calls.append((method, params))
+        return {"session_id": "live", "stored_session_id": "stored"}
+
+    gateway.rpc = rpc
+    gateway.ensure_session("conversation", "stored", artifact_context={"owner_id": "owner"})
+    assert [method for method, _ in calls] == ["session.resume", "session.cwd.set"]
+    assert calls[1][1]["session_id"] == "live"
+    assert Path(calls[1][1]["cwd"]).is_relative_to(tmp_path)
 
 
 def test_session_rpc_does_not_block_reader_or_other_conversations():
