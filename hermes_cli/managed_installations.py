@@ -583,6 +583,9 @@ def _atomic_runtime_write(path: Path, content: bytes, *, mode: int = 0o600) -> N
 
     if path.is_symlink():
         raise RuntimeError(f"managed runtime target is unsafe: {path.name}")
+    if path.is_file() and path.read_bytes() == content:
+        path.chmod(mode)
+        return
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
@@ -725,8 +728,9 @@ def _materialize_account_runtime_locked(
     )
     merged["skills"] = skills_config
 
-    encoded_config = yaml.safe_dump(
+    encoded_config = yaml.dump(
         merged,
+        Dumper=getattr(yaml, "CSafeDumper", yaml.SafeDumper),
         allow_unicode=True,
         default_flow_style=False,
         sort_keys=False,

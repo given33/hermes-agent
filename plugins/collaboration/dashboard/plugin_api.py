@@ -1477,6 +1477,10 @@ _SIMPLE_CHAT_MARKERS = (
     "聊聊",
 )
 _SINGLE_TURN_TOOL_MARKERS = (
+    "terminal",
+    "终端",
+    "运行命令",
+    "执行命令",
     "搜索",
     "查一下",
     "查询",
@@ -2825,6 +2829,10 @@ def _deliver_and_persist_hosted_event_hook_outbox(
 ) -> dict[str, Any]:
     """Deliver committed callbacks and persist their ACK without rollback."""
 
+    if not state.get("_hosted_event_persistence_outbox") and not state.get("_hosted_event_persistence_acks"):
+        # Most reads have no observer work. Avoid copying every conversation
+        # under the shared state lock merely to discover an empty outbox.
+        return state
     outcome = dispatch_persisted_hosted_event_hooks(
         state,
         store_path=str(target),
@@ -3129,6 +3137,8 @@ def load_state(
         dispatch_persistence_hooks=dispatch_persistence_hooks,
     )
     result = {"rooms": data["rooms"]}
+    if _HOSTED_ROLE_MIGRATION_MARKER in data:
+        result[_HOSTED_ROLE_MIGRATION_MARKER] = data[_HOSTED_ROLE_MIGRATION_MARKER]
     for room in result["rooms"]:
         if not isinstance(room, dict):
             continue
@@ -3222,6 +3232,8 @@ def load_single_state(
         except (TypeError, ValueError):
             conversation["hosted_event_cursor"] = 0
     result = {"conversations": normalized_conversations}
+    if _HOSTED_ROLE_MIGRATION_MARKER in data:
+        result[_HOSTED_ROLE_MIGRATION_MARKER] = data[_HOSTED_ROLE_MIGRATION_MARKER]
     tombstones = _account_deletion_tombstones(data)
     if tombstones:
         result[_ACCOUNT_DELETION_TOMBSTONES_KEY] = tombstones
@@ -7625,6 +7637,10 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         and (imperative or not explanatory)
     )
     explicit_chat = any(marker in lowered for marker in _SIMPLE_CHAT_MARKERS)
+    explicit_single = bool(re.search(
+        r"(?:不要|无需|不用)(?:创建|使用|启动|进行)?(?:团队|群聊|派发|拆分)"
+        r"|(?:no|without) (?:team|delegation|group chat)", lowered
+    ))
     single_turn_tools = any(
         marker in lowered for marker in _SINGLE_TURN_TOOL_MARKERS
     )
@@ -7646,7 +7662,7 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         and not ambiguous_delegation
         and not requires_artifact_delivery(text)
     )
-    hard_chat = (
+    hard_chat = explicit_single or (
         not hard_work
         and len(text) <= 80
         and (explicit_chat or trivial_chat or plain_chat or single_turn_tools)
@@ -7662,6 +7678,8 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         score = max(score, 4)
     if explicit_chat and len(text) < 30:
         score -= 3
+    if explicit_single:
+        score = min(score, 3)
 
     if score < 4:
         if explicit_chat or trivial_chat or plain_chat or single_turn_tools:
@@ -10845,7 +10863,7 @@ def _run_hosted_role(
         } or first_visible_delta
         live_now = time.monotonic()
         should_publish_live = (
-            is_chat_role
+            visible
             and event_type in live_event_types
             and (
                 force_live_projection

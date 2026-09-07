@@ -1158,6 +1158,38 @@ def test_checkpoint_does_not_deduplicate_different_turns_with_legacy_event_keys(
     assert snapshot["hosted_event_cursor"] == 2
 
 
+def test_empty_persistence_outbox_does_not_copy_history(monkeypatch, tmp_path):
+    module = _load_module()
+    state = {"conversations": [{"messages": [{"content": "history"}]}]}
+    monkeypatch.setattr(module, "dispatch_persisted_hosted_event_hooks",
+                        lambda *args, **kwargs: pytest.fail("empty outbox dispatched"))
+    assert module._deliver_and_persist_hosted_event_hook_outbox(tmp_path / "single.json", state,
+                                                              "conversations") is state
+
+
+def test_normalized_state_preserves_migration_marker_across_a_write(monkeypatch, tmp_path):
+    module = _load_module()
+    path = tmp_path / "single.json"
+    module.save_single_state({"conversations": []}, path)
+    state = module.load_single_state(path)
+    assert state[module._HOSTED_ROLE_MIGRATION_MARKER] == module._HOSTED_ROLE_MIGRATION_VERSION
+    module.save_single_state(state, path)
+    monkeypatch.setattr(module, "migrate_hosted_container",
+                        lambda *_: pytest.fail("already migrated history migrated again"))
+    assert module.load_single_state(path)[module._HOSTED_ROLE_MIGRATION_MARKER] == module._HOSTED_ROLE_MIGRATION_VERSION
+
+
+def test_single_agent_tool_request_is_not_promoted_to_a_team_due_to_command_length():
+    module = _load_module()
+    route = module._rule_based_user_intent(
+        '请在当前会话调用 terminal 运行 python3 -c "import time; print(1); time.sleep(3); print(2)"。'
+        '这是单步任务，无需团队或派发。完成后只回复执行结果。'
+    )
+    assert route["mode"] == "chat"
+    assert route["lock_level"] == "hard_chat"
+    assert route["needs_tools"] is True
+
+
 def test_empty_intervention_check_does_not_block_gateway_event_dispatch(monkeypatch):
     module = _load_module()
     module._HOSTED_LIVE_CONVERSATIONS["c"] = {"hosted_turns": {"t": {"interventions": []}}}

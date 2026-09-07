@@ -29,6 +29,17 @@ INSTALL_TOKEN = "installation-private-token-0000000000000001"
 STATUS_TOKEN = "status-private-token-00000000000000000001"
 
 
+def test_identical_runtime_materialization_preserves_file_generation(tmp_path):
+    path = tmp_path / "config.yaml"
+    managed_installations._atomic_runtime_write(path, b"model: stable\n")
+    before = path.stat()
+    managed_installations._atomic_runtime_write(path, b"model: stable\n")
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+    assert path.stat().st_ino == before.st_ino
+    managed_installations._atomic_runtime_write(path, b"model: changed\n")
+    assert path.read_bytes() == b"model: changed\n"
+
+
 def test_managed_installations_database_uses_fallback_when_home_is_full(
     monkeypatch, tmp_path: Path
 ):
