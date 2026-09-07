@@ -1035,7 +1035,7 @@ class CloudRelayClient:
                             **self._worker_status_fields(),
                         }, separators=(",", ":")))
                         last_heartbeat_sent = time.monotonic()
-            except Exception:
+            except Exception as exc:
                 # A rotated connector credential may close the websocket
                 # during the HTTP upgrade.  Reload before the next backoff
                 # cycle; REST requests retain their own 401 retry boundary.
@@ -1044,10 +1044,11 @@ class CloudRelayClient:
                     return
                 if not handshake_accepted:
                     handshake_failures += 1
-                    # A proxy or older backend may not expose /worker/ws.
-                    # After a few bounded attempts, use the legacy SSE wakeup
-                    # stream rather than burning a reconnect loop forever.
-                    if handshake_failures >= 3:
+                    # Only an unsupported endpoint warrants a permanent fallback.
+                    # Temporary outages must reconnect WS to resume node heartbeats.
+                    response = getattr(exc, "response", None)
+                    status_code = getattr(response, "status_code", None)
+                    if handshake_failures >= 3 and status_code in {404, 405, 426, 501}:
                         self._stream_sse_events(wake, stop, on_steer)
                         return
             finally:

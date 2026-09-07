@@ -920,6 +920,21 @@ def test_behavior_eval_runtime_binding_fails_closed_on_profile_mismatch(monkeypa
     assert exc_info.value.status_code == 409
 
 
+def test_chat_routing_validates_identity_without_loading_profile_catalog(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "list_profile_names", lambda: ["default", "deleted"])
+    monkeypatch.setattr(module, "profile_exists", lambda name: name == "default")
+    monkeypatch.setattr(module, "available_profiles", lambda: pytest.fail("expensive catalog read"))
+    _, mode, profiles, _ = module._hosted_route_parameters(
+        route_metadata={"mode": "chat"}, requested_profiles=["default"],
+    )
+    assert (mode, profiles) == ("chat", ["default"])
+    for profile in ("deleted", "missing"):
+        with pytest.raises(module.HTTPException) as error:
+            module._hosted_route_parameters(route_metadata={"mode": "chat"}, requested_profiles=[profile])
+        assert error.value.status_code == 400
+
+
 def test_retired_profiles_are_rejected_without_catalog_reappearance(
     monkeypatch,
 ):

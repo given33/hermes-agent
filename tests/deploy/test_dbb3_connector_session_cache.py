@@ -292,7 +292,9 @@ def test_worker_websocket_falls_back_after_repeated_handshake_failures(monkeypat
     calls = []
 
     def fake_connect(_url, **_kwargs):
-        raise OSError("proxy does not support websocket upgrade")
+        error = OSError("proxy does not support websocket upgrade")
+        error.response = type("Response", (), {"status_code": 404})()
+        raise error
 
     class StopAfterRetries:
         def __init__(self):
@@ -318,6 +320,29 @@ def test_worker_websocket_falls_back_after_repeated_handshake_failures(monkeypat
 
     assert calls == [(wake, stop, callback)]
     assert stop.waits == 2
+
+
+def test_worker_websocket_keeps_retrying_after_temporary_outage(monkeypatch):
+    client = connector_module.CloudRelayClient("https://example.test", "token", worker_ws=True)
+    attempts = []
+    fallbacks = []
+
+    def connect(_url, **_kwargs):
+        attempts.append(True)
+        raise TimeoutError("server restarting")
+
+    class Stop:
+        def is_set(self):
+            return False
+
+        def wait(self, _seconds):
+            return len(attempts) >= 5
+
+    monkeypatch.setattr(connector_module, "_websocket_connect", connect)
+    monkeypatch.setattr(client, "_stream_sse_events", lambda *args: fallbacks.append(True))
+    client._stream_events(threading.Event(), Stop())
+    assert len(attempts) == 5
+    assert not fallbacks
 
 
 def test_stream_parser_joins_multiline_data_and_advances_last_event_id(monkeypatch):

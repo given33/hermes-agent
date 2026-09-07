@@ -92,7 +92,7 @@ except ModuleNotFoundError as exc:
     owner_id_from_request = runtime_library.owner_id_from_request
     parse_date_filter = runtime_library.parse_date_filter
 from hermes_runtime.config import get_hermes_home
-from hermes_cli.profiles import list_profiles
+from hermes_cli.profiles import list_profiles, list_profile_names, profile_exists
 from hermes_services.hosted_event_protocol import (
     _PENDING_PERSISTENCE_HOOKS,
     append_hosted_event as _append_hosted_event_protocol,
@@ -19734,8 +19734,9 @@ def _hosted_route_parameters(
             (str(item).strip() for item in selected_profiles if str(item).strip()),
             "default",
         )
-        known_profiles = {str(item.get("name") or "") for item in available_profiles()}
-        if not _profile_is_known_or_legacy(selected_profile, known_profiles):
+        # Routing needs identity validation, not every profile's config and process state.
+        known_profiles = set(list_profile_names()) - _RETIRED_AI_PROFILES - {_LEGACY_DBB3_MANAGER_PROFILE}
+        if selected_profile not in known_profiles or not profile_exists(selected_profile):
             raise HTTPException(status_code=400, detail="Hermes Profile does not exist")
         selected_profiles = [selected_profile]
         route["profiles"] = selected_profiles
