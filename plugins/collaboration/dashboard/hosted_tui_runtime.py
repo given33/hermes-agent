@@ -73,6 +73,7 @@ class _HostedSessionState:
     artifact_context: dict[str, str]
     agent_ready: threading.Event = field(default_factory=threading.Event)
     latest_session_info: dict[str, Any] | None = None
+    selected_model: dict[str, Any] | None = None
     turn_lock: threading.Lock = field(default_factory=threading.Lock)
     message_complete_seen: threading.Event = field(default_factory=threading.Event)
     idle_after_turn: threading.Event = field(default_factory=threading.Event)
@@ -225,6 +226,8 @@ class _GatewayProcess:
                                 "type": event_type,
                                 "payload": payload,
                             }
+                            if state.selected_model and payload.get("model") == state.selected_model.get("model"):
+                                state.selected_model = None
                             state.agent_ready.set()
                             if state.message_complete_seen.is_set() and not payload.get("running"):
                                 state.idle_after_turn.set()
@@ -552,7 +555,17 @@ class _GatewayProcess:
             with self._session_lock:
                 state.async_event_callbacks.append(event_callback)
         try:
-            return self.rpc(method, {**params, "session_id": state.live_session_id}, timeout=30.0)
+            result = self.rpc(method, {**params, "session_id": state.live_session_id}, timeout=30.0)
+            if method == "config.set" and params.get("key") == "model" and not result.get("confirm_required"):
+                from hermes_cli.model_switch import parse_model_switch_args
+                parsed = parse_model_switch_args(str(params.get("value") or ""))
+                with self._session_lock:
+                    state.selected_model = {
+                        "model": str(result.get("value") or parsed.model_input),
+                        "provider": parsed.explicit_provider,
+                        "deferred": bool(result.get("deferred")),
+                    }
+            return result
         except Exception:
             if async_method and event_callback is not None:
                 with self._session_lock:
@@ -920,6 +933,25 @@ def run_hosted_gateway_turn(
             "allow_tools": "1" if allow_tools else "0",
         },
     )
+
+
+def hosted_session_model(*, owner_id: str, account_generation: str,
+                         conversation_id: str, profile: str) -> dict[str, Any]:
+    """Read the live session selection without building an idle Agent."""
+    with _POOL_LOCK:
+        candidates = [gateway for key, gateway in _POOL.items()
+                      if key[1:4] == (owner_id, account_generation, profile) and gateway.alive()]
+    for gateway in candidates:
+        with gateway._session_lock:
+            session = gateway._sessions_by_conversation.get(conversation_id)
+            if session is None:
+                continue
+            if session.selected_model:
+                return dict(session.selected_model)
+            info = (session.latest_session_info or {}).get("payload") or {}
+            return {"model": str(info.get("model") or ""),
+                    "provider": str(info.get("provider") or ""), "deferred": False}
+    return {}
 
 
 def run_hosted_gateway_command(

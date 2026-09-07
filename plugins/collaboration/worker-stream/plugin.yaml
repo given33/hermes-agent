@@ -1,0 +1,8 @@
+name: collaboration-worker-stream
+version: 1.0.0
+description: Stream managed Kanban worker progress to its owning collaboration session.
+hooks:
+  - on_stream_start
+  - on_stream_delta
+  - pre_tool_call
+  - post_tool_call

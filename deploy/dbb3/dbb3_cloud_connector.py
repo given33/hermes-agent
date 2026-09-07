@@ -1112,6 +1112,10 @@ class CloudRelayClient:
         encoded = urllib.parse.quote(_text(remote_run_id, 256), safe="")
         return self._request(f"/connector/runs/{encoded}/status", method="POST", payload=payload)
 
+    def report_events(self, remote_run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        encoded = urllib.parse.quote(remote_run_id, safe="")
+        return self._request(f"/connector/runs/{encoded}/events", method="POST", payload=payload)
+
     def fail_run(self, remote_run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         encoded = urllib.parse.quote(_text(remote_run_id, 256), safe="")
         return self._request(f"/connector/runs/{encoded}/fail", method="POST", payload=payload)
@@ -1996,11 +2000,14 @@ def _execution_profile_for_run(run_payload: dict[str, Any]) -> str:
     return internal_profile
 
 
-def _profiled_hermes_command(profile: str, *arguments: str) -> list[str]:
+def _profiled_hermes_command(profile: str, *arguments: str, board: str = "") -> list[str]:
     command = ["hermes"]
     if profile:
         command.extend(["-p", profile])
     command.extend(arguments)
+    if board and "kanban" in command:
+        position = command.index("kanban") + 1
+        command[position:position] = ["--board", board]
     return command
 
 
@@ -2025,11 +2032,8 @@ def build_root_task_command(run_payload: dict[str, Any]) -> list[str]:
         body,
         "--assignee",
         execution_profile,
-        # Official kanban flow: park the task in triage so the gateway
-        # auto-decomposer fans it out into a dependency chain and the
-        # dispatcher spawns steps back-to-back (dispatch_interval_seconds).
-        # Steps on the same node execute without connector round-trips.
-        "--triage",
+        # The server has already planned this assignment. A second triage
+        # pass delays startup and changes the dispatcher's ownership contract.
         "--workspace",
         workspace,
         "--created-by",
@@ -2037,6 +2041,7 @@ def build_root_task_command(run_payload: dict[str, Any]) -> list[str]:
         "--idempotency-key",
         idempotency,
         "--json",
+        board=_text(run_payload.get("board"), 128),
     )
     max_runtime = run_payload.get("max_runtime_seconds")
     try:
@@ -2083,6 +2088,9 @@ class DBB3CloudConnector:
         self._wake_event = threading.Event()
         self._stream_stop = threading.Event()
         self._stream_thread: threading.Thread | None = None
+        self._execution_streams: dict[str, dict[str, Any]] = {}
+        self._execution_stream_lock = threading.Lock()
+        self._execution_stream_thread: threading.Thread | None = None
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._drain_file = Path(
@@ -2166,6 +2174,86 @@ class DBB3CloudConnector:
         heartbeat = self._heartbeat_thread
         if heartbeat is not None and heartbeat is not threading.current_thread():
             heartbeat.join(timeout=max(0.0, timeout))
+        execution_stream = self._execution_stream_thread
+        if execution_stream is not None and execution_stream is not threading.current_thread():
+            execution_stream.join(timeout=max(0.0, timeout))
+
+    def _watch_execution(self, local: dict[str, Any]) -> None:
+        if self.command_runner is not run or not callable(getattr(self.cloud_client, "report_events", None)):
+            return
+        from hermes_cli.profiles import get_profile_dir
+        profile = _text(local.get("execution_profile") or local.get("profile"), 128)
+        task_id = _text(local.get("root_task_id"), 128)
+        if not _PROFILE_NAME_RE.fullmatch(profile) or not re.fullmatch(r"[A-Za-z0-9_-]+", task_id):
+            return
+        with self._execution_stream_lock:
+            remote_id = local["remote_run_id"]
+            stream = self._execution_streams.setdefault(remote_id, {"offset": 0, "cursor": 0})
+            stream.update(path=get_profile_dir(profile) / "collaboration-streams" / f"{task_id}.jsonl",
+                          claim_token=local["claim_token"])
+            if self._execution_stream_thread is None or not self._execution_stream_thread.is_alive():
+                self._execution_stream_thread = threading.Thread(target=self._execution_stream_loop,
+                    name="connector-execution-stream", daemon=True)
+                self._execution_stream_thread.start()
+
+    def _execution_stream_loop(self) -> None:
+        while not self._stream_stop.wait(0.05):
+            with self._execution_stream_lock:
+                streams = list(self._execution_streams.items())
+            for remote_id, stream in streams:
+                try:
+                    if not stream["path"].is_file() or stream["path"].is_symlink():
+                        continue
+                    events = []
+                    with stream["path"].open("rb") as source:
+                        source.seek(stream["offset"])
+                        offset = stream["offset"]
+                        cursor = stream["cursor"]
+                        size = 0
+                        while len(events) < 64 and size < 256 * 1024:
+                            raw = source.readline(128 * 1024)
+                            if not raw.endswith(b"\n"):
+                                break
+                            item = json.loads(raw)
+                            cursor += 1
+                            events.append({**item, "cursor": cursor})
+                            offset = source.tell()
+                            size += len(raw)
+                    if not events:
+                        continue
+                    response = self.cloud_client.report_events(remote_id, {
+                        "connector_id": self.cloud_client.connector_id,
+                        "claim_token": stream["claim_token"], "events": events,
+                    })
+                    if response.get("resync"):
+                        stream.update(offset=0, cursor=0)
+                    else:
+                        stream.update(offset=offset, cursor=cursor)
+                except CloudHTTPError as exc:
+                    if exc.status in {404, 409, 410}:
+                        with self._execution_stream_lock:
+                            self._execution_streams.pop(remote_id, None)
+                    self._stream_stop.wait(0.2)
+                except (OSError, ValueError, urllib.error.URLError):
+                    self._stream_stop.wait(0.2)
+
+    def _enable_execution_stream(self, profile: str) -> None:
+        if self.command_runner is not run:
+            return
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_cli.config import _cross_process_write_lock, _load_user_config_for_mutation, atomic_config_write
+        path = get_profile_dir(profile) / "config.yaml"
+        with _cross_process_write_lock(path):
+            config = _load_user_config_for_mutation(path)
+            plugins = config.setdefault("plugins", {})
+            enabled = list(plugins.get("enabled") or [])
+            name = "collaboration-worker-stream"
+            if name in enabled and plugins.get("stream_reasoning_deltas") is True:
+                return
+            if name not in enabled:
+                enabled.append(name)
+            plugins.update(enabled=enabled, stream_reasoning_deltas=True)
+            atomic_config_write(path, config, sort_keys=False, allow_unicode=True)
 
     def start_heartbeat(self, interval: float = 30.0) -> None:
         """Start a lightweight lease-renewal thread for active remote runs."""
@@ -2240,6 +2328,7 @@ class DBB3CloudConnector:
         root_id: str,
         reason: str,
         execution_profile: str = "",
+        board: str = "",
     ) -> list[str]:
         try:
             template = shlex.split(self.cancel_command)
@@ -2264,6 +2353,9 @@ class DBB3CloudConnector:
             command.append(root_id)
         if not has_reason_placeholder:
             command.append(reason)
+        if board and "kanban" in command:
+            position = command.index("kanban") + 1
+            command[position:position] = ["--board", board]
         return command
 
     def _materialize_attachments(
@@ -2335,6 +2427,7 @@ class DBB3CloudConnector:
                 "show",
                 task_id,
                 "--json",
+                board=_text(local.get("board"), 128),
             ),
             timeout=120,
         )
@@ -2622,6 +2715,7 @@ class DBB3CloudConnector:
                         root_id,
                         reason,
                         _text(local.get("execution_profile"), 128),
+                        _text(local.get("board"), 128),
                     ),
                     timeout=30,
                 )
@@ -2688,6 +2782,7 @@ class DBB3CloudConnector:
                 raise RuntimeError("Cloud run account boundary changed after acceptance")
         if _coerce_flag(current.get("terminal_acked")) and str(current.get("status") or "") in TERMINAL_STATUSES:
             return current
+        self._enable_execution_stream(_text(run_payload.get("profile"), 128) or "default")
         if current.get("root_task_id"):
             self._assert_local_account_boundary(current, state)
             resolved_profile = _text(current.get("execution_profile"), 128)
@@ -2721,10 +2816,20 @@ class DBB3CloudConnector:
             if isinstance(terminal_pending, dict):
                 terminal_pending["claim_token"] = claim_token
         if not current.get("root_task_id"):
+            self._enable_execution_stream(execution_profile or _text(run_payload.get("profile"), 128))
+            if self.command_runner is run:
+                from hermes_cli import kanban_db
+                board = "hosted-" + hashlib.sha256(
+                    f"{owner_id}:{account_generation}:{resolved_profile}".encode()
+                ).hexdigest()[:20]
+                if not kanban_db.board_exists(board):
+                    kanban_db.create_board(board, name="Hosted assignments")
+                current["board"] = board
             attachment_paths = self._materialize_attachments(run_payload, current, state)
             objective_path = self._write_objective_file(run_payload, current, state)
             prepared = dict(run_payload)
             prepared["execution_profile"] = execution_profile
+            prepared["board"] = current.get("board", "")
             prepared["title"] = "Hermes hosted run " + (
                 _text(run_payload.get("remote_run_id"), 64) or "task"
             )
@@ -2763,7 +2868,20 @@ class DBB3CloudConnector:
             self.cloud_client.acknowledge_run(run_payload, current)
             current["acked"] = True
             self.checkpoints.save(state)
+        self._watch_execution(current)
+        self._dispatch_board(current)
         return current
+
+    def _dispatch_board(self, local: dict[str, Any]) -> None:
+        board = _text(local.get("board"), 128)
+        if not board or self.command_runner is not run:
+            return
+        # Official board-scoped lock fences other dispatchers. Existing
+        # unrelated board tasks are never started by connector recovery.
+        from hermes_cli import kanban_db
+        with kanban_db.connect_closing(board=board) as connection:
+            kanban_db.dispatch_once(connection, board=board, max_spawn=1,
+                                   max_in_progress=1, max_in_progress_per_profile=1)
 
     def _compact_status(self, detail: dict[str, Any], local: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
@@ -3072,9 +3190,16 @@ class DBB3CloudConnector:
             local["acked"] = False
             self.checkpoints.save(state)
             return 0, 0
+        self._watch_execution(local)
+        self._dispatch_board(local)
         sync_started = time.monotonic()
         detail = self._show_task(_text(local.get("root_task_id"), 256), local)
         payload, artifact_paths = self._compact_status(detail, local)
+        if payload.get("terminal"):
+            with self._execution_stream_lock:
+                stream = self._execution_streams.get(remote_id)
+                if stream and stream["path"].is_file() and stream["offset"] < stream["path"].stat().st_size:
+                    return 0, 0
         payload["latency_ms"] = max(0, int((time.monotonic() - sync_started) * 1000))
         payload["lease_conflicts"] = self._lease_conflicts
         if artifact_paths:
@@ -3318,6 +3443,7 @@ class DBB3CloudConnector:
                     root_id,
                     "--reason",
                     text,
+                    board=_text(local.get("board"), 128),
                 ),
                 timeout=60,
             )
@@ -3365,6 +3491,7 @@ class DBB3CloudConnector:
                     root_id,
                     reason,
                     _text(local.get("execution_profile"), 128),
+                    _text(local.get("board"), 128),
                 ),
                 timeout=30,
             )

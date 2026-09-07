@@ -1,0 +1,89 @@
+"""Local append-only observer output; credentials remain in the connector."""
+
+import json
+import os
+from pathlib import Path
+import re
+import threading
+import time
+
+_lock = threading.Lock()
+_sequence = 0
+_tools = {}
+
+
+def _bounded(value, limit=20000):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text[-limit:]
+
+
+def _emit(event_type, payload):
+    global _sequence
+    task = os.environ.get("HERMES_KANBAN_TASK", "")
+    run = os.environ.get("HERMES_KANBAN_RUN_ID", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task) or not run.isdigit():
+        return
+    from hermes_constants import get_hermes_home
+    directory = Path(get_hermes_home()) / "collaboration-streams"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    path = directory / f"{task}.jsonl"
+    with _lock:
+        _sequence += 1
+        record = {"run_id": run, "sequence": _sequence, "type": event_type,
+                  "payload": {**payload, "timestamp": int(time.time() * 1000)}}
+        encoded = (json.dumps(record, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "ab", buffering=0) as stream:
+            stream.write(encoded)
+
+
+def _start(session_id="", model="", provider="", iteration=0, **_):
+    _emit("request.accepted", {"session_id": session_id, "model": model,
+                               "provider": provider, "iteration": iteration})
+
+
+def _delta(delta="", kind="text", session_id="", iteration=0, **_):
+    if delta:
+        for offset in range(0, len(delta), 8000):
+            _emit("reasoning.delta" if kind == "reasoning" else "message.delta",
+                  {"text": delta[offset:offset + 8000], "session_id": session_id,
+                   "entity_id": f"{session_id}:{iteration}:{kind}"})
+
+
+def _tool_start(tool_name="", args=None, tool_call_id="", session_id="", task_id="", **_):
+    key = tool_call_id or f"{session_id}:{task_id}:{tool_name}"
+    started = int(time.time() * 1000)
+    with _lock:
+        _tools[key] = started
+    _emit("tool.start", {"name": tool_name, "args": _bounded(args or {}, 8000), "tool_id": key,
+                         "session_id": session_id, "started_at": started})
+
+
+def _tool_complete(tool_name="", args=None, result=None, tool_call_id="", session_id="", task_id="", status="", **_):
+    key = tool_call_id or f"{session_id}:{task_id}:{tool_name}"
+    ended = int(time.time() * 1000)
+    with _lock:
+        started = _tools.pop(key, ended)
+    parsed = result
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except (ValueError, TypeError):
+            pass
+    error = parsed.get("error") if isinstance(parsed, dict) else ""
+    if not error and status in {"failed", "error", "cancelled"}:
+        error = status
+    _emit("tool.complete", {"name": tool_name, "args": _bounded(args or {}, 8000), "tool_id": key,
+                            "result": _bounded(result), "error": _bounded(error or "", 4000), "session_id": session_id,
+                            "started_at": started, "ended_at": ended,
+                            "duration_s": (ended - started) / 1000})
+
+
+def register(ctx):
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    ctx.register_hook("on_stream_start", _start)
+    ctx.register_hook("on_stream_delta", _delta)
+    ctx.register_hook("pre_tool_call", _tool_start)
+    ctx.register_hook("post_tool_call", _tool_complete)

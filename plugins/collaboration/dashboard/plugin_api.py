@@ -143,6 +143,7 @@ from hermes_runtime.collaboration import (
 from plugins.collaboration.dashboard.hosted_tui_runtime import (
     HostedTuiGatewayCancelled,
     control_hosted_subagents,
+    hosted_session_model,
     prewarm_hosted_gateway,
     release_hosted_gateway_conversation,
     run_hosted_gateway_command,
@@ -703,6 +704,7 @@ _HOSTED_UPDATE_WAIT_EXECUTOR = ThreadPoolExecutor(
 # write.  Snapshots are immutable after publication and are replaced on the
 # next state save.
 _HOSTED_LIVE_STATE_LOCK = threading.RLock()
+_REMOTE_STREAM_STATES: dict[str, dict[str, Any]] = {}
 _HOSTED_LIVE_CONVERSATIONS: dict[str, dict[str, Any]] = {}
 _HOSTED_CANCEL_STATE_LOCK = threading.Lock()
 _SUBAGENT_CONTROL_LOCK = threading.Lock()
@@ -9546,6 +9548,10 @@ def apply_profile_event(
         or payload.get("content")
         or payload.get("message")
     )
+    if event_type in {"message.delta", "reasoning.delta", "thinking.delta"}:
+        raw_delta = next((payload[key] for key in ("text", "delta", "output", "reasoning", "content", "message")
+                          if isinstance(payload.get(key), str) and payload[key]), "")
+        event_text = str(_redact_sensitive(raw_delta))
     thinking_is_reasoning = event_type == "thinking.delta" and not is_model_spinner(
         event_text
     )
@@ -9690,6 +9696,10 @@ def apply_profile_event(
         )[:1000]
     elif event_type == "tool.start":
         finish_retry_activity()
+        for thinking in activities:
+            if thinking.get("kind") == "reasoning" and thinking.get("status") == "running":
+                thinking.update(status="completed", ended_at=now,
+                                duration_ms=max(0, now - int(thinking.get("started_at") or now)))
         name = str(payload.get("name") or "工具调用")
         activity_id = str(payload.get("tool_id") or "")
         activity = _activity_by_id_or_name(activities, activity_id, name)
@@ -10332,6 +10342,7 @@ def _persist_hosted_role_state(
         "_protocol_invocation_index": int(
             state.get("_protocol_invocation_index") or 0
         ),
+        "remote_stream_cursor": int(state.get("remote_stream_cursor") or 0),
         "_protocol_started_entities": [
             str(item)
             for item in state.get("_protocol_started_entities") or []
@@ -10449,6 +10460,28 @@ def _persist_hosted_role_state(
             protocol_events=pending_protocol_events[live_event_offset:],
         )
         state["_live_protocol_event_count"] = len(pending_protocol_events)
+
+
+def _stage_hosted_milestone(state: dict[str, Any], *, turn_id: str, role_stage: str,
+                            profile: str, role_label: str) -> None:
+    current = str(state.get("content") or "").strip()
+    previous = str(state.get("milestone_content") or "")
+    if not current or current == previous:
+        return
+    count = int(state.get("milestone_count") or 0) + 1
+    content = current[len(previous):].strip() if previous and current.startswith(previous) else current
+    state.setdefault("_pending_milestone_messages", []).append({
+        "role": "assistant", "name": profile, "content": content, "status": "completed",
+        "kind": "message", "created_at": int(time.time() * 1000),
+        "meta": {"role_stage": f"{role_stage}.milestone.{count}",
+                 "base_role_stage": role_stage.split(":", 1)[0], "phase": "milestone",
+                 "message_key": f"{turn_id}:{role_stage}:milestone:{count}",
+                 "role_label": role_label, "profile": profile, "final_report": False,
+                 "collapse_activities": True, "activities": deepcopy(state.get("activities") or []),
+                 "actual_model": str(state.get("actual_model") or ""),
+                 "actual_provider": str(state.get("actual_provider") or "")},
+    })
+    state.update(milestone_count=count, milestone_content=current)
 
 
 def _run_hosted_role(
@@ -10828,50 +10861,9 @@ def _run_hosted_role(
                 raise _HostedRoleIntervention(intervention)
         if event_type in {"tool.start", "subagent.start"}:
             atomic_depth += 1
-        current_content = str(state.get("content") or "").strip()
-        previous_milestone = str(state.get("milestone_content") or "")
-        if (
-            visible
-            and event_type in {"tool.start", "subagent.start"}
-            and current_content
-            and current_content != previous_milestone
-        ):
-            milestone_count = int(state.get("milestone_count") or 0) + 1
-            milestone_content = (
-                current_content[len(previous_milestone):].strip()
-                if previous_milestone and current_content.startswith(previous_milestone)
-                else current_content
-            )
-            base_stage = role_stage.split(":", 1)[0]
-            # The gateway dispatches events serially. Saving a milestone here
-            # stalls all subsequent tool/reasoning deltas behind disk I/O.
-            # Publish it with the live projection and batch its durable write
-            # with the next regular checkpoint.
-            state.setdefault("_pending_milestone_messages", []).append(
-                {
-                    "role": "assistant",
-                    "name": profile,
-                    "content": milestone_content,
-                    "status": "completed",
-                    "kind": "message",
-                    "created_at": int(time.time() * 1000),
-                    "meta": {
-                        "role_stage": f"{role_stage}.milestone.{milestone_count}",
-                        "base_role_stage": base_stage,
-                        "phase": "milestone",
-                        "message_key": f"{turn_id}:{role_stage}:milestone:{milestone_count}",
-                        "role_label": role_label,
-                        "profile": profile,
-                        "final_report": False,
-                        "collapse_activities": True,
-                        "activities": [dict(item) for item in state.get("activities") or []],
-                        "actual_model": str(state.get("actual_model") or ""),
-                        "actual_provider": str(state.get("actual_provider") or ""),
-                    },
-                },
-            )
-            state["milestone_count"] = milestone_count
-            state["milestone_content"] = current_content
+        if visible and event_type in {"tool.start", "subagent.start"}:
+            _stage_hosted_milestone(state, turn_id=turn_id, role_stage=role_stage,
+                                    profile=profile, role_label=role_label)
         had_content = bool(str(state.get("content") or ""))
         had_reasoning = any(
             activity.get("kind") == "reasoning"
@@ -13574,7 +13566,8 @@ def _remote_execution_stalled(remote: dict[str, Any], *, now: int) -> bool:
         return False
     # Transport heartbeats renew a lease; they do not prove that a queued
     # model ever started or that its execution made progress.
-    progress_at = _nonnegative_int(remote.get("execution_progress_at")) or _nonnegative_int(
+    streamed = _REMOTE_STREAM_STATES.get(str(remote.get("id") or "")) or {}
+    progress_at = max(_nonnegative_int(streamed.get("updated_at")), _nonnegative_int(remote.get("execution_progress_at"))) or _nonnegative_int(
         remote.get("started_at") or remote.get("created_at")
     )
     startup = str(remote.get("execution_state") or "") in {"triage", "todo", "ready", "queued"} or (
@@ -14005,6 +13998,13 @@ def _remote_run_state_message(
         "completed_at": int(remote_run.get("completed_at") or 0) or None,
         "updated_at": int(remote_run.get("updated_at") or int(time.time() * 1000)),
     }
+    streamed = _REMOTE_STREAM_STATES.get(str(remote_run.get("id") or ""))
+    if streamed:
+        terminal = status in _REMOTE_TERMINAL_STATUSES
+        state = {**deepcopy(streamed), **{key: value for key, value in state.items()
+                 if key in {"status", "completed_at"} or (terminal and key == "content")}}
+        if terminal:
+            state["content"] = result or str(streamed.get("content") or "")
     _persist_hosted_role_state(
         conversation_id,
         turn_id,
@@ -14017,6 +14017,11 @@ def _remote_run_state_message(
             semantic_progress if status == "running" or intervention_pause else ""
         ),
     )
+    if status in _REMOTE_TERMINAL_STATUSES:
+        _REMOTE_STREAM_STATES.pop(str(remote_run.get("id") or ""), None)
+    elif streamed:
+        streamed["_protocol_events"] = []
+        streamed["_live_protocol_event_count"] = 0
 
 
 def request_hosted_turn_cancellation(
@@ -18011,6 +18016,76 @@ def connector_ack_run(remote_run_id: str, payload: ConnectorAckBody, request: Re
         root_task_id=str(payload.root_task_id or "")[:256],
     )
     return {"run": _remote_run_connector_payload(persisted), "applied": True}
+
+
+class ConnectorStreamBody(BaseModel):
+    connector_id: str
+    claim_token: str
+    events: list[dict[str, Any]] = Field(default_factory=list, max_length=128)
+
+
+@router.post("/connector/runs/{remote_run_id}/events")
+def connector_stream_run(remote_run_id: str, body: ConnectorStreamBody, request: Request):
+    connector_id = _require_connector(request)
+    _validate_connector_claim(body.connector_id, connector_id)
+    if len(json.dumps(body.events, ensure_ascii=False).encode("utf-8")) > 512 * 1024:
+        raise HTTPException(status_code=413, detail="Worker event batch too large")
+    with _HOSTED_LIVE_STATE_LOCK:
+        state_view = {"conversations": list(_HOSTED_LIVE_CONVERSATIONS.values())}
+        location = _remote_run_location(state_view, remote_run_id)
+        if location is None:
+            raise HTTPException(status_code=404, detail="Remote run not found")
+        conversation, hosted, role_stage, remote = location
+        _require_connector_account_boundary(conversation, remote)
+        _require_remote_run_claim(remote, connector_id=connector_id,
+                                 claim_token=body.claim_token, now=int(time.time() * 1000))
+        if (remote.get("terminal") or remote.get("cancel_requested")
+                or hosted.get("cancel_requested") or hosted.get("status") in _HOSTED_TERMINAL_STATUSES):
+            raise _connector_conflict("claim_lost", "Worker execution has ended")
+        stream = _REMOTE_STREAM_STATES.get(remote_run_id)
+        if stream is None:
+            stream = deepcopy((hosted.get("role_events") or {}).get(role_stage) or {})
+            stream.update(status="streaming", started_at=remote.get("started_at") or remote.get("created_at"))
+            # Queue messages are connection state, not model-generated output.
+            if not stream.get("remote_stream_cursor"):
+                stream.update(content="", activities=[])
+            stream["_live_protocol_event_count"] = 0
+            stream["_protocol_events"] = []
+            _REMOTE_STREAM_STATES[remote_run_id] = stream
+        cursor = int(stream.get("remote_stream_cursor") or 0)
+        expected = cursor + 1
+        for item in body.events:
+            sequence = int(item.get("cursor") or 0)
+            if sequence > cursor:
+                if sequence != expected:
+                    return {"cursor": cursor, "resync": True}
+                expected += 1
+        changed = False
+        for item in body.events:
+            sequence = int(item.get("cursor") or 0)
+            if sequence <= cursor:
+                continue
+            if sequence != cursor + 1:
+                return {"cursor": cursor, "resync": True}
+            event_type = str(item.get("type") or "")
+            if event_type not in {"request.accepted", "reasoning.delta", "message.delta", "tool.start", "tool.complete"}:
+                raise HTTPException(status_code=422, detail="Unsupported worker event")
+            payload = _redact_sensitive(dict(item.get("payload") or {}))
+            event = {"type": event_type, "payload": payload}
+            if event_type == "tool.start":
+                _stage_hosted_milestone(stream, turn_id=str(hosted["turn_id"]), role_stage=role_stage,
+                    profile=str(remote["profile"]), role_label=str(remote.get("role_label") or "任务执行"))
+            apply_profile_event(stream, event)
+            _queue_hosted_protocol_event(stream, event)
+            cursor = sequence
+            stream["remote_stream_cursor"] = cursor
+            changed = True
+        if changed:
+            _persist_hosted_role_state(str(conversation["id"]), str(hosted["turn_id"]),
+                profile=str(remote["profile"]), role_stage=role_stage,
+                role_label=str(remote.get("role_label") or "任务执行"), state=stream,
+                content_fallback="", persist=False)
+        return {"cursor": cursor, "resync": False}
 
 
 @router.post("/connector/runs/{remote_run_id}/status")
@@ -27913,6 +27988,11 @@ def mobile_hosted_command(
         "owner_id": owner_id,
         "account_generation": account_generation,
     }
+    if command == "model" and body.value == "status":
+        return {"accepted": True, "command": command, **hosted_session_model(
+            owner_id=owner_id, account_generation=account_generation,
+            conversation_id=conversation_id, profile=profile,
+        )}
     runtime_home = _hosted_runtime_home(profile, runtime_context)
     artifact_root = str(get_hermes_home())
     if command == "model":

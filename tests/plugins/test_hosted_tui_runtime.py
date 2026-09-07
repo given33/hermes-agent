@@ -51,6 +51,23 @@ def _event(event_type: str, payload: dict) -> str:
     )
 
 
+def test_deferred_model_selection_is_owned_by_its_session(monkeypatch):
+    from plugins.collaboration.dashboard import hosted_tui_runtime as runtime
+    gateway = _GatewayProcess.__new__(_GatewayProcess)
+    gateway._session_lock = threading.Lock()
+    session = _HostedSessionState("c", "live", "stored", {})
+    gateway._sessions_by_conversation = {"c": session}
+    gateway.ensure_session = lambda *args, **kwargs: session
+    gateway.alive = lambda: True
+    gateway.rpc = lambda *args, **kwargs: {"value": "next-model", "deferred": True}
+    monkeypatch.setattr(runtime, "_POOL", {("home", "owner", "gen", "profile", "root"): gateway})
+    gateway.command("c", "config.set", {"key": "model", "value": "next-model --provider configured --session"}, artifact_context={})
+    args = {"owner_id": "owner", "account_generation": "gen", "conversation_id": "c", "profile": "profile"}
+    assert runtime.hosted_session_model(**args) == {"model": "next-model", "provider": "configured", "deferred": True}
+    assert runtime.hosted_session_model(**{**args, "conversation_id": "other"}) == {}
+    assert runtime.hosted_session_model(**{**args, "owner_id": "other"}) == {}
+
+
 def test_reader_marks_turn_idle_only_after_post_completion_session_info():
     gateway = _GatewayProcess.__new__(_GatewayProcess)
     gateway.process = SimpleNamespace(
