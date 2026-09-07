@@ -19140,26 +19140,26 @@ async def stream_hosted_conversation_events(
     ):
         raise HTTPException(status_code=404, detail="Conversation not found")
     if live_conversation is None:
-        member_room_id = ""
-        with _STATE_LOCK:
-            state = load_single_state()
-            try:
-                _conversation, claimed = _owned_conversation_in_state(
-                    state,
-                    conversation_id,
-                    owner_id,
-                )
-            except HTTPException as exc:
-                # Room members reach the linked conversation's live stream
-                # without owning it: authorize through room membership.
-                if exc.status_code != 404:
-                    raise
-                member_room_id = _room_membership_room_id(conversation_id, owner_id)
-                if not member_room_id:
-                    raise
-                claimed = False
-            if claimed:
-                save_single_state(state)
+        def authorize_stream():
+            member_room_id = ""
+            with _STATE_LOCK:
+                state = _load_single_state_for_event_stream()
+                try:
+                    _conversation, claimed = _owned_conversation_in_state(state, conversation_id, owner_id)
+                except HTTPException as exc:
+                    if exc.status_code != 404:
+                        raise
+                    member_room_id = _room_membership_room_id(conversation_id, owner_id)
+                    if not member_room_id:
+                        raise
+                    claimed = False
+                if claimed:
+                    save_single_state(state)
+            return member_room_id
+
+        # Ownership checks may wait for a durable checkpoint. Never block
+        # the ASGI loop, which also delivers every active chat's deltas.
+        member_room_id = await asyncio.to_thread(authorize_stream)
     else:
         member_room_id = ""
 
@@ -19432,30 +19432,30 @@ async def stream_hosted_conversation_events_websocket(
     live_conversation = _live_conversation_snapshot(conversation_id, normalized_owner)
     member_room_id = ""
     if live_conversation is None:
-        with _STATE_LOCK:
-            state = _load_single_state_for_event_stream()
-            try:
-                _conversation, claimed = _owned_conversation_in_state(
-                    state,
-                    conversation_id,
-                    normalized_owner,
-                )
-            except HTTPException as exc:
-                if exc.status_code != 404:
-                    await websocket.close(code=4404, reason="conversation not found")
-                    return
-                member_room_id = _room_membership_room_id(conversation_id, normalized_owner)
-                if not member_room_id:
-                    await websocket.close(code=4404, reason="conversation not found")
-                    return
-                _conversation, claimed = _conversation_for_event_reader(
-                    state,
-                    conversation_id,
-                    normalized_owner,
-                    member_room_id,
-                )
-            if claimed:
-                save_single_state(state)
+        def authorize_websocket():
+            member_room_id = ""
+            with _STATE_LOCK:
+                state = _load_single_state_for_event_stream()
+                try:
+                    _conversation, claimed = _owned_conversation_in_state(state, conversation_id, normalized_owner)
+                except HTTPException as exc:
+                    if exc.status_code != 404:
+                        raise
+                    member_room_id = _room_membership_room_id(conversation_id, normalized_owner)
+                    if not member_room_id:
+                        raise
+                    _conversation, claimed = _conversation_for_event_reader(
+                        state, conversation_id, normalized_owner, member_room_id,
+                    )
+                if claimed:
+                    save_single_state(state)
+            return member_room_id
+
+        try:
+            member_room_id = await asyncio.to_thread(authorize_websocket)
+        except HTTPException:
+            await websocket.close(code=4404, reason="conversation not found")
+            return
 
     if not _acquire_hosted_sse_slot(normalized_owner, conversation_id):
         await websocket.close(code=4429, reason="too many live conversation streams")
