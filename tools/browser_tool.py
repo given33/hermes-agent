@@ -3193,7 +3193,7 @@ def _agent_browser_candidate_present(path: str | None) -> bool:
     return os.path.exists(path) and (os.name == "nt" or os.access(path, os.X_OK))
 
 
-def _resolve_npx_bin() -> Optional[str]:
+def _resolve_npx_bin(*, validate: bool = True) -> Optional[str]:
     """Resolve a runnable npx binary, preferring the Hermes-managed/Homebrew
     extended search over a bare ambient PATH lookup.
 
@@ -3206,10 +3206,10 @@ def _resolve_npx_bin() -> Optional[str]:
     extended_path = _merge_browser_path("")
     if extended_path:
         extended_npx = shutil.which("npx", path=extended_path)
-        if extended_npx and node_tool_runnable(extended_npx):
+        if extended_npx and (not validate or node_tool_runnable(extended_npx)):
             return extended_npx
     npx_path = shutil.which("npx")
-    if npx_path and node_tool_runnable(npx_path):
+    if npx_path and (not validate or node_tool_runnable(npx_path)):
         return npx_path
     return None
 
@@ -3297,7 +3297,7 @@ def _find_agent_browser(*, validate: bool = True) -> str:
             return _cached_agent_browser
 
     # Check common npx locations (also search the extended fallback PATH)
-    npx_path = _resolve_npx_bin()
+    npx_path = _resolve_npx_bin(validate=validate)
     if npx_path:
         if not validate:
             return NPX_AGENT_BROWSER_SENTINEL

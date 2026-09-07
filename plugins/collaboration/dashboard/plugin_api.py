@@ -3765,6 +3765,15 @@ def _persist_conversation_histories(state: dict[str, Any]) -> None:
         entries = conversation.get("session_entries")
         if not isinstance(messages, list) and not isinstance(entries, list):
             continue
+        if (not _conversation_terminal(conversation)
+                and len(messages or []) <= _MAX_HOSTED_MESSAGES_PER_CONVERSATION
+                and len(entries or []) <= _MAX_HOSTED_SESSION_ENTRIES_PER_CONVERSATION):
+            # This entire tail is committed in single.json below; nothing will
+            # be evicted. Rewriting a multi-megabyte historical transcript for
+            # every streaming update holds the dispatch lock unnecessarily.
+            # Merge before any eviction and again at terminal completion. Detail
+            # reads already overlay the durable hot tail onto older history.
+            continue
         conversation_id = str(conversation.get("id") or "").strip()
         if not conversation_id:
             continue

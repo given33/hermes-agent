@@ -502,6 +502,18 @@ class TestResolveNpxBinPriority:
     runs) before being trusted, mirroring _find_agent_browser's own
     validation discipline for agent-browser itself."""
 
+    def test_schema_readiness_does_not_execute_npx(self, monkeypatch):
+        import tools.browser_tool as bt
+        monkeypatch.setattr(bt, "_merge_browser_path", lambda _p: "/hermes/node/bin")
+        monkeypatch.setattr(bt.shutil, "which", lambda cmd, path=None:
+                            "/hermes/node/bin/npx" if cmd == "npx" else None)
+        with patch.object(bt, "node_tool_runnable", return_value=False) as probe:
+            assert bt._find_agent_browser(validate=False) == bt.NPX_AGENT_BROWSER_SENTINEL
+            probe.assert_not_called()
+            # Actual execution still rejects the unusable wrapper.
+            assert bt._resolve_npx_bin() is None
+            assert probe.called
+
     def test_prefers_managed_extended_path_over_bare_path(self, monkeypatch):
         import tools.browser_tool as bt
 

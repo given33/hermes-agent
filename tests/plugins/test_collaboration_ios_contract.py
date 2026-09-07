@@ -137,6 +137,45 @@ def test_listing_migrates_legacy_room_transcript_into_mobile_conversation_index(
     assert len(single_saves) == len(room_saves) == 1
 
 
+def test_streaming_tail_survives_restart_without_rewriting_old_history(tmp_path, monkeypatch):
+    import json
+    module = load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    conversation = {
+        "id": "chat_stream_tail", "owner_id": "owner-a", "account_generation": "generation-a",
+        "messages": [{"id": f"m-{i}", "role": "user" if i % 2 == 0 else "assistant",
+                      "content": str(i)} for i in range(60)],
+        "session_entries": [], "hosted_turns": {"turn": {"status": "completed"}},
+    }
+    state = {"conversations": [conversation]}
+    module._persist_conversation_histories(state)
+    module._trim_hosted_state(state)
+    target = module._conversation_history_path(conversation["id"])
+    before = target.read_bytes()
+    conversation["hosted_turns"]["turn"]["status"] = "running"
+    conversation["messages"][-1]["content"] = "live tool report"
+    module._persist_conversation_histories(state)
+    assert target.read_bytes() == before
+    hot = tmp_path / "single.json"
+    module._atomic_write_json_file(hot, state)
+    restarted = load_module()
+    monkeypatch.setattr(restarted, "get_hermes_home", lambda: tmp_path)
+    loaded = json.loads(hot.read_text(encoding="utf-8"))["conversations"][0]
+    restored = restarted._hydrate_conversation_history(loaded)
+    assert len(restored["messages"]) == 60
+    assert restored["messages"][0]["content"] == "0"
+    assert restored["messages"][-1]["content"] == "live tool report"
+    # Crossing the tail limit must flush before trimming, even while running.
+    conversation["messages"].append({"id": "new-user", "role": "user", "content": "next"})
+    module._persist_conversation_histories(state)
+    module._trim_hosted_state(state)
+    assert module._read_conversation_history(conversation["id"])["message_count"] == 61
+    conversation["hosted_turns"]["turn"]["status"] = "completed"
+    conversation["messages"][-1]["content"] = "finished"
+    module._persist_conversation_histories(state)
+    assert module._read_conversation_history(conversation["id"])["messages"][-1]["content"] == "finished"
+
+
 def test_unchanged_history_skips_full_merge_and_invalidates_on_disk_change(tmp_path, monkeypatch):
     module = load_module()
     monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
