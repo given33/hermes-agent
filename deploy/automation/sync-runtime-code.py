@@ -56,7 +56,7 @@ def request_json(url: str, headers: dict | None = None) -> dict:
 
 def release_target(role: str) -> dict:
     if role == 'hub':
-        return {'commit': request_json(f'https://api.github.com/repos/{REPOSITORY}/commits/main')['sha']}
+        return {'commit': github_main_commit()}
     family = {'dbb3': 'dbb3', 'wsl': 'pc', 'hk': 'hk'}[role]
     token_path = Path(f'/etc/{family}-team/cloud_connector_token')
     if token_path.is_symlink():
@@ -75,6 +75,25 @@ def release_target(role: str) -> dict:
 def run(args: list[str], *, check: bool = True, **kwargs):
     return subprocess.run(args, check=check, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, timeout=kwargs.pop('timeout', 180), **kwargs)
+
+
+def github_main_commit() -> str:
+    # Git's read-only refs endpoint is independent of the shared REST quota.
+    result = run(['git', 'ls-remote', '--exit-code', f'https://github.com/{REPOSITORY}.git',
+                  'refs/heads/main'], timeout=45)
+    rows = [line.split() for line in result.stdout.splitlines()]
+    for row in rows:
+        if len(row) == 2 and row[1] == 'refs/heads/main' and re.fullmatch('[0-9a-f]{40}', row[0]):
+            return row[0]
+    raise ValueError('GitHub did not return the approved main branch')
+
+
+def verify_approved_commit(commit: str) -> None:
+    if commit == github_main_commit():
+        return
+    ancestry = request_json(f'https://api.github.com/repos/{REPOSITORY}/compare/{commit}...main')
+    if ancestry.get('status') not in {'ahead', 'identical'}:
+        raise ValueError('Release is not part of the approved main branch')
 
 
 def digest_file(path: Path) -> str:
@@ -214,9 +233,7 @@ def main():
             return
         if not args.check:
             prune_backups(root, state, receipt)
-        ancestry = request_json(f'https://api.github.com/repos/{REPOSITORY}/compare/{commit}...main')
-        if ancestry.get('status') not in {'ahead', 'identical'}:
-            raise ValueError('Release is not part of the approved main branch')
+        verify_approved_commit(commit)
         generation = root / '.fabric-generations' / commit
         if generation.resolve() != generation:
             raise ValueError('Release generation must not be a symlink')

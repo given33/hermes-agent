@@ -2,6 +2,7 @@ import importlib.util
 import io
 from pathlib import Path
 import tarfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +40,17 @@ def test_runtime_archive_contains_code_but_never_instance_state(updater, tmp_pat
 def test_runtime_member_rejects_traversal_and_nested_secret_files(updater):
     for path in ['../tools/escape.py', '/tools/escape.py', 'tools/../../.env', 'plugins/example/.env']:
         assert updater.code_member(path) is False
+
+
+def test_current_github_release_does_not_depend_on_rest_api_quota(updater, monkeypatch):
+    commit = 'a' * 40
+    monkeypatch.setattr(updater, 'run', lambda *args, **kwargs: SimpleNamespace(stdout=commit + '\trefs/heads/main\n'))
+    monkeypatch.setattr(updater, 'request_json', lambda *args: pytest.fail('REST quota must not block current main'))
+    assert updater.release_target('hub') == {'commit': commit}
+    updater.verify_approved_commit(commit)
+    monkeypatch.setattr(updater, 'run', lambda *args, **kwargs: SimpleNamespace(stdout=commit + '\trefs/heads/other\n'))
+    with pytest.raises(ValueError, match='approved main'):
+        updater.github_main_commit()
 
 
 def test_runtime_symlink_is_rejected_before_it_can_touch_a_profile(updater, tmp_path):
