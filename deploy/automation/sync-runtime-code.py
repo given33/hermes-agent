@@ -100,6 +100,31 @@ def digest_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def has_active_execution(homes: list[str], proc_root: Path = Path('/proc')) -> bool:
+    for home in map(Path, homes):
+        state_path = home / 'collaboration/single.json'
+        if not state_path.is_file():
+            continue
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            return True
+        for conversation in state.get('conversations') or []:
+            for turn in (conversation.get('hosted_turns') or {}).values():
+                if str(turn.get('status') or '') in {'queued', 'running', 'streaming', 'waiting', 'awaiting_input'}:
+                    return True
+    for process in proc_root.iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            argv = (process / 'cmdline').read_bytes().split(b'\0')
+        except (OSError, ProcessLookupError):
+            continue
+        if b'--cli' in argv and any(arg.startswith(b'work kanban task ') for arg in argv):
+            return True
+    return False
+
+
 def reusable_environment(original: Path, dependency_lock: Path) -> bool:
     ready = original.resolve().parent / '.dependencies-ready'
     return bool((original / 'bin/python').is_file() and ready.is_file()
@@ -221,6 +246,9 @@ def main():
         if args.prune_only:
             print(json.dumps({'role': args.role, 'removed_backups': prune_backups(root, state, receipt)}))
             return
+        if not args.check and has_active_execution(node['homes']):
+            print(json.dumps({'role': args.role, 'status': 'deferred', 'reason': 'execution_active'}))
+            return
         target = release_target(args.role)
         commit = str(target.get('commit') or '')
         if not re.fullmatch('[0-9a-f]{40}', commit):
@@ -293,6 +321,9 @@ def main():
                 env={**os.environ, 'PYTHONPATH': str(generation), 'HERMES_HOME': home}, timeout=90)
         print(json.dumps({'role': args.role, 'commit': commit, 'version': version, 'prepared': True}), flush=True)
         if args.check:
+            return
+        if has_active_execution(node['homes']):
+            print(json.dumps({'role': args.role, 'commit': commit, 'status': 'deferred', 'reason': 'execution_active'}))
             return
         prefixes = [(['systemctl'], unit) for unit in node['units']]
         if node['user_units']:

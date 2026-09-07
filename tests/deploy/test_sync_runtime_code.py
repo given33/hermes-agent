@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 from pathlib import Path
 import tarfile
 from types import SimpleNamespace
@@ -40,6 +41,22 @@ def test_runtime_archive_contains_code_but_never_instance_state(updater, tmp_pat
 def test_runtime_member_rejects_traversal_and_nested_secret_files(updater):
     for path in ['../tools/escape.py', '/tools/escape.py', 'tools/../../.env', 'plugins/example/.env']:
         assert updater.code_member(path) is False
+
+
+def test_updates_wait_for_chat_or_real_worker_but_ignore_exited_processes(updater, tmp_path):
+    home = tmp_path / 'home'
+    state = home / 'collaboration/single.json'
+    state.parent.mkdir(parents=True)
+    processes = tmp_path / 'proc'
+    (processes / '123').mkdir(parents=True)
+    command = processes / '123/cmdline'
+    command.write_bytes(b'')
+    state.write_text(json.dumps({'conversations': [{'hosted_turns': {'one': {'status': 'running'}}}]}))
+    assert updater.has_active_execution([str(home)], processes)
+    state.write_text(json.dumps({'conversations': [{'hosted_turns': {'one': {'status': 'completed'}}}]}))
+    assert not updater.has_active_execution([str(home)], processes)
+    command.write_bytes(b'hermes\0--cli\0chat\0-q\0work kanban task t_1\0-Q\0')
+    assert updater.has_active_execution([str(home)], processes)
 
 
 def test_current_github_release_does_not_depend_on_rest_api_quota(updater, monkeypatch):
