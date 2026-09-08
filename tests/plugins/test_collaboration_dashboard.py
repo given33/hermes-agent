@@ -43,6 +43,44 @@ def test_connector_nonnegative_int_rejects_corrupt_state():
     assert module._nonnegative_int(float("inf")) == 0
 
 
+def test_explicit_assignment_route_is_durable_before_start_and_idempotent(monkeypatch, tmp_path):
+    module = load_module()
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    state_path = tmp_path / 'collaboration/single.json'
+    monkeypatch.setattr(module, 'single_state_path', lambda: state_path)
+    monkeypatch.setattr(module, 'owner_id_from_request', lambda _: 'owner-inline')
+    monkeypatch.setattr(module, '_account_generation_for_request', lambda *args: 'generation-inline')
+    monkeypatch.setattr(module, '_account_generation_for_owner', lambda *args: 'generation-inline')
+    monkeypatch.setattr(module, '_required_runtime_binding', lambda *args, **kwargs: {})
+    monkeypatch.setattr(module, '_prewarm_hosted_chat', lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, 'start_hosted_routing', lambda *args: pytest.fail('Explicit route was queued again'))
+    conversation = module.create_single_conversation('default')
+    conversation.update(owner_id='owner-inline', account_generation='generation-inline')
+    module.save_single_state({'conversations': [conversation]})
+    starts = []
+    def start(conversation_id, turn_id):
+        durable = json.loads(state_path.read_text())['conversations'][0]
+        run = durable['hosted_turns'][turn_id]
+        assert run['mode'] == 'work' and run['stage'] == 'accepted'
+        assert run['profiles'] == ['default', 'hk-worker']
+        assert not durable.get('route_outbox')
+        starts.append(turn_id)
+    monkeypatch.setattr(module, 'start_hosted_workflow', start)
+    payload = SimpleNamespace(
+        request_id='request-inline', turn_id='turn-inline',
+        message={'id': 'message-inline', 'role': 'user', 'content': '请派发给 hk-worker 使用 terminal 执行 hostname。'},
+        recent_messages=[], profiles=[], attachment_ids=[], attachment_context='', delivery_context='',
+    )
+    first = module.enqueue_hosted_turn(conversation['id'], payload, SimpleNamespace())
+    replay = module.enqueue_hosted_turn(conversation['id'], payload, SimpleNamespace())
+    assert first['accepted'] and replay['replayed']
+    durable = json.loads(state_path.read_text())['conversations'][0]
+    assert len(durable['hosted_turns']) == 1
+    assert sum(item['role'] == 'user' for item in durable['messages']) == 1
+    assert sum(item.get('kind') == 'route' for item in durable['messages']) == 1
+    assert starts == ['turn-inline', 'turn-inline']
+
+
 def test_router_account_fence_accepts_websocket_connections():
     from fastapi import FastAPI, WebSocket
     from fastapi.testclient import TestClient

@@ -20985,9 +20985,10 @@ def enqueue_hosted_turn(
             )
         return replay_response
 
-    hard_chat_route: Optional[dict[str, Any]] = None
-    hard_chat_profiles: list[str] = []
-    hard_chat_artifact_required = False
+    inline_route: Optional[dict[str, Any]] = None
+    inline_profiles: list[str] = []
+    inline_artifact_required = False
+    inline_mode = "chat"
     if (
         str(deterministic_route.get("mode") or "") == "chat"
         and str(deterministic_route.get("lock_level") or "") == "hard_chat"
@@ -20998,10 +20999,10 @@ def enqueue_hosted_turn(
         and conversation_profile == "default"
     ):
         (
-            hard_chat_route,
-            _hard_chat_mode,
-            hard_chat_profiles,
-            hard_chat_artifact_required,
+            inline_route,
+            inline_mode,
+            inline_profiles,
+            inline_artifact_required,
         ) = _hosted_route_parameters(
             route_metadata=deterministic_route,
             content=message_content,
@@ -21010,6 +21011,27 @@ def enqueue_hosted_turn(
             requested_artifact=_coerce_flag(
                 deterministic_route.get("artifact_required")
             ),
+        )
+
+    elif (
+        conversation_profile == "default"
+        and deterministic_route.get("lock_level") == "hard_work"
+        and _explicit_member_request(message_content)
+        and not slash_directive
+        and not attachment_ids
+        and not _coerce_flag(deterministic_route.get("artifact_required"))
+    ):
+        # The user already selected the executor. Commit that deterministic
+        # route with the queued turn, just like plain chat. Recovery still
+        # resumes the same durable turn; there is no classifier side effect
+        # that needs a second outbox claim and two more account-state writes.
+        inline_route, inline_mode, inline_profiles, inline_artifact_required = (
+            _hosted_route_parameters(
+                route_metadata=deterministic_route,
+                content=message_content,
+                requested_mode="work",
+                requested_profiles=list(deterministic_route.get("profiles") or []),
+            )
         )
 
     output_dir = _hosted_turn_output_dir(conversation_id, turn_id).resolve()
@@ -21122,15 +21144,15 @@ def enqueue_hosted_turn(
                 user_message_id=message_id,
                 content=message_content,
                 title=summarize_task_title(message_content),
-                profiles=hard_chat_profiles,
-                artifact_required=hard_chat_artifact_required,
+                profiles=inline_profiles,
+                artifact_required=inline_artifact_required,
                 attachment_context=payload.attachment_context,
                 delivery_context=payload.delivery_context,
                 user_delivery_context=payload.delivery_context,
-                mode="chat" if hard_chat_route is not None else "pending",
+                mode=inline_mode if inline_route is not None else "pending",
                 route_metadata=(
-                    hard_chat_route
-                    if hard_chat_route is not None
+                    inline_route
+                    if inline_route is not None
                     else {
                         "mode": "pending",
                         "lock_level": "pending",
@@ -21153,19 +21175,31 @@ def enqueue_hosted_turn(
                         "slash_argument": slash_argument,
                     }
                 )
-            if hard_chat_route is not None:
+            if inline_route is not None:
                 routed_at = int(time.time() * 1000)
                 hosted.update(
                     {
-                        "mode": "chat",
+                        "mode": inline_mode,
                         "stage": "accepted",
-                        "profiles": hard_chat_profiles,
-                        "artifact_required": hard_chat_artifact_required,
+                        "profiles": inline_profiles,
+                        "artifact_required": inline_artifact_required,
                         "artifact_producer_profiles": [],
                         "routing_requested_at": routed_at,
                         "routing_completed_at": routed_at,
                     }
                 )
+                if inline_mode == "work":
+                    route_record = _append_message(
+                        conversation, role="system", name=str(inline_route.get("label") or "任务路由"),
+                        content=str(inline_route.get("reason") or "已完成任务路由。"),
+                        status="completed", kind="route", meta={
+                            "mode": inline_mode, "profiles": inline_profiles,
+                            "lock_level": inline_route.get("lock_level"),
+                            "source": inline_route.get("source"), "runtime_turn_id": turn_id,
+                        },
+                    )
+                    route_record["id"] = route_message_id
+                    _project_native_message(route_record)
             else:
                 hosted.update(
                     {
@@ -21213,8 +21247,8 @@ def enqueue_hosted_turn(
                 conversation["title"] = summarize_task_title(message_content)
             now = int(time.time() * 1000)
             pending_route = (
-                hard_chat_route
-                if hard_chat_route is not None
+                inline_route
+                if inline_route is not None
                 else {
                     "mode": "pending",
                     "confidence": 0.0,
@@ -21230,20 +21264,20 @@ def enqueue_hosted_turn(
                 "fingerprint": fingerprint,
                 "turn_id": turn_id,
                 "message_id": message_id,
-                "route_message_id": "",
+                "route_message_id": route_message_id if inline_route is not None and inline_mode == "work" else "",
                 "route": pending_route,
                 "routing_state": (
-                    "completed" if hard_chat_route is not None else "pending"
+                    "completed" if inline_route is not None else "pending"
                 ),
                 "accepted": not isinstance(pending_cancellation, dict),
                 "created_at": now,
             }
-            if hard_chat_route is not None:
+            if inline_route is not None:
                 request_record["routing_completed_at"] = now
             requests[request_id] = request_record
             if (
                 not isinstance(pending_cancellation, dict)
-                and hard_chat_route is None
+                and inline_route is None
             ):
                 route_outbox = conversation.get("route_outbox")
                 if not isinstance(route_outbox, dict):
