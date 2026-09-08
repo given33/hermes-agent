@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import threading
 import time
+import pytest
 from types import SimpleNamespace
 
 from plugins.collaboration.dashboard.hosted_tui_runtime import (
@@ -164,7 +165,8 @@ def test_run_turn_waits_for_gateway_idle_ack_before_returning(monkeypatch):
     assert time.monotonic() - started >= 0.04
 
 
-def test_run_turn_returns_completed_reply_without_idle_ack(monkeypatch):
+@pytest.mark.parametrize("submit_status", ["streaming", "queued"])
+def test_run_turn_returns_completed_reply_without_idle_ack(monkeypatch, submit_status):
     gateway = _GatewayProcess.__new__(_GatewayProcess)
     gateway.last_used = 0.0
     state = _HostedSessionState(
@@ -178,6 +180,7 @@ def test_run_turn_returns_completed_reply_without_idle_ack(monkeypatch):
     gateway.ensure_session = lambda *_args, **_kwargs: state
 
     def rpc(_method, _params, *, timeout):
+        assert _params["queued"] is True
         def finish():
             sink = state.current_sink
             assert sink is not None
@@ -186,7 +189,7 @@ def test_run_turn_returns_completed_reply_without_idle_ack(monkeypatch):
             sink.done.set()
 
         threading.Thread(target=finish, daemon=True).start()
-        return {"status": "streaming"}
+        return {"status": submit_status}
 
     gateway.rpc = rpc
 

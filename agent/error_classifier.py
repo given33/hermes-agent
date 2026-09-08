@@ -1359,6 +1359,17 @@ def _classify_by_status(
         )
 
     if status_code == 429:
+        # OpenCode Go's paid monthly allowance is an account quota wall even
+        # when it advertises a future reset and Retry-After. Reuse the normal
+        # billing recovery instead of sleeping for ten minutes per attempt.
+        if ("monthly usage limit reached" in error_msg
+                and "available balance" in error_msg):
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+            )
         # Already checked long_context_tier above. Some providers (notably
         # Z.AI / Zhipu) reuse HTTP 429 for server-wide overload — same status
         # code as a true per-credential rate limit, but the credential is

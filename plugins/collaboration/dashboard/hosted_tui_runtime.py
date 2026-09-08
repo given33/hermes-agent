@@ -620,12 +620,16 @@ class _GatewayProcess:
                     {
                         "session_id": live_session_id,
                         "text": prompt,
+                        # Hosted turn_lock serializes complete user turns.
+                        # The previous TUI turn may still be unwinding after
+                        # message.complete; use its official next-turn queue.
+                        "queued": True,
                         "tool_artifact_turn_id": str(turn_id or ""),
                         "allow_tools": _allow_tools_from_context(artifact_context),
                     },
                     timeout=30.0 if timeout <= 0 else min(30.0, timeout),
                 )
-                if str(response.get("status") or "") != "streaming":
+                if str(response.get("status") or "") not in {"streaming", "queued"}:
                     raise HostedTuiGatewayError("Hermes 0.20 rejected the prompt")
                 deadline = None if timeout <= 0 else time.monotonic() + timeout
                 while not state.agent_ready.is_set():
