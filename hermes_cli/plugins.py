@@ -6273,7 +6273,7 @@ def _plugin_home_key() -> Path:
     being one process-wide singleton.
     """
     try:
-        return get_hermes_home().expanduser().resolve()
+        return Path(hermes_home_key(get_hermes_home()))
     except Exception:
         return get_hermes_home().expanduser()
 

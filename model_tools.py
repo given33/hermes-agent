@@ -39,6 +39,7 @@ from tools.registry import (
     tool_error,
 )
 from toolsets import resolve_toolset, validate_toolset
+from hermes_constants import hermes_home_resolution_scope
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +321,7 @@ def _clear_tool_defs_cache() -> None:
         _tool_defs_cache.clear()
 
 
+@hermes_home_resolution_scope()
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,

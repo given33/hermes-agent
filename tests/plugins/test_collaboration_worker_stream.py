@@ -18,6 +18,24 @@ def _load(name, relative):
     return module
 
 
+def test_idle_registration_binds_real_task_only_after_assignment(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
+    monkeypatch.delenv('HERMES_KANBAN_RUN_ID', raising=False)
+    plugin = _load('worker_stream_idle', 'plugins/collaboration/worker-stream/__init__.py')
+    hooks = {}
+    plugin.register(SimpleNamespace(register_hook=lambda name, callback: hooks.setdefault(name, callback)))
+    hooks['on_stream_start'](session_id='idle')
+    assert not (tmp_path / 'collaboration-streams').exists()
+    monkeypatch.setenv('HERMES_KANBAN_TASK', 't_live')
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', '7')
+    hooks['on_stream_start'](session_id='live')
+    hooks['on_stream_delta'](delta='Actual token', session_id='live')
+    rows = [json.loads(line) for line in (tmp_path / 'collaboration-streams/t_live.jsonl').read_text().splitlines()]
+    assert [row['run_id'] for row in rows] == ['7', '7']
+    assert rows[-1]['payload']['text'] == 'Actual token'
+
+
 def test_official_worker_hooks_publish_before_tool_completion_and_replay(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")

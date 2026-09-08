@@ -10,6 +10,7 @@ import time
 _lock = threading.Lock()
 _sequence = 0
 _tools = {}
+_stream_directory = None
 
 
 def _bounded(value, limit=20000):
@@ -18,16 +19,18 @@ def _bounded(value, limit=20000):
 
 
 def _emit(event_type, payload):
-    global _sequence
+    global _sequence, _stream_directory
     task = os.environ.get("HERMES_KANBAN_TASK", "")
     run = os.environ.get("HERMES_KANBAN_RUN_ID", "")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task) or not run.isdigit():
         return
     from hermes_constants import get_hermes_home
     directory = Path(get_hermes_home()) / "collaboration-streams"
-    directory.mkdir(mode=0o700, exist_ok=True)
     path = directory / f"{task}.jsonl"
     with _lock:
+        if _stream_directory != directory:
+            directory.mkdir(mode=0o700, exist_ok=True)
+            _stream_directory = directory
         _sequence += 1
         record = {"run_id": run, "sequence": _sequence, "type": event_type,
                   "payload": {**payload, "timestamp": int(time.time() * 1000)}}
@@ -65,6 +68,8 @@ def _api_error(session_id="", status_code=None, retry_count=None, max_retries=No
 
 
 def _tool_start(tool_name="", args=None, tool_call_id="", session_id="", task_id="", **_):
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return
     key = tool_call_id or f"{session_id}:{task_id}:{tool_name}"
     started = int(time.time() * 1000)
     with _lock:
@@ -74,6 +79,8 @@ def _tool_start(tool_name="", args=None, tool_call_id="", session_id="", task_id
 
 
 def _tool_complete(tool_name="", args=None, result=None, tool_call_id="", session_id="", task_id="", status="", **_):
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return
     key = tool_call_id or f"{session_id}:{task_id}:{tool_name}"
     ended = int(time.time() * 1000)
     with _lock:
@@ -94,8 +101,8 @@ def _tool_complete(tool_name="", args=None, result=None, tool_call_id="", sessio
 
 
 def register(ctx):
-    if not os.environ.get("HERMES_KANBAN_TASK"):
-        return
+    # Registration can happen in an idle worker; each callback binds the
+    # actual task at invocation and emits nothing before an assignment.
     ctx.register_hook("on_stream_start", _start)
     ctx.register_hook("on_stream_delta", _delta)
     ctx.register_hook("api_request_error", _api_error)

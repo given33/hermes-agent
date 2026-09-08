@@ -194,6 +194,9 @@ def _main() -> None:
         pass
     from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
     ensure_mcp_discovery_before_agent_build(logger=cli.logger, single_query=True)
+    # Resolve lazy requirement imports while idle. Actual task toolsets and
+    # permissions are still recomputed after its context has been installed.
+    model_tools.get_tool_definitions(quiet_mode=True, skip_tool_search_assembly=True)
     if os.environ.get("HERMES_KANBAN_DB"):
         from hermes_cli import kanban_db
         with kanban_db.connect_closing():
@@ -215,10 +218,18 @@ def _main() -> None:
         os.dup2(log.fileno(), 2)
     with open(os.devnull, "rb") as devnull:
         os.dup2(devnull.fileno(), 0)
-    # Registration may depend on task context or the actual workspace (the
-    # worker-stream observer, for example). Rebind through the official
-    # teardown/discovery API after those values are installed.
-    discover_plugins(force=True)
+    # Bundled observers bind task IDs at invocation. Third-party or project
+    # plugins may instead capture task/workspace state during registration;
+    # retain the official reload for those installations.
+    from hermes_cli.plugins import get_plugin_manager
+    from utils import env_var_enabled
+    manager = get_plugin_manager()
+    reload_plugins = env_var_enabled("HERMES_ENABLE_PROJECT_PLUGINS") or any(
+        getattr(loaded.manifest, "source", "") != "bundled"
+        and getattr(loaded.manifest, "name", "") != "collaboration-worker-stream"
+        for loaded in manager._plugins.values()
+    )
+    discover_plugins(force=reload_plugins)
     entry.main()
 
 

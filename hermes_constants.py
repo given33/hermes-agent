@@ -10,6 +10,7 @@ import shutil
 import stat
 import sys
 from contextvars import ContextVar, Token
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 
@@ -240,6 +241,26 @@ def expand_user_path(path: str | os.PathLike[str]) -> str:
     return os.path.expanduser(raw)
 
 
+_HOME_KEY_SNAPSHOT: ContextVar[tuple | None] = ContextVar("hermes_home_key_snapshot", default=None)
+
+
+@contextmanager
+def hermes_home_resolution_scope():
+    """Resolve once within one synchronous registry operation, then discard.
+
+    The raw expanded path and cwd must still match on every read. Nested
+    profile overrides therefore never inherit another profile's identity.
+    Symlink changes are observed by the next operation, without a TTL cache.
+    """
+    candidate = get_hermes_home().expanduser()
+    identity = (str(candidate), os.getcwd() if not candidate.is_absolute() else "")
+    token = _HOME_KEY_SNAPSHOT.set((*identity, os.path.normcase(str(candidate.resolve(strict=False)))))
+    try:
+        yield
+    finally:
+        _HOME_KEY_SNAPSHOT.reset(token)
+
+
 def hermes_home_key(path: str | Path | None = None) -> str:
     """Return a stable key for a Hermes home/profile directory.
 
@@ -248,7 +269,13 @@ def hermes_home_key(path: str | Path | None = None) -> str:
     useful behavior for profiles whose directories have not been created yet.
     """
     candidate = Path(path) if path is not None else get_hermes_home()
-    resolved = candidate.expanduser().resolve(strict=False)
+    candidate = candidate.expanduser()
+    snapshot = _HOME_KEY_SNAPSHOT.get()
+    if snapshot is not None and snapshot[:2] == (
+        str(candidate), os.getcwd() if not candidate.is_absolute() else ""
+    ):
+        return snapshot[2]
+    resolved = candidate.resolve(strict=False)
     return os.path.normcase(str(resolved))
 
 

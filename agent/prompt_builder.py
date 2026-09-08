@@ -2064,9 +2064,11 @@ def _build_skills_system_prompt_inner(
         if not ext_dir.exists():
             continue
         metadata = _external_skills_metadata(ext_dir)
-        for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
+        for relative_name, frontmatter in sorted(metadata.items()):
+            if Path(relative_name).name != "SKILL.md":
+                continue
+            skill_file = ext_dir / relative_name
             try:
-                frontmatter = metadata.get(skill_file.relative_to(ext_dir).as_posix(), {})
                 if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter):
                     continue
                 desc = extract_skill_description(frontmatter)
@@ -2092,9 +2094,11 @@ def _build_skills_system_prompt_inner(
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
 
         # External category descriptions
-        for desc_file in iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
+        for relative_name, fm in sorted(metadata.items()):
+            if Path(relative_name).name != "DESCRIPTION.md":
+                continue
+            desc_file = ext_dir / relative_name
             try:
-                fm = metadata.get(desc_file.relative_to(ext_dir).as_posix(), {})
                 cat_desc = fm.get("description")
                 if not cat_desc:
                     continue
