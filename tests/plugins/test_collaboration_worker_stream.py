@@ -30,10 +30,11 @@ def test_idle_registration_binds_real_task_only_after_assignment(monkeypatch, tm
     monkeypatch.setenv('HERMES_KANBAN_TASK', 't_live')
     monkeypatch.setenv('HERMES_KANBAN_RUN_ID', '7')
     hooks['on_stream_start'](session_id='live')
-    hooks['on_stream_delta'](delta='Actual token', session_id='live')
+    hooks['on_stream_delta'](delta='Actual token', session_id='live', observed_at_ms=123456)
     rows = [json.loads(line) for line in (tmp_path / 'collaboration-streams/t_live.jsonl').read_text().splitlines()]
     assert [row['run_id'] for row in rows] == ['7', '7']
     assert rows[-1]['payload']['text'] == 'Actual token'
+    assert rows[-1]['payload']['timestamp'] == 123456
 
 
 def test_official_worker_hooks_publish_before_tool_completion_and_replay(monkeypatch, tmp_path):

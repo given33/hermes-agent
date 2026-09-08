@@ -766,6 +766,8 @@ def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
     """Publish immutable hosted conversation snapshots before durable I/O."""
 
     with _latency_trace.span("state.publish_live") as pub:
+        with _HOSTED_LIVE_STATE_LOCK:
+            published = dict(_HOSTED_LIVE_CONVERSATIONS)
         snapshots: dict[str, dict[str, Any]] = {}
         for item in state.get("conversations") or []:
             if not isinstance(item, dict):
@@ -773,11 +775,19 @@ def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
             conversation_id = str(item.get("id") or "").strip()
             if not conversation_id:
                 continue
-            snapshots[conversation_id] = _copy_state_document(item)
+            previous = published.get(conversation_id)
+            snapshots[conversation_id] = previous if previous == item else _copy_state_document(item)
         with _HOSTED_LIVE_STATE_LOCK:
-            for conversation_id, snapshot in snapshots.items():
+            for conversation_id, snapshot in list(snapshots.items()):
                 previous = _HOSTED_LIVE_CONVERSATIONS.get(conversation_id)
+                if previous is snapshot:
+                    continue
                 if previous is not None:
+                    # A token may have replaced the snapshot while the state
+                    # writer was preparing it. Never mutate a shared old view.
+                    if snapshot is published.get(conversation_id):
+                        snapshot = _copy_state_document(snapshot)
+                        snapshots[conversation_id] = snapshot
                     _merge_published_hosted_events(snapshot, previous)
             # Checkpoint the same ledger clients have already consumed. Saving
             # an older cursor makes subsequent HTTP snapshots lag forever.
@@ -787,7 +797,7 @@ def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
                     continue
                 for key in ("hosted_events", "hosted_event_cursor", "hosted_event_min_cursor",
                             "hosted_event_sequences", "hosted_event_terminals"):
-                    if key in snapshot:
+                    if key in snapshot and item.get(key) != snapshot[key]:
                         item[key] = _copy_state_document(snapshot[key])
             _HOSTED_LIVE_CONVERSATIONS.clear()
             _HOSTED_LIVE_CONVERSATIONS.update(snapshots)
@@ -919,21 +929,17 @@ def _publish_live_hosted_role_projection(
         if not isinstance(current_run, dict):
             return
         turns = dict(current_turns)
-        run = deepcopy(current_run)
+        run = dict(current_run)
         turns[normalized_turn_id] = run
         conversation["hosted_turns"] = turns
         for key, value in (patch or {}).items():
             if key == "role_events" and isinstance(value, dict):
-                role_events = run.setdefault("role_events", {})
-                if not isinstance(role_events, dict):
-                    role_events = {}
-                    run["role_events"] = role_events
+                role_events = dict(run.get("role_events") or {})
+                run["role_events"] = role_events
                 role_events.update(deepcopy(value))
             elif key == "participants" and isinstance(value, list):
-                existing = run.setdefault("participants", [])
-                if not isinstance(existing, list):
-                    existing = []
-                    run["participants"] = existing
+                existing = list(run.get("participants") or [])
+                run["participants"] = existing
                 known = {
                     str(item.get("member_id") or item.get("id") or "")
                     for item in existing
@@ -14141,6 +14147,7 @@ def _remote_run_state_message(
     remote_run: dict[str, Any],
     *,
     role_label: str,
+    persist: bool = True,
 ) -> None:
     """Project a remote checkpoint into the same collapsible native message."""
 
@@ -14265,7 +14272,10 @@ def _remote_run_state_message(
         semantic_milestone=(
             semantic_progress if status == "running" or intervention_pause else ""
         ),
+        persist=persist,
     )
+    if not persist:
+        return
     with _HOSTED_LIVE_STATE_LOCK:
         current = _REMOTE_STREAM_STATES.get(stream_id)
         if status in _REMOTE_TERMINAL_STATUSES:
@@ -18277,6 +18287,7 @@ def connector_ack_run(remote_run_id: str, payload: ConnectorAckBody, request: Re
         str(hosted.get("turn_id") or ""),
         persisted,
         role_label=f"{persisted.get('profile') or 'worker'} · 执行",
+        persist=False,
     )
     _audit_connector(
         connector_id,

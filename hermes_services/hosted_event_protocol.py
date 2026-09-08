@@ -489,14 +489,19 @@ def state_with_persistence_hook_outbox(
     # A guarded store writer already owns a private mutable document. Allow
     # that caller to promote its outbox in place instead of cloning every
     # historical transcript twice per queue/lease transition.
-    persisted = _json_copy(dict(state)) if copy_state else state
+    pending_owners = _mappings_with_pending_persistence_hooks(state)
+    # Pending callbacks belong to the caller until the atomic write succeeds.
+    # Preserve them on failure; the common no-hook save needs no full clone.
+    persisted = _json_copy(dict(state)) if copy_state or pending_owners else state
+    if persisted is not state:
+        pending_owners = _mappings_with_pending_persistence_hooks(persisted)
     raw_outbox = persisted.get(_PERSISTENCE_HOOK_OUTBOX)
     outbox = deepcopy(raw_outbox) if isinstance(raw_outbox, dict) else {}
     raw_acks = persisted.get(_PERSISTENCE_HOOK_ACKS)
     acknowledgements = deepcopy(raw_acks) if isinstance(raw_acks, dict) else {}
     for acknowledged_event_id in acknowledgements:
         outbox.pop(acknowledged_event_id, None)
-    for owner in _mappings_with_pending_persistence_hooks(persisted):
+    for owner in pending_owners:
         raw_pending = owner.get(_PENDING_PERSISTENCE_HOOKS)
         pending = list(raw_pending) if isinstance(raw_pending, list) else []
         for snapshot in pending:
@@ -536,7 +541,8 @@ def state_with_persistence_hook_outbox(
         persisted[_PERSISTENCE_HOOK_ACKS] = acknowledgements
     else:
         persisted.pop(_PERSISTENCE_HOOK_ACKS, None)
-    _remove_pending_persistence_hooks(persisted)
+    for owner in pending_owners:
+        owner.pop(_PENDING_PERSISTENCE_HOOKS, None)
     _purge_deleted_persistence_hook_work(persisted)
     return persisted
 
@@ -875,14 +881,18 @@ def _remove_pending_persistence_hooks(value: Any) -> None:
 
 def _mappings_with_pending_persistence_hooks(value: Any) -> list[dict[str, Any]]:
     owners: list[dict[str, Any]] = []
-    if isinstance(value, dict):
-        if isinstance(value.get(_PENDING_PERSISTENCE_HOOKS), list):
-            owners.append(value)
-        for child in value.values():
-            owners.extend(_mappings_with_pending_persistence_hooks(child))
-    elif isinstance(value, list):
-        for child in value:
-            owners.extend(_mappings_with_pending_persistence_hooks(child))
+    def visit(item):
+        if isinstance(item, dict):
+            if _PENDING_PERSISTENCE_HOOKS in item:
+                owners.append(item)
+            children = item.values()
+        else:
+            children = item
+        for child in children:
+            if isinstance(child, (dict, list)):
+                visit(child)
+    if isinstance(value, (dict, list)):
+        visit(value)
     return owners
 
 

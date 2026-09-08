@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -123,6 +124,7 @@ def enqueue_plugin_stream_hook(hook_name: str, **payload: Any) -> bool:
     """Queue an observer hook for each consumer without running plugin code inline."""
     queued = False
     item = dict(payload)
+    item.setdefault("observed_at_ms", int(time.time() * 1000))
     for dispatcher in _dispatchers_for(hook_name):
         try:
             dispatcher.events.put_nowait(item)
@@ -159,7 +161,7 @@ def stream_reasoning_deltas_enabled() -> bool:
     try:
         from hermes_cli import config as config_mod
 
-        config = config_mod.load_config()
+        config = config_mod.load_config_readonly()
         return bool(config_mod.cfg_get(config, "plugins", "stream_reasoning_deltas", default=False))
     except Exception:
         logger.debug("failed to read plugins.stream_reasoning_deltas", exc_info=True)

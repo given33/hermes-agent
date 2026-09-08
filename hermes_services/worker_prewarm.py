@@ -228,10 +228,6 @@ def _main() -> None:
     import hermes_cli.models
     from agent.models_dev import fetch_models_dev
     fetch_models_dev(allow_network=False)
-    from agent.ssl_verify import default_httpx_context
-    default_httpx_context()
-    from agent.ssl_guard import verify_ca_bundle
-    verify_ca_bundle()
     import hermes_cli.model_data_policy_guard
     import hermes_cli.active_sessions
     import hermes_cli.observability.relay_shared_metrics
@@ -248,6 +244,22 @@ def _main() -> None:
     # adapters; resolve those static settings before an assignment arrives.
     from agent.relay_runtime import _segments_config
     _segments_config()
+    # Gateway discovery can establish SSL_CERT_FILE. Warm the final CA policy
+    # after that import, otherwise the task rebuilds every TLS context again.
+    from agent.ssl_verify import default_httpx_context, resolve_httpx_verify
+    from agent.ssl_guard import verify_ca_bundle
+    from agent.process_bootstrap import build_keepalive_http_client
+    from hermes_cli.config import load_config_readonly
+    import agent.model_metadata
+    verify_ca_bundle()
+    default_httpx_context()
+    model_config = load_config_readonly().get("model") or {}
+    if isinstance(model_config, dict):
+        verify = resolve_httpx_verify(ca_bundle=model_config.get("ssl_ca_cert"),
+                                      ssl_verify=model_config.get("ssl_verify"))
+        transport = build_keepalive_http_client(str(model_config.get("base_url") or ""), verify=verify)
+        if transport is not None:
+            transport.close()  # The official process-shared pool stays warm.
     from tools.env_probe import get_environment_probe_line
     get_environment_probe_line()
     if os.environ.get("HERMES_KANBAN_DB"):

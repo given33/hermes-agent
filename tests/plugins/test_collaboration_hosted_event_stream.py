@@ -58,6 +58,26 @@ def _load_module():
     return module
 
 
+def test_live_projection_shares_unchanged_turns_without_mutating_old_snapshot():
+    module = _load_module()
+    remote = {'worker': {'status': 'running'}}
+    original = {'id': 'c', 'owner_id': 'owner', 'account_generation': 'generation-1',
+        'hosted_turns': {'t': {'status': 'running', 'remote_runs': remote,
+            'role_events': {'old': {'content': 'original'}}, 'participants': [{'id': 'old'}]}},
+        'messages': []}
+    module._HOSTED_LIVE_CONVERSATIONS['c'] = original
+    module._publish_live_hosted_role_projection('c', 't', patch={
+        'role_events': {'new': {'content': 'token'}}, 'participants': [{'id': 'new'}]})
+    current = module._HOSTED_LIVE_CONVERSATIONS['c']
+    assert set(original['hosted_turns']['t']['role_events']) == {'old'}
+    assert original['hosted_turns']['t']['participants'] == [{'id': 'old'}]
+    assert current['hosted_turns']['t']['remote_runs'] is remote
+    assert set(current['hosted_turns']['t']['role_events']) == {'old', 'new'}
+    staged = module._copy_state_document({'conversations': [current]})
+    module._publish_live_conversations(staged)
+    assert module._HOSTED_LIVE_CONVERSATIONS['c'] is current
+
+
 def _load_ios_dashboard_module():
     spec = importlib.util.spec_from_file_location(
         "ios_intelligence_account_deletion_recovery_test_module",

@@ -33,7 +33,7 @@ def _emit(event_type, payload):
             _stream_directory = directory
         _sequence += 1
         record = {"run_id": run, "sequence": _sequence, "type": event_type,
-                  "payload": {**payload, "timestamp": int(time.time() * 1000)}}
+                  "payload": {"timestamp": int(time.time() * 1000), **payload}}
         encoded = (json.dumps(record, ensure_ascii=False, default=str) + "\n").encode("utf-8")
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags, 0o600)
@@ -41,16 +41,18 @@ def _emit(event_type, payload):
             stream.write(encoded)
 
 
-def _start(session_id="", model="", provider="", iteration=0, **_):
+def _start(session_id="", model="", provider="", iteration=0, observed_at_ms=None, **_):
     _emit("request.accepted", {"session_id": session_id, "model": model,
-                               "provider": provider, "iteration": iteration})
+                               "provider": provider, "iteration": iteration,
+                               "timestamp": observed_at_ms or int(time.time() * 1000)})
 
 
-def _delta(delta="", kind="text", session_id="", iteration=0, **_):
+def _delta(delta="", kind="text", session_id="", iteration=0, observed_at_ms=None, **_):
     if delta:
         for offset in range(0, len(delta), 8000):
             _emit("reasoning.delta" if kind == "reasoning" else "message.delta",
                   {"text": delta[offset:offset + 8000], "session_id": session_id,
+                   "timestamp": observed_at_ms or int(time.time() * 1000),
                    "entity_id": f"{session_id}:{iteration}:{kind}"})
 
 

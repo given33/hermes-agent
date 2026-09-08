@@ -3973,6 +3973,34 @@ def apply_terminal_config_to_env(
     return target
 
 
+def _copy_config(value: Any, memo: Optional[dict] = None) -> Any:
+    """Copy YAML containers without deepcopy dispatch for every scalar.
+
+    Keep aliases/cycles and delegate uncommon values to deepcopy so callers
+    retain the same isolation contract as load_config's original cache.
+    """
+    kind = type(value)
+    if kind in (str, int, float, bool, bytes, type(None)):
+        return value
+    if memo is None:
+        memo = {}
+    identity = id(value)
+    if identity in memo:
+        return memo[identity]
+    if kind is dict:
+        result = {}
+        memo[identity] = result
+        for key, item in value.items():
+            result[_copy_config(key, memo)] = _copy_config(item, memo)
+        return result
+    if kind is list:
+        result = []
+        memo[identity] = result
+        result.extend(_copy_config(item, memo) for item in value)
+        return result
+    return copy.deepcopy(value, memo)
+
+
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         ensure_hermes_home()
@@ -4021,9 +4049,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # life of the process (#58514).
             env_snapshot = cached[5] if len(cached) > 5 else {}
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
-                return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
+                return _copy_config(cached[4]) if want_deepcopy else cached[4]
 
-        config = copy.deepcopy(DEFAULT_CONFIG)
+        config = _copy_config(DEFAULT_CONFIG)
 
         if user_sig is not None:
             try:
