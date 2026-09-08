@@ -18,3 +18,15 @@ def test_assignment_rechecks_idle_tool_permissions(monkeypatch, tmp_path):
     assert 'kanban_unblock' not in names
     invalidate_check_fn_cache()
     model_tools._clear_tool_defs_cache()
+
+
+def test_prewarm_signature_uses_content_hash_not_mtime(tmp_path):
+    import os
+    from hermes_services.worker_prewarm import _signature
+    config = tmp_path / "config.yaml"
+    config.write_text("model: original\n")
+    before = _signature(str(tmp_path))
+    os.utime(config, ns=(config.stat().st_atime_ns, config.stat().st_mtime_ns + 1_000_000))
+    assert _signature(str(tmp_path)) == before
+    config.write_text("model: modified\n")
+    assert _signature(str(tmp_path)) != before

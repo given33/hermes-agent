@@ -7,12 +7,14 @@ No agent, prompt, conversation, or model request is created while idle.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 
 
 def _signature(home: str) -> tuple:
@@ -24,8 +26,7 @@ def _signature(home: str) -> tuple:
     result = []
     for path in paths:
         try:
-            stat = path.stat()
-            result.append((str(path), stat.st_mtime_ns, stat.st_size))
+            result.append((str(path), hashlib.sha256(path.read_bytes()).digest()))
         except OSError:
             result.append((str(path), None, None))
     return tuple(result)
@@ -83,7 +84,7 @@ class WorkerPrewarmPool:
                 )
             except OSError:
                 return  # The ordinary Kanban launcher remains available.
-            spare = {"proc": proc, "signature": signature, "ready": False,
+            spare = {"proc": proc, "signature": signature, "ready": False, "created_at": time.monotonic(),
                      "profile": profile, "board": board}
             self._spares[home] = spare
 
@@ -123,10 +124,18 @@ class WorkerPrewarmPool:
         home = env.get("HERMES_HOME", "")
         with self._lock:
             spare = self._spares.pop(home, None)
+        diagnostic = {"event": "worker.startup", "timestamp_ms": int(time.time() * 1000),
+                      "prewarmed": False, "reason": "no-spare"}
         if spare:
             proc = spare["proc"]
+            diagnostic.update(pid=proc.pid, ready=spare["ready"],
+                              spare_age_ms=round((time.monotonic()-spare["created_at"])*1000),
+                              signature_matches=spare["signature"] == _signature(home))
             if (spare["ready"] and proc.poll() is None
                     and spare["signature"] == _signature(home)):
+                diagnostic.update(prewarmed=True, reason="ready")
+                kwargs["stdout"].write((json.dumps(diagnostic)+"\n").encode())
+                kwargs["stdout"].flush()
                 # The command is built by Kanban, not by a remote payload.
                 # Preserve all official CLI flags after its -p profile pair.
                 try:
@@ -143,6 +152,9 @@ class WorkerPrewarmPool:
                 self._replenish(proc, spare["profile"], spare["board"])
                 return proc
             self._discard(spare)
+            diagnostic["reason"] = "unready-or-stale"
+        kwargs["stdout"].write((json.dumps(diagnostic)+"\n").encode())
+        kwargs["stdout"].flush()
         result = subprocess.Popen(cmd, **kwargs)
         profile = env.get("HERMES_PROFILE", "")
         if profile:
