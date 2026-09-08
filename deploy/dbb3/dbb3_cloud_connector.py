@@ -2103,7 +2103,10 @@ class DBB3CloudConnector:
             from hermes_services.worker_prewarm import WorkerPrewarmPool
             from hermes_cli.config import load_config_readonly
             section = (load_config_readonly().get("collaboration") or {})
-            self._worker_pool = WorkerPrewarmPool(limit=int(section.get("worker_prewarm_processes", 1)))
+            self._worker_pool = WorkerPrewarmPool(
+                limit=int(section.get("worker_prewarm_processes", 1)),
+                depth=int(section.get("worker_prewarm_depth", 2)),
+            )
         self.clock = clock
         self._pending_steers: list[dict[str, Any]] = []
         self._pending_steers_lock = threading.Lock()

@@ -35,9 +35,10 @@ def _signature(home: str) -> tuple:
 class WorkerPrewarmPool:
     """Bounded spare processes; never block dispatch waiting for a spare."""
 
-    def __init__(self, *, limit: int = 1):
+    def __init__(self, *, limit: int = 1, depth: int = 2):
         self.limit = max(0, limit)
-        self._spares: dict[str, dict] = {}
+        self.depth = max(1, min(4, depth))
+        self._spares: dict[str, list[dict]] = {}
         self._lock = threading.Lock()
         self._closed = False
 
@@ -54,13 +55,20 @@ class WorkerPrewarmPool:
         with self._lock:
             if self._closed:
                 return
-            previous = self._spares.get(home)
-            if previous and previous["signature"] == signature and previous["proc"].poll() is None:
+            previous = self._spares.get(home, [])
+            usable = []
+            for spare in previous:
+                if spare["signature"] == signature and spare["proc"].poll() is None:
+                    usable.append(spare)
+                else:
+                    self._discard(spare)
+            if home in self._spares:
+                self._spares[home] = usable
+            if len(usable) >= self.depth:
                 return
-            if previous:
-                self._discard(self._spares.pop(home))
-            if len(self._spares) >= self.limit:
-                self._discard(self._spares.pop(next(iter(self._spares))))
+            if home not in self._spares and len(self._spares) >= self.limit:
+                for spare in self._spares.pop(next(iter(self._spares))):
+                    self._discard(spare)
             env = dict(os.environ)
             for key in _VAR_MAP:
                 env.pop(key, None)
@@ -76,19 +84,7 @@ class WorkerPrewarmPool:
             if board:
                 from hermes_cli import kanban_db
                 env["HERMES_KANBAN_DB"] = str(kanban_db.kanban_db_path(board=board))
-            try:
-                proc = subprocess.Popen(
-                    [sys.executable, "-m", __name__, profile], env=env,
-                    cwd=home, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL, start_new_session=True,
-                )
-            except OSError:
-                return  # The ordinary Kanban launcher remains available.
-            spare = {"proc": proc, "signature": signature, "ready": False, "created_at": time.monotonic(),
-                     "profile": profile, "board": board}
-            self._spares[home] = spare
-
-            def ready() -> None:
+            def ready(proc, spare) -> None:
                 assert proc.stdout is not None
                 for line in proc.stdout:
                     if line.strip() == b"HERMES_WORKER_READY":
@@ -99,7 +95,21 @@ class WorkerPrewarmPool:
                         "Worker prewarm exited before readiness for %s (code %s)",
                         profile, proc.poll())
 
-            threading.Thread(target=ready, name="worker-prewarm-ready", daemon=True).start()
+            self._spares[home] = usable
+            for _ in range(self.depth - len(usable)):
+                try:
+                    proc = subprocess.Popen(
+                        [sys.executable, "-m", __name__, profile], env=env,
+                        cwd=home, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, start_new_session=True,
+                    )
+                except OSError:
+                    return  # The ordinary Kanban launcher remains available.
+                spare = {"proc": proc, "signature": signature, "ready": False,
+                         "created_at": time.monotonic(), "profile": profile, "board": board}
+                usable.append(spare)
+                threading.Thread(target=ready, args=(proc, spare),
+                                 name="worker-prewarm-ready", daemon=True).start()
 
     @staticmethod
     def _discard(spare: dict) -> None:
@@ -122,17 +132,23 @@ class WorkerPrewarmPool:
     def launch(self, cmd: list[str], **kwargs):
         env = kwargs["env"]
         home = env.get("HERMES_HOME", "")
+        signature = _signature(home)
         with self._lock:
-            spare = self._spares.pop(home, None)
+            candidates = self._spares.get(home, [])
+            spare = next((item for item in candidates if item["ready"]
+                          and item["signature"] == signature and item["proc"].poll() is None), None)
+            if spare:
+                candidates.remove(spare)
+            pending = bool(candidates)
         diagnostic = {"event": "worker.startup", "timestamp_ms": int(time.time() * 1000),
-                      "prewarmed": False, "reason": "no-spare"}
+                      "prewarmed": False, "reason": "spare-preparing" if pending else "no-spare"}
         if spare:
             proc = spare["proc"]
             diagnostic.update(pid=proc.pid, ready=spare["ready"],
                               spare_age_ms=round((time.monotonic()-spare["created_at"])*1000),
-                              signature_matches=spare["signature"] == _signature(home))
+                              signature_matches=spare["signature"] == signature)
             if (spare["ready"] and proc.poll() is None
-                    and spare["signature"] == _signature(home)):
+                    and spare["signature"] == signature):
                 diagnostic.update(prewarmed=True, reason="ready")
                 kwargs["stdout"].write((json.dumps(diagnostic)+"\n").encode())
                 kwargs["stdout"].flush()
@@ -177,8 +193,9 @@ class WorkerPrewarmPool:
         with self._lock:
             self._closed = True
             spares, self._spares = self._spares, {}
-        for spare in spares.values():
-            self._discard(spare)
+        for candidates in spares.values():
+            for spare in candidates:
+                self._discard(spare)
 
 
 def _bind_task_environment(env: dict[str, str]) -> None:

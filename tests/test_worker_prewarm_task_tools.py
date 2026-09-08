@@ -30,3 +30,34 @@ def test_prewarm_signature_uses_content_hash_not_mtime(tmp_path):
     assert _signature(str(tmp_path)) == before
     config.write_text("model: modified\n")
     assert _signature(str(tmp_path)) != before
+
+
+def test_cold_fallback_preserves_inflight_prewarm(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from hermes_services import worker_prewarm as runtime
+    pool = runtime.WorkerPrewarmPool()
+    proc = SimpleNamespace(poll=lambda: None)
+    spare = {'proc': proc, 'ready': False, 'signature': runtime._signature(str(tmp_path))}
+    pool._spares[str(tmp_path)] = [spare]
+    child = object()
+    monkeypatch.setattr(runtime.subprocess, 'Popen', lambda *a, **k: child)
+    monkeypatch.setattr(pool, '_replenish', lambda *a: None)
+    with (tmp_path/'worker.log').open('ab') as log:
+        assert pool.launch(['hermes', '-p', 'test'], env={'HERMES_HOME': str(tmp_path)}, stdout=log) is child
+    assert pool._spares[str(tmp_path)] == [spare]
+
+
+def test_ready_reserve_is_used_while_other_spare_is_preparing(monkeypatch, tmp_path):
+    import io
+    import time
+    from types import SimpleNamespace
+    from hermes_services import worker_prewarm as runtime
+    pool = runtime.WorkerPrewarmPool()
+    proc = SimpleNamespace(poll=lambda: None, pid=123, stdin=io.BytesIO())
+    pending = {'proc': proc, 'ready': False, 'signature': runtime._signature(str(tmp_path))}
+    ready = {**pending, 'ready': True, 'created_at': time.monotonic(), 'profile': 'test', 'board': 'test'}
+    pool._spares[str(tmp_path)] = [pending, ready]
+    monkeypatch.setattr(pool, '_replenish', lambda *a: None)
+    with (tmp_path/'worker.log').open('ab') as log:
+        assert pool.launch(['hermes', '-p', 'test'], env={'HERMES_HOME': str(tmp_path)}, stdout=log) is proc
+    assert pool._spares[str(tmp_path)] == [pending]
