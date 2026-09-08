@@ -197,6 +197,12 @@ def _main() -> None:
     # Resolve lazy requirement imports while idle. Actual task toolsets and
     # permissions are still recomputed after its context has been installed.
     model_tools.get_tool_definitions(quiet_mode=True, skip_tool_search_assembly=True)
+    # Relay's first-turn settings currently import gateway.run and its
+    # adapters; resolve those static settings before an assignment arrives.
+    from agent.relay_runtime import _segments_config
+    _segments_config()
+    from tools.env_probe import get_environment_probe_line
+    get_environment_probe_line()
     if os.environ.get("HERMES_KANBAN_DB"):
         from hermes_cli import kanban_db
         with kanban_db.connect_closing():
