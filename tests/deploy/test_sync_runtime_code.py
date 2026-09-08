@@ -5,6 +5,7 @@ from pathlib import Path
 import tarfile
 import subprocess
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,20 @@ def test_runtime_archive_contains_code_but_never_instance_state(updater, tmp_pat
 def test_runtime_member_rejects_traversal_and_nested_secret_files(updater):
     for path in ['../tools/escape.py', '/tools/escape.py', 'tools/../../.env', 'plugins/example/.env']:
         assert updater.code_member(path) is False
+
+
+def test_bytecode_warm_uses_runtime_python_without_executing_code(updater, tmp_path):
+    source = tmp_path / 'cli.py'
+    source.write_text('raise RuntimeError("must never execute during compilation")\n')
+    private = tmp_path / 'profiles' / 'worker.py'
+    private.parent.mkdir()
+    private.write_text('private = True\n')
+    result = updater.warm_runtime_bytecode(sys.executable, tmp_path, {
+        'cli.py': updater.digest_file(source), 'profiles/worker.py': 'excluded',
+    })
+    assert result == {'files': 1, 'failed': 0, 'skipped': False}
+    assert list((tmp_path / '__pycache__').glob('cli.*.pyc'))
+    assert not (private.parent / '__pycache__').exists()
 
 
 def test_updates_wait_for_chat_or_real_worker_but_ignore_exited_processes(updater, tmp_path):

@@ -113,6 +113,29 @@ def digest_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def warm_runtime_bytecode(python: str, root: Path, files: dict[str, str]) -> dict:
+    """Pay compilation during deployment, before read-only workers start.
+
+    Extends upstream d380651a9f's install-time bytecode warming to our code
+    archive installer. Use the runtime interpreter, not the system Python.
+    No module is imported or executed and only approved code is traversed.
+    """
+    paths = [str(root / name) for name in files
+             if code_member(name) and name.endswith('.py')]
+    script = (
+        'import compileall,json,sys\n'
+        'paths=json.load(sys.stdin)\n'
+        'failed=[]\n'
+        'if not sys.dont_write_bytecode:\n'
+        ' for path in paths:\n'
+        '  if not compileall.compile_file(path,quiet=2,force=False): failed.append(path)\n'
+        'print(json.dumps({"files":len(paths),"failed":len(failed),'
+        '"skipped":bool(sys.dont_write_bytecode)}))\n'
+    )
+    result = run([python, '-c', script], input=json.dumps(paths), timeout=180)
+    return json.loads(result.stdout.splitlines()[-1])
+
+
 def has_active_execution(homes: list[str], proc_root: Path = Path('/proc')) -> bool:
     for home in map(Path, homes):
         state_path = home / 'collaboration/single.json'
@@ -365,6 +388,7 @@ def main():
                 os.chown(Path(directory) / filename, environment_owner.st_uid, environment_owner.st_gid,
                          follow_symlinks=False)
         import tempfile
+        warm_runtime_bytecode(python, generation, files)
         with tempfile.TemporaryDirectory(prefix='hermes-update-check-') as home:
             run([python, '-c', 'import hermes_cli.web_server, run_agent'], cwd=generation,
                 env={**os.environ, 'PYTHONPATH': str(generation), 'HERMES_HOME': home}, timeout=90)
@@ -448,6 +472,7 @@ def main():
             for name, digest in files.items():
                 if digest_file(root / name) != digest:
                     raise RuntimeError('Runtime checksum mismatch: ' + name)
+            report['bytecode'] = warm_runtime_bytecode(python, root, files)
             for prefix, unit in reversed(active):
                 run(prefix + ['start', unit])
             if watchdog.is_file():

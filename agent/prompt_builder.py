@@ -5,6 +5,7 @@ assemble pieces, then combines them with memory and ephemeral prompts.
 """
 
 import json
+import hashlib
 import logging
 import os
 import sys
@@ -1702,6 +1703,46 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         return True, {}, ""
 
 
+def _external_skills_metadata(skills_dir: Path) -> dict[str, dict]:
+    """Reuse parsed external metadata across worker processes, scoped to the profile.
+
+    Match the official local snapshot's manifest validation. Store metadata,
+    never visibility decisions: environment, platform and tool gates still run
+    for the current agent. The external directory remains read-only.
+    """
+    identity = str(skills_dir.resolve())
+    cache_path = get_hermes_home() / "cache" / (
+        "external-skills-" + hashlib.sha256(identity.encode()).hexdigest() + ".json"
+    )
+    manifest = _build_skills_manifest(skills_dir)
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        entries = cached.get("entries")
+        if (cached.get("version") == 1 and cached.get("directory") == identity
+                and cached.get("manifest") == manifest and isinstance(entries, dict)
+                and all(isinstance(value, dict) for value in entries.values())):
+            return entries
+    except (OSError, ValueError, AttributeError):
+        pass
+    entries = {}
+    for name in ("SKILL.md", "DESCRIPTION.md"):
+        for path in iter_skill_index_files(skills_dir, name):
+            try:
+                frontmatter, _ = parse_frontmatter(path.read_text(encoding="utf-8"))
+                entries[path.relative_to(skills_dir).as_posix()] = frontmatter
+            except Exception as exc:
+                logger.debug("Could not cache external skill %s: %s", path, exc)
+    # Do not certify a mixed snapshot if a skill changed during the scan.
+    if manifest == _build_skills_manifest(skills_dir):
+        try:
+            atomic_json_write(cache_path, {
+                "version": 1, "directory": identity, "manifest": manifest, "entries": entries,
+            })
+        except Exception as exc:
+            logger.debug("Could not save external skills metadata: %s", exc)
+    return entries
+
+
 def _skill_should_show(
     conditions: dict,
     available_tools: "set[str] | None",
@@ -2011,8 +2052,8 @@ def _build_skills_system_prompt_inner(
         )
 
     # ── External skill directories ─────────────────────────────────────
-    # Scan external dirs directly (no snapshot caching — they're read-only
-    # and typically small).  Local skills already in skills_by_category take
+    # Cache external metadata in the profile, never in the read-only source.
+    # Local skills already in skills_by_category take
     # precedence: we track seen names and skip duplicates from external dirs.
     seen_skill_names: set[str] = set()
     for cat_skills in skills_by_category.values():
@@ -2022,11 +2063,13 @@ def _build_skills_system_prompt_inner(
     for ext_dir in external_dirs:
         if not ext_dir.exists():
             continue
+        metadata = _external_skills_metadata(ext_dir)
         for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
             try:
-                is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
-                if not is_compatible:
+                frontmatter = metadata.get(skill_file.relative_to(ext_dir).as_posix(), {})
+                if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter):
                     continue
+                desc = extract_skill_description(frontmatter)
                 entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
@@ -2051,8 +2094,7 @@ def _build_skills_system_prompt_inner(
         # External category descriptions
         for desc_file in iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
             try:
-                content = desc_file.read_text(encoding="utf-8")
-                fm, _ = parse_frontmatter(content)
+                fm = metadata.get(desc_file.relative_to(ext_dir).as_posix(), {})
                 cat_desc = fm.get("description")
                 if not cat_desc:
                     continue
