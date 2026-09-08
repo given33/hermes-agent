@@ -10,6 +10,31 @@ import pytest
 from deploy.dbb3 import dbb3_cloud_connector as connector_module
 
 
+def test_connector_dispatches_concurrent_conversations_with_official_caps(monkeypatch, tmp_path):
+    import os
+    from hermes_cli import kanban_db
+    home = tmp_path / 'home'
+    home.mkdir()
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    (home/'config.yaml').write_text('kanban:\n  max_in_progress: 3\n  max_concurrent: 3\n  max_in_progress_per_profile: 2\n')
+    board = 'hosted-concurrent'
+    kanban_db.create_board(board, name='Concurrent conversations')
+    connector = connector_module.DBB3CloudConnector(SimpleNamespace(), state_file=tmp_path/'state.json')
+    connector._worker_pool = None
+    ids = [connector._create_root({'board': board, 'profile': 'default',
+        'objective': f'Conversation {i}', 'idempotency_key': f'conversation-{i}'}) for i in range(3)]
+    spawned = []
+    def spawn(task, workspace, **kwargs):
+        spawned.append(task.id)
+        return os.getpid()
+    monkeypatch.setattr(kanban_db, '_default_spawn', spawn)
+    connector._dispatch_board({'board': board})
+    assert len(spawned) == 2
+    states = [connector._show_task(task_id, {'board': board})['task']['status'] for task_id in ids]
+    assert states.count('running') == 2
+    assert states.count('ready') == 1
+
+
 def test_direct_kanban_creation_and_observation_preserve_task_contract(monkeypatch, tmp_path):
     from hermes_cli import kanban_db
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))

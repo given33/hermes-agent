@@ -10,6 +10,7 @@ the official TUI and desktop clients.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from concurrent.futures import Future
 import atexit
 import hashlib
 import json
@@ -137,6 +138,11 @@ class _GatewayProcess:
 
     def alive(self) -> bool:
         return not self._closed.is_set() and self.process.poll() is None
+
+    def busy(self) -> bool:
+        with self._session_lock:
+            return any(state.turn_lock.locked() or state.async_event_callbacks
+                       for state in self._sessions_by_conversation.values())
 
     def _stderr_summary(self) -> str:
         return "".join(self._stderr_tail)[-4000:].strip()
@@ -752,6 +758,7 @@ class _GatewayProcess:
 
 _POOL_LOCK = threading.Lock()
 _POOL: dict[tuple[str, str, str, str, str], _GatewayProcess] = {}
+_POOL_STARTING: dict[tuple[str, str, str, str, str], Future] = {}
 _MAX_IDLE_SECONDS = 30 * 60
 _MAX_GATEWAYS = 32
 
@@ -770,21 +777,24 @@ def _pool_key(
     return (runtime_home, owner_id, account_generation, profile, artifact_root)
 
 
-def _prune_locked(now: float) -> None:
+def _prune_locked(now: float) -> list[_GatewayProcess]:
     stale = [
         key
         for key, gateway in _POOL.items()
-        if not gateway.alive() or now - gateway.last_used > _MAX_IDLE_SECONDS
+        if not gateway.alive() or (not gateway.busy() and now - gateway.last_used > _MAX_IDLE_SECONDS)
     ]
     if len(_POOL) - len(stale) > _MAX_GATEWAYS:
         survivors = sorted(
-            ((gateway.last_used, key) for key, gateway in _POOL.items() if key not in stale)
+            ((gateway.last_used, key) for key, gateway in _POOL.items()
+             if key not in stale and not gateway.busy())
         )
         stale.extend(key for _used, key in survivors[: len(_POOL) - len(stale) - _MAX_GATEWAYS])
+    retired = []
     for key in dict.fromkeys(stale):
         gateway = _POOL.pop(key, None)
         if gateway is not None:
-            gateway.close()
+            retired.append(gateway)
+    return retired
 
 
 def _gateway_for(
@@ -806,10 +816,23 @@ def _gateway_for(
         artifact_root=artifact_root,
     )
     with _POOL_LOCK:
-        _prune_locked(time.monotonic())
         existing = _POOL.get(key)
         if existing is not None and existing.alive():
+            existing.last_used = time.monotonic()
             return existing
+        retired = _prune_locked(time.monotonic())
+        pending = _POOL_STARTING.get(key)
+        creator = pending is None
+        if creator:
+            pending = Future()
+            _POOL_STARTING[key] = pending
+    # Process startup and termination can take seconds. Only callers for this
+    # same account/profile wait for readiness; warm gateways remain available.
+    for gateway in retired:
+        gateway.close()
+    if not creator:
+        return pending.result(timeout=30.0)
+    try:
         env = {
             **os.environ,
             **(extra_env or {}),
@@ -836,8 +859,16 @@ def _gateway_for(
             dict.fromkeys([import_root, *inherited.split(os.pathsep)])
         ).rstrip(os.pathsep)
         gateway = _GatewayProcess(env=env, cwd=runtime_home)
-        _POOL[key] = gateway
+        with _POOL_LOCK:
+            _POOL[key] = gateway
+        pending.set_result(gateway)
         return gateway
+    except BaseException as exc:
+        pending.set_exception(exc)
+        raise
+    finally:
+        with _POOL_LOCK:
+            _POOL_STARTING.pop(key, None)
 
 
 def prewarm_hosted_gateway(

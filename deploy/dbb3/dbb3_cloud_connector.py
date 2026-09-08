@@ -2893,10 +2893,13 @@ class DBB3CloudConnector:
         return target
 
     def _accept_run(self, run_payload: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+        preparation_started = time.perf_counter()
+        preparation_wall_ms = int(time.time() * 1000)
         remote_id = _text(run_payload.get("remote_run_id"), 256)
         if not remote_id:
             return {}
         current = _checkpoint_run(state, remote_id)
+        new_assignment = not current.get("root_task_id")
         previous_claim = _text(current.get("claim_token"), 256)
         claim_token = _text(run_payload.get("claim_token"), 256)
         if not claim_token:
@@ -2919,6 +2922,7 @@ class DBB3CloudConnector:
         else:
             resolved_profile = _execution_profile_for_run(run_payload)
         self._boundary_validated_runs.add(remote_id)
+        profile_ready_ms = round((time.perf_counter() - preparation_started) * 1000, 3)
         execution_profile = (
             resolved_profile
             if owner_id and owner_id not in {"server-admin", "local-owner"}
@@ -3002,12 +3006,20 @@ class DBB3CloudConnector:
                 }
             )
             self.checkpoints.save(state)
+        root_ready_ms = round((time.perf_counter() - preparation_started) * 1000, 3)
         if not _coerce_flag(current.get("acked")):
             self.cloud_client.acknowledge_run(run_payload, current)
             current["acked"] = True
             self.checkpoints.save(state)
+        acknowledged_ms = round((time.perf_counter() - preparation_started) * 1000, 3)
         self._watch_execution(current)
         self._dispatch_board(current)
+        if new_assignment:
+            print(json.dumps({"event": "worker.preparation", "remote_run_id": remote_id,
+                "root_task_id": current.get("root_task_id"), "started_at": preparation_wall_ms,
+                "profile_ready_ms": profile_ready_ms, "root_ready_ms": root_ready_ms,
+                "acknowledged_ms": acknowledged_ms,
+                "dispatched_ms": round((time.perf_counter() - preparation_started) * 1000, 3)}), flush=True)
         return current
 
     def _dispatch_board(self, local: dict[str, Any]) -> None:
@@ -3017,14 +3029,18 @@ class DBB3CloudConnector:
         # Official board-scoped lock fences other dispatchers. Existing
         # unrelated board tasks are never started by connector recovery.
         from hermes_cli import kanban_db
+        from hermes_cli.config import load_config_readonly
+        kanban_config = (load_config_readonly() or {}).get("kanban") or {}
+        host_cap = kanban_db.resolve_max_in_progress(kanban_db.configured_max_in_progress())
         with kanban_db.connect_closing(board=board) as connection:
             spawn_fn = None
             if self._worker_pool is not None:
                 spawn_fn = lambda task, workspace: kanban_db._default_spawn(
                     task, workspace, board=board, process_factory=self._worker_pool.launch)
-            kanban_db.dispatch_once(connection, board=board, max_spawn=1, spawn_fn=spawn_fn,
-                max_in_progress=kanban_db.resolve_max_in_progress(kanban_db.configured_max_in_progress()),
-                max_in_progress_per_profile=1)
+            kanban_db.dispatch_once(connection, board=board,
+                max_spawn=kanban_config.get("max_concurrent", host_cap), spawn_fn=spawn_fn,
+                max_in_progress=host_cap,
+                max_in_progress_per_profile=kanban_config.get("max_in_progress_per_profile"))
 
     def _compact_status(self, detail: dict[str, Any], local: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         task = detail.get("task") if isinstance(detail.get("task"), dict) else {}

@@ -518,6 +518,55 @@ def test_gateway_pool_key_is_account_scoped_not_conversation_scoped():
     ) == ("/runtime", "owner", "generation", "default", "/artifacts")
 
 
+def test_cold_profile_does_not_block_warm_or_other_cold_profiles(monkeypatch):
+    from plugins.collaboration.dashboard import hosted_tui_runtime as runtime
+    started = threading.Event()
+    release = threading.Event()
+    created = []
+    warm = SimpleNamespace(alive=lambda: True, busy=lambda: False,
+                           last_used=time.monotonic(), close=lambda: None)
+    monkeypatch.setattr(runtime, '_POOL', {('/warm', 'owner', 'g', 'default', '/artifacts'): warm})
+    monkeypatch.setattr(runtime, '_POOL_STARTING', {})
+
+    def build(*, env, cwd):
+        created.append(cwd)
+        if cwd == '/slow':
+            started.set()
+            assert release.wait(3)
+        return SimpleNamespace(alive=lambda: True, busy=lambda: False,
+                               last_used=time.monotonic(), close=lambda: None)
+
+    monkeypatch.setattr(runtime, '_GatewayProcess', build)
+    def get(home):
+        return runtime._gateway_for(runtime_home=home, owner_id='owner',
+            account_generation='g', conversation_id='conversation', profile='default',
+            artifact_root='/artifacts', import_root='/code')
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        slow = executor.submit(get, '/slow')
+        try:
+            assert started.wait(1)
+            duplicate = executor.submit(get, '/slow')
+            assert executor.submit(get, '/warm').result(timeout=1) is warm
+            assert executor.submit(get, '/other').result(timeout=1) is not warm
+        finally:
+            release.set()
+        assert slow.result(timeout=1) is duplicate.result(timeout=1)
+    assert created.count('/slow') == 1
+
+
+def test_pruning_preserves_active_long_turns_and_defers_close(monkeypatch):
+    from plugins.collaboration.dashboard import hosted_tui_runtime as runtime
+    closed = []
+    busy = SimpleNamespace(alive=lambda: True, busy=lambda: True, last_used=0,
+                           close=lambda: closed.append('busy'))
+    idle = SimpleNamespace(alive=lambda: True, busy=lambda: False, last_used=0,
+                           close=lambda: closed.append('idle'))
+    monkeypatch.setattr(runtime, '_POOL', {'busy': busy, 'idle': idle})
+    assert runtime._prune_locked(runtime._MAX_IDLE_SECONDS + 1) == [idle]
+    assert runtime._POOL == {'busy': busy}
+    assert closed == []
+
+
 def test_real_gateway_process_serves_two_isolated_conversations(tmp_path):
     repo_root = Path(__file__).resolve().parents[2]
     runtime_home = tmp_path / "runtime"
