@@ -166,6 +166,16 @@ class WorkerPrewarmPool:
             self._discard(spare)
 
 
+def _bind_task_environment(env: dict[str, str]) -> None:
+    os.environ.update(env)
+    # Requirement probes ran without an assignment. In particular Kanban's
+    # task tools must not inherit the idle process's cached negative result.
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+
 def _main() -> None:
     profile = sys.argv[1]
     # CLI import-time configuration belongs to this one profile for the
@@ -214,7 +224,7 @@ def _main() -> None:
     request = json.loads(packet)
     if request["env"].get("HERMES_HOME") != os.environ.get("HERMES_HOME"):
         raise RuntimeError("Prewarmed worker profile changed")
-    os.environ.update(request["env"])
+    _bind_task_environment(request["env"])
     sys.argv = ["hermes", *request["argv"]]
     entry._apply_profile_override()
     if request.get("cwd"):
