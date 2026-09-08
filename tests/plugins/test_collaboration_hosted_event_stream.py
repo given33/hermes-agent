@@ -1176,6 +1176,39 @@ def test_background_checkpoint_cannot_rewind_live_tokens_or_reuse_their_cursor()
     assert conversation["hosted_event_cursor"] == 2
 
 
+def test_live_merge_keeps_checkpoint_bounded_and_restart_replays_with_gap(monkeypatch):
+    from copy import deepcopy
+    module = _load_module()
+    monkeypatch.setattr(module, "_MAX_HOSTED_EVENTS_PER_CONVERSATION", 3)
+    conversation = module.create_single_conversation(profile="default")
+    conversation.update(owner_id="owner", account_generation="generation")
+    module.create_hosted_turn_record(conversation, turn_id="t", content="hello", title="hello",
+                                    profiles=["default"], artifact_required=False, mode="chat")
+    state = {"conversations": [conversation]}
+    module._publish_live_conversations(state)
+    for index in range(1, 9):
+        module._publish_live_hosted_role_projection(conversation["id"], "t", protocol_events=[{
+            "event_type": "message.delta", "payload": {"text": str(index)}, "entity_id": "m",
+            "idempotency_key": f"delta-{index}", "occurred_at": index, "role_stage": "chat"}])
+        module._publish_live_conversations(state)
+        assert len(conversation["hosted_events"]) <= 3
+        assert conversation["hosted_event_cursor"] == index
+    live = module._live_conversation_snapshot(conversation["id"], "owner")
+    assert len(live["hosted_events"]) == 8
+    assert conversation["hosted_event_min_cursor"] == 6
+    checkpoint = deepcopy(conversation)
+    module._HOSTED_LIVE_CONVERSATIONS.clear()
+    module._publish_live_conversations({"conversations": [checkpoint]})
+    frame, _ = module._hosted_event_stream_frame(checkpoint, delivered_cursor=1, include_snapshot=False)
+    assert frame["has_gap"] is True
+    assert "conversation" in frame
+    module.append_hosted_event(checkpoint, conversation_id=conversation["id"], turn_id="t",
+                              role_stage="chat", event_type="message.delta", entity_id="m",
+                              idempotency_key="delta-9", payload={"text": "9"})
+    assert checkpoint["hosted_event_cursor"] == 9
+    assert checkpoint["hosted_events"][-1]["sequence"] == 9
+
+
 def test_checkpoint_does_not_deduplicate_different_turns_with_legacy_event_keys():
     module = _load_module()
     def conversation(turn):

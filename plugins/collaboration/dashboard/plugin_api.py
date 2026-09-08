@@ -789,16 +789,23 @@ def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
                         snapshot = _copy_state_document(snapshot)
                         snapshots[conversation_id] = snapshot
                     _merge_published_hosted_events(snapshot, previous)
-            # Checkpoint the same ledger clients have already consumed. Saving
-            # an older cursor makes subsequent HTTP snapshots lag forever.
+            # Preserve the published cursor, but checkpoint only the bounded
+            # replay tail. Older clients recover through the gap snapshot.
             for item in state.get("conversations") or []:
                 snapshot = snapshots.get(str(item.get("id") or "")) if isinstance(item, dict) else None
                 if snapshot is None:
                     continue
                 for key in ("hosted_events", "hosted_event_cursor", "hosted_event_min_cursor",
                             "hosted_event_sequences", "hosted_event_terminals"):
-                    if key in snapshot and item.get(key) != snapshot[key]:
-                        item[key] = _copy_state_document(snapshot[key])
+                    if key not in snapshot:
+                        continue
+                    value = snapshot[key]
+                    if key == "hosted_events":
+                        value = value[-_MAX_HOSTED_EVENTS_PER_CONVERSATION:]
+                    elif key == "hosted_event_min_cursor" and snapshot.get("hosted_events"):
+                        value = snapshot["hosted_events"][-_MAX_HOSTED_EVENTS_PER_CONVERSATION:][0]["cursor"]
+                    if item.get(key) != value:
+                        item[key] = _copy_state_document(value)
             _HOSTED_LIVE_CONVERSATIONS.clear()
             _HOSTED_LIVE_CONVERSATIONS.update(snapshots)
         pub.attr("conversations", len(snapshots))
@@ -4146,6 +4153,7 @@ def _trim_hosted_state(state: dict[str, Any]) -> None:
         events = conversation.get("hosted_events")
         if isinstance(events, list) and len(events) > _MAX_HOSTED_EVENTS_PER_CONVERSATION:
             conversation["hosted_events"] = events[-_MAX_HOSTED_EVENTS_PER_CONVERSATION:]
+            conversation["hosted_event_min_cursor"] = conversation["hosted_events"][0]["cursor"]
         messages = conversation.get("messages")
         if isinstance(messages, list) and len(messages) > _MAX_HOSTED_MESSAGES_PER_CONVERSATION:
             conversation["messages"] = messages[-_MAX_HOSTED_MESSAGES_PER_CONVERSATION:]
