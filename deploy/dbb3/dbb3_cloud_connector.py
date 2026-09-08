@@ -2097,6 +2097,12 @@ class DBB3CloudConnector:
         self._last_reported_terminal = False
         self._lease_conflicts = 0
         self.command_runner = command_runner
+        self._worker_pool = None
+        if command_runner is run:
+            from hermes_services.worker_prewarm import WorkerPrewarmPool
+            from hermes_cli.config import load_config_readonly
+            section = (load_config_readonly().get("collaboration") or {})
+            self._worker_pool = WorkerPrewarmPool(limit=int(section.get("worker_prewarm_processes", 1)))
         self.clock = clock
         self._pending_steers: list[dict[str, Any]] = []
         self._pending_steers_lock = threading.Lock()
@@ -2108,6 +2114,16 @@ class DBB3CloudConnector:
             )
         )
         self.checkpoints = CheckpointStore(path)
+        if self._worker_pool is not None:
+            recent = list((self.checkpoints.load().get("runs") or {}).values())
+            warmed = set()
+            for local in reversed(recent):
+                profile = _text(local.get("execution_profile") or local.get("profile"), 128)
+                if profile and profile not in warmed:
+                    self._worker_pool.prepare(profile, board=_text(local.get("board"), 128))
+                    warmed.add(profile)
+                    if len(warmed) >= self._worker_pool.limit:
+                        break
         self.attachment_root = path.parent / "attachments"
         self.attachment_root.mkdir(parents=True, exist_ok=True)
         roots = artifact_roots or os.environ.get(
@@ -2192,6 +2208,8 @@ class DBB3CloudConnector:
 
     def close(self, timeout: float = 2.0) -> None:
         """Stop the optional event stream/heartbeat without blocking shutdown."""
+        if self._worker_pool is not None:
+            self._worker_pool.close()
         self._stream_stop.set()
         self._heartbeat_stop.set()
         self._wake_event.set()
@@ -2866,6 +2884,8 @@ class DBB3CloudConnector:
             if owner_id and owner_id not in {"server-admin", "local-owner"}
             else ""
         )
+        if self._worker_pool is not None:
+            self._worker_pool.prepare(resolved_profile, board=_text(current.get("board"), 128))
         current.update(
             {
                 "remote_run_id": remote_id,
@@ -2958,7 +2978,11 @@ class DBB3CloudConnector:
         # unrelated board tasks are never started by connector recovery.
         from hermes_cli import kanban_db
         with kanban_db.connect_closing(board=board) as connection:
-            kanban_db.dispatch_once(connection, board=board, max_spawn=1,
+            spawn_fn = None
+            if self._worker_pool is not None:
+                spawn_fn = lambda task, workspace: kanban_db._default_spawn(
+                    task, workspace, board=board, process_factory=self._worker_pool.launch)
+            kanban_db.dispatch_once(connection, board=board, max_spawn=1, spawn_fn=spawn_fn,
                 max_in_progress=kanban_db.resolve_max_in_progress(kanban_db.configured_max_in_progress()),
                 max_in_progress_per_profile=1)
 

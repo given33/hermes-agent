@@ -3093,7 +3093,7 @@ def _save_state_store_locked(
         # recovery reader already delivered. Merge durable receipts before
         # promoting pending work so an ACK cannot be resurrected.
         preserve_persistence_hook_outbox(previous, state)
-    persisted_state = state_with_persistence_hook_outbox(state)
+    persisted_state = state_with_persistence_hook_outbox(state, copy_state=False)
     _validate_state_document(persisted_state, collection_key, target)
 
     # Keep the last known-good document in a separately atomic file. On first
@@ -3134,8 +3134,9 @@ def _save_state_store_locked(
             persisted_state,
             collection_key,
         )
-        state.clear()
-        state.update(_copy_state_document(committed_state))
+        if committed_state is not state:
+            state.clear()
+            state.update(committed_state)
     except Exception:
         # The target write is already authoritative. Persistence observers are
         # fail-open and must never turn a committed state transition into a
@@ -6551,7 +6552,7 @@ def _renew_hosted_active_role(
 
     now = int(time.time() * 1000)
     with _STATE_LOCK:
-        state = load_single_state()
+        state = _load_single_state_for_event_stream()
         conversation = _conversation_by_id(state, conversation_id)
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
         if not isinstance(run, dict) or run.get("status") in _HOSTED_TERMINAL_STATUSES:
@@ -6564,6 +6565,15 @@ def _renew_hosted_active_role(
             or str(current.get("execution_owner") or "") != execution_owner
         ):
             return False
+        # Stream deltas wake this coordinator many times per second. A live
+        # lease only needs renewal in its final half; saving on every wake
+        # also wakes the coordinator itself and creates an endless write loop.
+        if int(current.get("lease_expires_at") or 0) > now + max(500, int(lease_ms) // 2):
+            return True
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = conversation["hosted_turns"][turn_id]
+        current = run["active_roles"][role_stage]
         current["lease_expires_at"] = now + max(1_000, int(lease_ms))
         current["updated_at"] = now
         run["updated_at"] = now
@@ -10019,7 +10029,7 @@ def apply_profile_event(
             activities.append(activity)
         activity.update(
             {
-                "name": str(payload.get("message") or f"正在重新连接 ({attempt}/{max_attempts})")[:160],
+                "name": f"正在重新连接 ({attempt}/{max_attempts})",
                 # Intermediate causes stay server-side. The fifth failure is
                 # persisted once as the terminal assistant error.
                 "output": "",
@@ -11679,6 +11689,8 @@ def _run_hosted_remote_role(
     fallback_deadline = time.monotonic() + float(
         min(configured_fallback or _REMOTE_SERVER_FALLBACK_SECONDS, 60)
     )
+    last_remote_checkpoint = None
+    last_remote_checkpoint_at = 0.0
     while True:
         if not _renew_hosted_active_role(
             conversation_id,
@@ -11704,7 +11716,7 @@ def _run_hosted_remote_role(
                 visible=visible,
             )
         with _STATE_LOCK:
-            state = load_single_state()
+            state = _load_single_state_for_event_stream()
             location = _remote_run_location(state, str(remote.get("id") or ""))
             if location is None:
                 raise RuntimeError("远程执行记录不存在")
@@ -12097,12 +12109,21 @@ def _run_hosted_remote_role(
             release_remote_role_claim()
             return result, role_state["status"], role_state
         if visible:
-            _remote_run_state_message(
-                conversation_id,
-                turn_id,
-                remote,
-                role_label=role_label,
-            )
+            with _HOSTED_LIVE_STATE_LOCK:
+                stream_cursor = int((_REMOTE_STREAM_STATES.get(active_remote_id) or {}).get("remote_stream_cursor") or 0)
+            checkpoint = (status, remote.get("updated_at"), remote.get("checkpoint_cursor"), stream_cursor)
+            instant = time.monotonic()
+            if (checkpoint != last_remote_checkpoint
+                    and (last_remote_checkpoint is None or status != last_remote_checkpoint[0]
+                         or instant - last_remote_checkpoint_at >= _HOSTED_EVENT_FLUSH_SECONDS)):
+                _remote_run_state_message(
+                    conversation_id,
+                    turn_id,
+                    remote,
+                    role_label=role_label,
+                )
+                last_remote_checkpoint = checkpoint
+                last_remote_checkpoint_at = instant
         if time.monotonic() >= deadline:
             _advance_remote_run_deadline(active_remote_id)
             deadline = time.monotonic() + _REMOTE_CANCELLATION_GRACE_SECONDS

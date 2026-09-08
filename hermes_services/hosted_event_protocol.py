@@ -481,10 +481,15 @@ def append_hosted_event(
 
 def state_with_persistence_hook_outbox(
     state: MutableMapping[str, Any],
+    *,
+    copy_state: bool = True,
 ) -> dict[str, Any]:
     """Promote staged callbacks into an event-ID-keyed durable outbox."""
 
-    persisted = _json_copy(dict(state))
+    # A guarded store writer already owns a private mutable document. Allow
+    # that caller to promote its outbox in place instead of cloning every
+    # historical transcript twice per queue/lease transition.
+    persisted = _json_copy(dict(state)) if copy_state else state
     raw_outbox = persisted.get(_PERSISTENCE_HOOK_OUTBOX)
     outbox = deepcopy(raw_outbox) if isinstance(raw_outbox, dict) else {}
     raw_acks = persisted.get(_PERSISTENCE_HOOK_ACKS)
