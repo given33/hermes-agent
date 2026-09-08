@@ -198,6 +198,11 @@ def _main() -> None:
     fetch_models_dev(allow_network=False)
     from agent.ssl_verify import default_httpx_context
     default_httpx_context()
+    from agent.ssl_guard import verify_ca_bundle
+    verify_ca_bundle()
+    import hermes_cli.model_data_policy_guard
+    import hermes_cli.active_sessions
+    import hermes_cli.observability.relay_shared_metrics
     try:
         import aiohttp
     except ImportError:

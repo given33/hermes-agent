@@ -19,6 +19,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -1317,7 +1318,7 @@ class CheckpointStore:
                 os.chmod(temporary, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 fd = -1
-                json.dump(value, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -2280,6 +2281,13 @@ class DBB3CloudConnector:
                         stream.update(offset=0, cursor=0)
                     else:
                         stream.update(offset=offset, cursor=cursor)
+                        for event in events:
+                            if event.get("type") != "request.accepted":
+                                continue
+                            session_id = _text((event.get("payload") or {}).get("session_id"), 256)
+                            if _SESSION_ID_RE.fullmatch(session_id):
+                                with self._execution_stream_lock:
+                                    stream["session_id"] = session_id
                 except CloudHTTPError as exc:
                     if exc.status in {404, 409, 410}:
                         with self._execution_stream_lock:
@@ -2513,6 +2521,12 @@ class DBB3CloudConnector:
         existing = _text(local.get("worker_session_id"), 256)
         if existing:
             return existing
+        with self._execution_stream_lock:
+            observed = self._execution_streams.get(local.get("remote_run_id"), {})
+            streamed_session_id = _text(observed.get("session_id"), 256)
+        if streamed_session_id and _SESSION_ID_RE.fullmatch(streamed_session_id):
+            local["worker_session_id"] = streamed_session_id
+            return streamed_session_id
         runs = detail.get("runs") if isinstance(detail.get("runs"), list) else []
         for item in reversed(runs):
             if not isinstance(item, dict):
@@ -2525,6 +2539,12 @@ class DBB3CloudConnector:
             if session_id and _SESSION_ID_RE.fullmatch(session_id):
                 local["worker_session_id"] = session_id
                 return session_id
+
+        if self.command_runner is run:
+            # Every current worker announces its actual session in the live
+            # observer. Spawning `hermes sessions list` while it is booting
+            # competes with startup and can hold the same SQLite writer lock.
+            return ""
 
         profile = _text(
             local.get("execution_profile") or local.get("profile"),
@@ -2595,38 +2615,30 @@ class DBB3CloudConnector:
             and (not terminal or terminal_loaded)
         ):
             return dict(cached.get("snapshot") or {})
-        code, output = self.command_runner(
-            [
-                "hermes",
-                "-p",
-                profile,
-                "sessions",
-                "export",
-                "-",
-                "--format",
-                "jsonl",
-                "--session-id",
-                session_id,
-                "--redact",
-            ],
-            timeout=30,
-        )
-        if code != 0:
-            return dict(cached.get("snapshot") or {})
         record: dict[str, Any] = {}
-        for line in output.splitlines():
-            if not line.lstrip().startswith("{"):
-                continue
+        if self.command_runner is run:
             try:
-                candidate = json.loads(line)
-            except (TypeError, ValueError):
-                continue
-            if (
-                isinstance(candidate, dict)
-                and _text(candidate.get("id"), 256) == session_id
-            ):
-                record = candidate
-                break
+                record = self._read_worker_session(profile, session_id)
+            except Exception:
+                logging.getLogger(__name__).debug("Worker session snapshot unavailable", exc_info=True)
+        else:
+            code, output = self.command_runner(
+                ["hermes", "-p", profile, "sessions", "export", "-",
+                 "--format", "jsonl", "--session-id", session_id, "--redact"],
+                timeout=30,
+            )
+            if code != 0:
+                return dict(cached.get("snapshot") or {})
+            for line in output.splitlines():
+                if not line.lstrip().startswith("{"):
+                    continue
+                try:
+                    candidate = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(candidate, dict) and _text(candidate.get("id"), 256) == session_id:
+                    record = candidate
+                    break
         if not record:
             return dict(cached.get("snapshot") or {})
         snapshot = {
@@ -2659,6 +2671,31 @@ class DBB3CloudConnector:
             while len(self._session_cache) > _SESSION_CACHE_MAX:
                 self._session_cache.popitem(last=False)
         return snapshot
+
+    @staticmethod
+    def _read_worker_session(profile: str, session_id: str) -> dict[str, Any]:
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from hermes_cli.session_export_md import redact_session_data
+        from hermes_state import SessionDB
+
+        home = get_profile_dir(profile)
+        path = home / "state.db"
+        if not path.is_file() or path.is_symlink():
+            return {}
+        token = set_hermes_home_override(home)
+        try:
+            # Exactly the CLI's export and redaction functions, using the
+            # official read-only connection so telemetry cannot run schema
+            # maintenance or queue behind the worker's conversation writes.
+            db = SessionDB(path, read_only=True)
+            try:
+                record = db.export_session(session_id)
+                return redact_session_data(record) if isinstance(record, dict) else {}
+            finally:
+                db.close()
+        finally:
+            reset_hermes_home_override(token)
 
     def _create_root(self, run_payload: dict[str, Any]) -> str:
         if self.command_runner is run:

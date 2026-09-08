@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import ssl
+from functools import lru_cache
 from pathlib import Path
 
 from agent.errors import SSLConfigurationError
@@ -51,8 +52,18 @@ def _validate_bundle_path(label: str, value: str, *, require_substantial: bool =
         raise _ssl_err(f"{label} does not point to a CA bundle file: {value}")
     if require_substantial and path.stat().st_size < 1024:
         raise _ssl_err(f"{label} at {value} appears corrupted (too small)")
+    stat = path.stat()
+    _validate_bundle_contents(label, str(path.resolve()),
+                              (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino))
+
+
+@lru_cache(maxsize=16)
+def _validate_bundle_contents(label: str, value: str, signature: tuple) -> None:
+    # Successful validation is reusable only while the actual file metadata
+    # is unchanged. Missing, replaced and corrupted bundles are checked again;
+    # exceptions are never cached. Every client still verifies peer TLS.
     try:
-        ctx = ssl.create_default_context(cafile=str(path))
+        ctx = ssl.create_default_context(cafile=value)
     except Exception as exc:
         raise _ssl_err(f"{label} CA bundle at {value} cannot be loaded: {exc}") from exc
     try:

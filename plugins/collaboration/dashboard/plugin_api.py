@@ -11705,14 +11705,6 @@ def _run_hosted_remote_role(
             remote_effect_scope.close_sync()
         except Exception:
             logger.exception("remote hosted role effect scope cleanup failed")
-    if visible and str(remote.get("status") or "queued") not in _REMOTE_TERMINAL_STATUSES:
-        _remote_run_state_message(
-            conversation_id,
-            turn_id,
-            remote,
-            role_label=role_label,
-        )
-
     configured_fallback = _positive_int(
         os.environ.get("HERMES_REMOTE_FALLBACK_SECONDS")
     )
@@ -14914,10 +14906,11 @@ def execute_hosted_workflow(
         else {}
     )
     manager_result = str(run.get("manager_result") or "")
+    dispatch_patch: dict[str, Any] = {}
     if remote_workers and not manager_plan and not plan_only:
         manager_plan = _direct_member_plan(content, fallback_worker_profiles)
         if manager_plan:
-            _persist_hosted_turn(conversation_id, turn_id, patch={
+            dispatch_patch.update({
                 "manager_plan": manager_plan, "profiles": ["default", *manager_plan["workers"]],
                 "stage": "dispatching",
             })
@@ -15083,16 +15076,13 @@ def execute_hosted_workflow(
         turn_plan,
         completed=("manager_planning",),
     )
-    _persist_hosted_turn(
-        conversation_id,
-        turn_id,
-        patch={
+    dispatch_patch.update({
             "turn_plan": turn_plan_snapshot,
             "turn_plan_revision": turn_plan.revision,
             "turn_plan_critical_path": turn_plan_snapshot["critical_path"],
             "turn_plan_ready_nodes": turn_plan_snapshot["initial_ready_nodes"],
-        },
-        protocol_events=[
+        })
+    dispatch_events = [
             {
                 "event_type": "turn.plan_created",
                 "role_stage": "turn",
@@ -15111,8 +15101,11 @@ def execute_hosted_workflow(
                     "contract_revision": "hosted-turn-plan.v1",
                 },
             }
-        ],
-    )
+        ]
+    if not remote_workers:
+        _persist_hosted_turn(conversation_id, turn_id, patch=dispatch_patch,
+                             protocol_events=dispatch_events)
+        dispatch_patch, dispatch_events = {}, []
     _observe_runtime_provider(
         provider_id=_runtime_provider_id("model", str(run.get("model_provider") or "default")),
         interface_key="model:hosted",
@@ -15255,13 +15248,8 @@ def execute_hosted_workflow(
         completed=("manager_planning", "dispatch"),
     )
     ready_worker_ids = {node.node_id for node in ready_worker_nodes}
-    _persist_hosted_turn(
-        conversation_id,
-        turn_id,
-        patch={
-            "turn_plan_ready_nodes": sorted(ready_worker_ids),
-        },
-        protocol_events=[
+    dispatch_patch["turn_plan_ready_nodes"] = sorted(ready_worker_ids)
+    dispatch_events.extend([
             {
                 "event_type": "turn.node_completed",
                 "role_stage": "turn",
@@ -15304,13 +15292,13 @@ def execute_hosted_workflow(
                 }
                 for node in ready_worker_nodes
             ),
-        ],
-    )
+        ])
 
     _persist_hosted_turn(
         conversation_id,
         turn_id,
         patch={
+            **dispatch_patch,
             "stage": "worker_running",
             # Dispatch is the authoritative join point: the dispatcher and
             # every dispatched worker become first-class roster members.
@@ -15326,6 +15314,7 @@ def execute_hosted_workflow(
                 ),
             ],
         },
+        protocol_events=dispatch_events,
         message={
             "role": "assistant",
             "name": dispatcher_profile,

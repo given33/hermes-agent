@@ -696,3 +696,37 @@ def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
     assert list(connector._session_cache) == ["remote-one", "remote-three"]
     assert calls == ["one", "two", "three"]
     connector.close()
+
+
+def test_live_session_telemetry_reads_redacted_snapshot_during_writer_transaction(tmp_path, monkeypatch):
+    import sqlite3
+    from hermes_cli import profiles
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _: tmp_path)
+    session_id = "20260908_123456_abcdef12"
+    secret = "sk-" + "A" * 48
+    writer = SessionDB(tmp_path / "state.db")
+    writer.create_session(session_id, source="cli", model="test-model")
+    writer.append_message(session_id, "assistant", "Verified output " + secret)
+    blocker = sqlite3.connect(tmp_path / "state.db")
+    connector = connector_module.DBB3CloudConnector(SimpleNamespace(), state_file=tmp_path / "checkpoint.json")
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute("UPDATE sessions SET model = ? WHERE id = ?", ("uncommitted-model", session_id))
+        local = {"remote_run_id": "remote-one", "execution_profile": "default"}
+        assert connector._discover_session_id({}, local) == ""
+        connector._execution_streams["remote-one"] = {"session_id": session_id}
+        assert connector._discover_session_id({}, local) == session_id
+        snapshot = connector._session_snapshot({}, local, terminal=False)
+        assert snapshot["model"] == "test-model"
+        exported = connector._read_worker_session("default", session_id)
+        assert "Verified output" in json.dumps(exported)
+        assert secret not in json.dumps(exported)
+        assert writer.export_session(session_id)["messages"][0]["content"].endswith(secret)
+    finally:
+        blocker.rollback()
+        blocker.close()
+        writer.close()
+        connector.close()
