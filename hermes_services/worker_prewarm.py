@@ -7,6 +7,7 @@ No agent, prompt, conversation, or model request is created while idle.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -66,6 +67,9 @@ class WorkerPrewarmPool:
                 if key.startswith("HERMES_KANBAN_"):
                     env.pop(key, None)
             env.update(HERMES_HOME=home, HERMES_PROFILE=profile)
+            code_root = str(Path(__file__).resolve().parent.parent)
+            env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(
+                [code_root, *filter(None, env.get("PYTHONPATH", "").split(os.pathsep))]))
             # Warm the very board this profile will use, so the official
             # first-open integrity/schema migration is paid once while idle.
             if board:
@@ -89,6 +93,10 @@ class WorkerPrewarmPool:
                     if line.strip() == b"HERMES_WORKER_READY":
                         spare["ready"] = True
                         break
+                if not spare["ready"]:
+                    logging.getLogger(__name__).warning(
+                        "Worker prewarm exited before readiness for %s (code %s)",
+                        profile, proc.poll())
 
             threading.Thread(target=ready, name="worker-prewarm-ready", daemon=True).start()
 
