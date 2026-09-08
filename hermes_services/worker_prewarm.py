@@ -151,11 +151,14 @@ class WorkerPrewarmPool:
 
     def _replenish(self, proc, profile: str, board: str) -> None:
         def replace():
-            # Keep CPU-heavy imports off the current task's startup path.
+            # Start the successor immediately while the current task is
+            # waiting on provider/tool work. This makes the next assignment
+            # consume a genuinely ready spare instead of paying the full
+            # import cost after the previous worker exits.
+            self.prepare(profile, board=board)
             proc.wait()
             if proc.stdout:
                 proc.stdout.close()
-            self.prepare(profile, board=board)
         threading.Thread(target=replace, name="worker-prewarm-replace", daemon=True).start()
 
     def close(self) -> None:
