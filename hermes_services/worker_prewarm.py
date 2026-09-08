@@ -183,6 +183,15 @@ def _main() -> None:
     # generated response classes on the first real OpenAI request.
     from openai import OpenAI
     from openai.resources.chat import Completions
+    import hermes_cli.models
+    from agent.models_dev import fetch_models_dev
+    fetch_models_dev(allow_network=False)
+    from agent.ssl_verify import default_httpx_context
+    default_httpx_context()
+    try:
+        import aiohttp
+    except ImportError:
+        pass
     from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
     ensure_mcp_discovery_before_agent_build(logger=cli.logger, single_query=True)
     if os.environ.get("HERMES_KANBAN_DB"):

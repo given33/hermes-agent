@@ -3571,6 +3571,10 @@ def _read_conversation_history(conversation_id: str) -> dict[str, Any]:
     target = _conversation_history_path(conversation_id)
     if target is None:
         return {}
+    from hermes_services.conversation_history import read
+    indexed = read(target)
+    if indexed is not None:
+        return indexed
     try:
         value = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
@@ -3646,6 +3650,21 @@ def _write_conversation_history(
         # This path is reached before hot-state trimming.  Silently returning
         # would make the subsequent trim destroy the only copy of history.
         raise ValueError("invalid conversation id for history sidecar")
+    from hermes_services.conversation_history import active, merge
+    if active(target):
+        incoming = {key: conversation.get(key) for key in (
+            'owner_id', 'account_generation', 'updated_at', 'session_entries')}
+        incoming.update(conversation_id=conversation_id, messages=[
+            _sanitize_history_message(_copy_state_document(item))
+            for item in conversation.get('messages') or [] if isinstance(item, dict)])
+        summary = merge(target, incoming, item_key=_history_item_key)
+        conversation.update(history_message_count=summary['message_count'],
+            history_last_message=summary['last_message'],
+            history_session_entry_count=summary['session_entry_count'])
+        meta_target = _conversation_history_meta_path(conversation_id)
+        if meta_target is not None:
+            _atomic_write_json_file(meta_target, summary)
+        return
     previous = existing if existing is not None else _read_conversation_history(conversation_id)
     if previous and not _history_matches_conversation(previous, conversation):
         previous = {}
@@ -3736,7 +3755,11 @@ def _rewrite_conversation_history_messages(
     meta_target = _conversation_history_meta_path(conversation_id)
     if target is None or meta_target is None:
         return
-    _atomic_write_json_file(target, history)
+    from hermes_services.conversation_history import active, merge
+    if active(target):
+        merge(target, history, item_key=_history_item_key, replace_messages=True)
+    else:
+        _atomic_write_json_file(target, history)
     _atomic_write_json_file(meta_target, {
         "version": 1,
         "conversation_id": conversation_id,
@@ -3781,6 +3804,13 @@ def _persist_conversation_histories(state: dict[str, Any]) -> None:
         target = _conversation_history_path(conversation_id)
         meta_target = _conversation_history_meta_path(conversation_id)
         if target is None or meta_target is None:
+            continue
+        from hermes_services.conversation_history import active
+        if active(target):
+            # Large sidecars upsert only the retained tail. Reading and merging
+            # their full JSON under the account lock made every enqueue slower
+            # as a conversation grew.
+            _write_conversation_history(conversation)
             continue
         # Most saves update one turn. Unchanged transcripts must not repeatedly
         # read, merge and clone every other conversation's complete history.
@@ -24369,7 +24399,9 @@ def clear_room_context(room_id: str, request: Request):
             sidecar = _conversation_history_path(conversation_id)
             if sidecar is not None:
                 try:
-                    sidecar.unlink()
+                    sidecar.unlink(missing_ok=True)
+                    for suffix in ('.sqlite', '.sqlite-wal', '.sqlite-shm'):
+                        sidecar.with_suffix(suffix).unlink(missing_ok=True)
                 except FileNotFoundError:
                     pass
                 except OSError as exc:

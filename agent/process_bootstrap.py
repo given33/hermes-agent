@@ -515,6 +515,9 @@ def build_keepalive_http_client(
         import httpx
 
         proxy = _get_proxy_for_base_url(base_url)
+        if verify is True:
+            from agent.ssl_verify import default_httpx_context
+            verify = default_httpx_context()
 
         limits = httpx.Limits(
             max_keepalive_connections=20,

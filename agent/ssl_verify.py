@@ -22,6 +22,27 @@ def _coerce_insecure(ssl_verify: Any) -> bool:
 
 _CA_CONTEXTS: dict[str, ssl.SSLContext] = {}
 _CA_CONTEXTS_LOCK = threading.Lock()
+_DEFAULT_CONTEXTS: dict[tuple, ssl.SSLContext] = {}
+
+
+def default_httpx_context() -> ssl.SSLContext:
+    """Reuse httpx's verified default context, including its env CA policy."""
+    import certifi
+    import httpx
+    # Directory CA stores can change individual hashed files independently;
+    # keep httpx's normal reload semantics for those operator-managed stores.
+    if os.environ.get('SSL_CERT_DIR') and not os.environ.get('SSL_CERT_FILE'):
+        return httpx.create_ssl_context()
+    path = Path(os.environ.get('SSL_CERT_FILE') or certifi.where())
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    with _CA_CONTEXTS_LOCK:
+        context = _DEFAULT_CONTEXTS.get(key)
+        if context is None:
+            context = httpx.create_ssl_context()
+            _DEFAULT_CONTEXTS.clear()
+            _DEFAULT_CONTEXTS[key] = context
+        return context
 
 
 def _context_for_ca_bundle(ca_path: str) -> ssl.SSLContext:
