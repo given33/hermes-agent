@@ -164,6 +164,7 @@ class WorkerPrewarmPool:
                 except (BrokenPipeError, OSError):
                     # A partial handoff is ambiguous; do not launch a duplicate
                     # worker. Kanban's PID/crash reconciliation owns recovery.
+                    self._replenish(proc, spare["profile"], spare["board"])
                     return proc
                 self._replenish(proc, spare["profile"], spare["board"])
                 return proc

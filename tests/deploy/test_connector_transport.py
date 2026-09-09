@@ -104,3 +104,130 @@ def test_missing_artifacts_do_not_make_a_network_request(tmp_path):
         assert count == 0 and not complete and errors and not transient
     finally:
         connector.close()
+
+
+@pytest.mark.parametrize('once', [True, False])
+def test_terminal_handoff_has_no_fixed_wait_and_honors_once(monkeypatch, capsys, once):
+    calls = []
+    closed = []
+
+    class Connector:
+        _wake_event = SimpleNamespace(wait=lambda **kw: pytest.fail('Handoff must poll immediately'))
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def sync_once(self):
+            calls.append('sync')
+            if len(calls) == 1:
+                return {'terminal_pushed': 1}
+            if once:
+                pytest.fail('--once must stop after a terminal checkpoint')
+            raise connector_module.ConnectorAuthError(401, 'stop')
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(connector_module, '_load_token', lambda path: 'test')
+    monkeypatch.setattr(connector_module, 'CloudRelayClient', lambda *a, **kw: object())
+    monkeypatch.setattr(connector_module, 'DBB3CloudConnector', Connector)
+    monkeypatch.setattr(connector_module.time, 'sleep', lambda *a: pytest.fail('Fixed sleep delays handoff'))
+    args = ['--cloud-url', 'https://example.test', '--quiet'] + (['--once'] if once else [])
+    assert connector_module.main(args) == (0 if once else 78)
+    assert len(calls) == (1 if once else 2)
+    assert closed == [True]
+    assert json.loads(capsys.readouterr().out.splitlines()[0])['terminal_pushed'] == 1
+
+
+def test_terminal_on_pulled_run_wakes_next_stage_without_counting_other_statuses(tmp_path, monkeypatch):
+    cloud = SimpleNamespace(pull_runs=lambda **kw: [{'remote_run_id': 'new'}],
+                            pull_cancellations=lambda **kw: [])
+    connector = connector_module.DBB3CloudConnector(cloud, state_file=tmp_path / 'state.json')
+    connector.checkpoints.save({'runs': {'old': {'acked': True, 'root_task_id': 'old-task', 'status': 'running'}}})
+
+    def accept(payload, state):
+        state['runs']['new'] = {'acked': True, 'root_task_id': 'new-task', 'status': 'running'}
+
+    def sync(remote_id, *_args):
+        connector._last_reported_terminal = remote_id == 'new'
+        return 1, 0
+
+    monkeypatch.setattr(connector, '_accept_run', accept)
+    monkeypatch.setattr(connector, '_sync_local_run', sync)
+    try:
+        result = connector.sync_once()
+        assert result['terminal_pushed'] == 1
+        assert result['statuses'] == 2
+    finally:
+        connector.close()
+
+
+def test_batch_dispatch_precedes_status_and_upload_work(tmp_path, monkeypatch):
+    order = []
+    cloud = SimpleNamespace(pull_runs=lambda **kw: [{'remote_run_id': 'one'}, {'remote_run_id': 'two'}],
+                            pull_cancellations=lambda **kw: [])
+    connector = connector_module.DBB3CloudConnector(cloud, state_file=tmp_path / 'state.json')
+
+    def accept(payload, state):
+        remote_id = payload['remote_run_id']
+        order.append(('dispatch', remote_id))
+        state['runs'][remote_id] = {'acked': True, 'root_task_id': remote_id, 'status': 'running'}
+
+    def sync(remote_id, *_args):
+        order.append(('sync', remote_id))
+        return 1, 0
+
+    connector.checkpoints.save({'runs': {}})
+    monkeypatch.setattr(connector, '_accept_run', accept)
+    monkeypatch.setattr(connector, '_sync_local_run', sync)
+    try:
+        connector.sync_once()
+        assert order == [('dispatch', 'one'), ('dispatch', 'two'), ('sync', 'one'), ('sync', 'two')]
+    finally:
+        connector.close()
+
+
+def test_pull_consumes_old_wake_but_preserves_new_notification(tmp_path):
+    def pull(**kwargs):
+        assert not connector._wake_event.is_set()
+        connector._wake_event.set()
+        return []
+
+    cloud = SimpleNamespace(pull_runs=pull, pull_cancellations=lambda **kw: [])
+    connector = connector_module.DBB3CloudConnector(cloud, state_file=tmp_path / 'state.json')
+    try:
+        connector._wake_event.set()
+        connector.sync_once()
+        assert connector._wake_event.is_set()
+    finally:
+        connector.close()
+
+
+def test_new_assignment_interrupts_artifact_batch_and_retry_keeps_uploaded_files(tmp_path):
+    first, second = tmp_path / 'first.txt', tmp_path / 'second.txt'
+    first.write_text('first')
+    second.write_text('second')
+    uploads = []
+    lists = []
+
+    def upload(remote_id, **kwargs):
+        uploads.append(kwargs['path'])
+        connector._wake_event.set()
+
+    cloud = SimpleNamespace(list_run_attachments=lambda _: lists.append('list') or [], upload_artifact=upload)
+    connector = connector_module.DBB3CloudConnector(cloud, state_file=tmp_path / 'state.json', artifact_roots=[tmp_path])
+    local = {'remote_run_id': 'old', 'root_task_id': 'old-task'}
+    state = {'runs': {'old': local}}
+    paths = [str(first), str(second)]
+    try:
+        connector._wake_event.set()
+        assert connector._upload_artifacts('old', local, paths, state) == (0, False, [], True)
+        assert lists == uploads == []
+        connector._wake_event.clear()
+        assert connector._upload_artifacts('old', local, paths, state) == (1, False, [], True)
+        assert uploads == [first]
+        connector._wake_event.clear()
+        assert connector._upload_artifacts('old', local, paths, state) == (1, True, [], False)
+        assert uploads == [first, second]
+    finally:
+        connector.close()

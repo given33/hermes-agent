@@ -61,3 +61,25 @@ def test_ready_reserve_is_used_while_other_spare_is_preparing(monkeypatch, tmp_p
     with (tmp_path/'worker.log').open('ab') as log:
         assert pool.launch(['hermes', '-p', 'test'], env={'HERMES_HOME': str(tmp_path)}, stdout=log) is proc
     assert pool._spares[str(tmp_path)] == [pending]
+
+
+def test_failed_handoff_replenishes_reserve_without_duplicate_task(monkeypatch, tmp_path):
+    import time
+    from types import SimpleNamespace
+    from hermes_services import worker_prewarm as runtime
+
+    def broken_write(packet):
+        raise BrokenPipeError('spare exited')
+
+    proc = SimpleNamespace(poll=lambda: None, pid=123, stdin=SimpleNamespace(write=broken_write))
+    pool = runtime.WorkerPrewarmPool()
+    spare = {'proc': proc, 'ready': True, 'signature': runtime._signature(str(tmp_path)),
+             'created_at': time.monotonic(), 'profile': 'test', 'board': 'test'}
+    pool._spares[str(tmp_path)] = [spare]
+    replacements = []
+    monkeypatch.setattr(pool, '_replenish', lambda *args: replacements.append(args))
+    monkeypatch.setattr(runtime.subprocess, 'Popen', lambda *a, **kw: __import__('pytest').fail('Duplicate task'))
+    with (tmp_path / 'worker.log').open('ab') as log:
+        assert pool.launch(['hermes', '-p', 'test'], env={'HERMES_HOME': str(tmp_path)}, stdout=log) is proc
+    assert replacements == [(proc, 'test', 'test')]
+    assert pool._spares[str(tmp_path)] == []

@@ -1591,7 +1591,7 @@ class _FakeCloud:
         return target
 
 
-def test_connector_checkpoint_status_and_raw_artifact_are_idempotent(tmp_path):
+def test_connector_checkpoint_status_and_raw_artifact_are_idempotent(tmp_path, monkeypatch):
     connector = _load_connector()
     artifact = tmp_path / "report.pdf"
     artifact.write_bytes(b"%PDF-connector-test")
@@ -1630,6 +1630,8 @@ def test_connector_checkpoint_status_and_raw_artifact_are_idempotent(tmp_path):
         raise AssertionError(command)
 
     state_file = tmp_path / "state" / "checkpoint.json"
+    dispatches = []
+    monkeypatch.setattr(connector.DBB3CloudConnector, '_dispatch_board', lambda self, local: dispatches.append(local['remote_run_id']))
     first = connector.DBB3CloudConnector(
         fake,
         command_runner=command_runner,
@@ -1637,6 +1639,8 @@ def test_connector_checkpoint_status_and_raw_artifact_are_idempotent(tmp_path):
         artifact_roots=[tmp_path],
     )
     result = first.sync_once()
+    assert dispatches == ['run-1']
+    assert result['terminal_pushed'] == 1
     assert result["created"] == 1
     assert result["statuses"] == 1
     assert result["artifacts"] == 1
@@ -1659,7 +1663,8 @@ def test_connector_checkpoint_status_and_raw_artifact_are_idempotent(tmp_path):
     assert len(fake.acks) == 1
     assert len(fake.statuses) == 1
     assert len(fake.uploads) == 1
-    assert show_count["value"] == 2
+    # A completed, uploaded run stays retired across connector restarts.
+    assert show_count["value"] == 1
 
 
 def test_account_remote_run_executes_in_private_overlay_profile(tmp_path, monkeypatch):
@@ -1771,7 +1776,7 @@ def test_deleted_account_remote_run_fails_without_local_execution(tmp_path, monk
         "artifacts": 0,
         "cancelled": 0,
         "steered": 0,
-        "terminal_pushed": 0,
+        "terminal_pushed": 1,
     }
     assert commands == []
     assert len(cloud.failures) == 1
@@ -2169,7 +2174,7 @@ def test_connector_keeps_authoritative_objective_in_utf8_control_file(tmp_path):
         artifact_roots=[tmp_path],
     )
     instance.sync_once()
-    assert "Read the authoritative UTF-8 user objective" in captured["body"]
+    assert run["objective"] in captured["body"]
     assert "kanban_complete" in captured["body"]
     assert "kanban_block" in captured["body"]
     objective_path = next((tmp_path / "state" / "attachments").rglob("objective.txt"))
@@ -2399,6 +2404,8 @@ def test_connector_client_uses_the_connector_route_prefix():
 
 
 def test_connector_client_sends_bound_connector_identity_header():
+    import httpx
+
     connector = _load_connector()
     client = connector.CloudRelayClient(
         "https://example.test/api/plugins/collaboration",
@@ -2406,21 +2413,20 @@ def test_connector_client_sends_bound_connector_identity_header():
         connector_id="dbb3-primary",
     )
 
-    class Response:
-        def __enter__(self):
-            return self
+    requests = []
 
-        def __exit__(self, *_args):
-            return False
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True, "contract_version": 2})
 
-        def read(self):
-            return b'{"ok":true,"contract_version":2}'
-
-    with mock.patch.object(connector.urllib.request, "urlopen", return_value=Response()) as urlopen:
+    client._http.close()
+    client._http = httpx.Client(transport=httpx.MockTransport(respond))
+    try:
         client.probe()
-
-    request = urlopen.call_args.args[0]
-    assert request.get_header("X-connector-id") == "dbb3-primary"
+        assert len(requests) == 1
+        assert requests[0].headers['X-Connector-ID'] == 'dbb3-primary'
+    finally:
+        client.close()
 
 
 def test_terminal_artifact_waits_for_transient_upload_then_reports(tmp_path):

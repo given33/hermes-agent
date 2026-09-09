@@ -249,6 +249,8 @@ runtime_service_assets=(
   "hermes_services/tool_isolation.py"
   "hermes_services/tool_output_artifacts.py"
   "hermes_services/worker_channel.py"
+  "hermes_services/conversation_history.py"
+  "hermes_services/worker_prewarm.py"
   "hermes_cli/account_identity.py"
   "hermes_cli/account_lifecycle.py"
   "hermes_cli/collaboration_plugin_backend.py"

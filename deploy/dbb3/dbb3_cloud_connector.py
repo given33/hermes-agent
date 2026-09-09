@@ -2921,7 +2921,6 @@ class DBB3CloudConnector:
             resolved_profile = _text(current.get("execution_profile"), 128)
         else:
             resolved_profile = _execution_profile_for_run(run_payload)
-        self._boundary_validated_runs.add(remote_id)
         profile_ready_ms = round((time.perf_counter() - preparation_started) * 1000, 3)
         execution_profile = (
             resolved_profile
@@ -3014,6 +3013,7 @@ class DBB3CloudConnector:
         acknowledged_ms = round((time.perf_counter() - preparation_started) * 1000, 3)
         self._watch_execution(current)
         self._dispatch_board(current)
+        self._boundary_validated_runs.add(remote_id)
         if new_assignment:
             print(json.dumps({"event": "worker.preparation", "remote_run_id": remote_id,
                 "root_task_id": current.get("root_task_id"), "started_at": preparation_wall_ms,
@@ -3240,6 +3240,8 @@ class DBB3CloudConnector:
         root_id = _text(local.get("root_task_id"), 256)
         if not any(self._allowed_artifact(path) is not None for path in paths):
             return 0, False, [f"Artifact is missing or outside allowed roots: {path}" for path in paths], False
+        if self._wake_event.is_set():
+            return 0, False, [], True
         try:
             existing_attachments = self.cloud_client.list_run_attachments(remote_id)
         except (CloudHTTPError, ConnectorContractError, OSError, urllib.error.URLError):
@@ -3250,6 +3252,10 @@ class DBB3CloudConnector:
             if isinstance(item, dict) and _text(item.get("sha256"), 64)
         }
         for raw_path in paths:
+            # Yield between files when a new assignment arrives. Its push
+            # must not wait behind the rest of a previous run's uploads.
+            if self._wake_event.is_set():
+                return count, False, permanent_errors, True
             path = self._allowed_artifact(raw_path)
             if path is None:
                 permanent_errors.append(f"Artifact is missing or outside allowed roots: {raw_path}")
@@ -3335,7 +3341,8 @@ class DBB3CloudConnector:
         local: dict[str, Any],
         state: dict[str, Any],
     ) -> tuple[int, int]:
-        if remote_id in self._boundary_validated_runs:
+        just_accepted = remote_id in self._boundary_validated_runs
+        if just_accepted:
             self._boundary_validated_runs.discard(remote_id)
         else:
             self._assert_local_account_boundary(local, state)
@@ -3351,8 +3358,9 @@ class DBB3CloudConnector:
             local["acked"] = False
             self.checkpoints.save(state)
             return 0, 0
-        self._watch_execution(local)
-        self._dispatch_board(local)
+        if not just_accepted:
+            self._watch_execution(local)
+            self._dispatch_board(local)
         sync_started = time.monotonic()
         detail = self._show_task(_text(local.get("root_task_id"), 256), local)
         payload, artifact_paths = self._compact_status(detail, local)
@@ -3555,15 +3563,6 @@ class DBB3CloudConnector:
                     self._last_reported_terminal = True
         return reported, uploaded
 
-    def _process_run(self, run_payload: dict[str, Any], state: dict[str, Any]) -> tuple[int, int]:
-        local = self._accept_run(run_payload, state)
-        remote_id = _text(run_payload.get("remote_run_id"), 256)
-        if not local or not remote_id:
-            return 0, 0
-        if _coerce_flag(local.get("terminal_acked")) and str(local.get("status") or "") in TERMINAL_STATUSES:
-            return 0, 0
-        return self._sync_local_run(remote_id, local, state)
-
     def _drain_steers(self, state: dict[str, Any]) -> int:
         """Apply pending run.steer events: unblock the local task with the
         user's answer injected as a comment (UNBLOCK: <choice>) so the
@@ -3724,6 +3723,10 @@ class DBB3CloudConnector:
         return 1
 
     def sync_once(self) -> dict[str, int]:
+        # Consume notifications before the authoritative pull. Notifications
+        # arriving during this cycle stay set and trigger the next pull.
+        self._wake_event.clear()
+        self._boundary_validated_runs.clear()
         state = self.checkpoints.load()
         created = 0
         statuses = 0
@@ -3741,8 +3744,6 @@ class DBB3CloudConnector:
             if not isinstance(run_payload, dict):
                 continue
             remote_id = _text(run_payload.get("remote_run_id"), 256)
-            if remote_id:
-                processed.add(remote_id)
             # Durable steers ride on the pull payload: if the SSE push was
             # lost (stream down, server restart), the answer still arrives
             # here and gets applied by _drain_steers below.
@@ -3752,7 +3753,9 @@ class DBB3CloudConnector:
                     if isinstance(steer, dict):
                         self._queue_steer(steer)
             try:
-                made, uploaded = self._process_run(run_payload, state)
+                # Dispatch the entire leased batch before status snapshots or
+                # uploads from any earlier run can block a later assignment.
+                self._accept_run(run_payload, state)
             except RuntimeError as exc:
                 # A root that cannot be created is a durable terminal failure;
                 # a root that already exists is left pending for the next
@@ -3760,6 +3763,7 @@ class DBB3CloudConnector:
                 remote_id = _text(run_payload.get("remote_run_id"), 256)
                 local = _checkpoint_run(state, remote_id)
                 if remote_id:
+                    processed.add(remote_id)
                     local.setdefault("remote_run_id", remote_id)
                     local.setdefault(
                         "claim_token",
@@ -3781,16 +3785,17 @@ class DBB3CloudConnector:
                                 else "DBB3 could not create the Kanban root"
                             ),
                         )
-                    statuses += int(self._flush_terminal_failure(remote_id, local, state))
+                    failed = int(self._flush_terminal_failure(remote_id, local, state))
+                    statuses += failed
+                    terminal_pushed += failed
                 continue
-            created += made
-            artifacts += uploaded
-            statuses += int(made > 0)
         for remote_id, local in list((state.get("runs") or {}).items()):
             if remote_id in processed or not isinstance(local, dict):
                 continue
             if isinstance(local.get("pending_terminal_failure"), dict):
-                statuses += int(self._flush_terminal_failure(remote_id, local, state))
+                failed = int(self._flush_terminal_failure(remote_id, local, state))
+                statuses += failed
+                terminal_pushed += failed
                 continue
             if not _coerce_flag(local.get("acked")) or not local.get("root_task_id"):
                 continue
@@ -3819,6 +3824,7 @@ class DBB3CloudConnector:
                     self.checkpoints.save(state)
                 continue
             try:
+                self._last_reported_terminal = False
                 made, uploaded = self._sync_local_run(remote_id, local, state)
             except (RuntimeError, ValueError, json.JSONDecodeError):
                 continue
@@ -3922,6 +3928,7 @@ def main(argv: list[str] | None = None) -> int:
         return exit_code
 
     while True:
+        terminal_pushed = False
         try:
             if _latency_trace is not None and _latency_trace.enabled():
                 with _latency_trace.span(
@@ -3938,11 +3945,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
             else:
                 result = connector.sync_once()
-            if int(result.get("terminal_pushed") or 0) > 0:
-                # A terminal checkpoint was accepted; the cloud may have
-                # created the next role run. Poll again almost immediately.
-                time.sleep(0.3)
-                continue
+            terminal_pushed = int(result.get("terminal_pushed") or 0) > 0
             if not args.quiet or any(int(value) for value in result.values()):
                 print(json.dumps({"timestamp": now_iso(), **result}, ensure_ascii=False), flush=True)
         except ConnectorAuthError as exc:
@@ -3974,10 +3977,13 @@ def main(argv: list[str] | None = None) -> int:
                 return finish(75)
         if args.once:
             return finish(0)
-        # Wait for the poll interval or an SSE push (run.created / terminal)
-        # that signals work may be waiting, then clear and poll again.
+        if terminal_pushed:
+            # The next role may already be queued. Keep logging and --once
+            # semantics, but do not add a fixed delay to every handoff.
+            continue
+        # sync_once consumes the notification before pulling, including on
+        # the immediate terminal-handoff path that bypasses this wait.
         connector._wake_event.wait(timeout=max(0.5, args.interval))
-        connector._wake_event.clear()
 
 
 if __name__ == "__main__":

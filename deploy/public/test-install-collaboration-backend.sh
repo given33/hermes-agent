@@ -24,6 +24,13 @@ elif [[ ! -x "${runtime_python}" ]]; then
     runtime_python="$(command -v python3)"
   fi
 fi
+if [[ "$("${runtime_python}" -c 'import sys; print(sys.platform)')" != linux ]]; then
+  if [[ -n "${HERMES_TEST_RUNTIME_PYTHON:-}" ]]; then
+    printf '%s\n' 'Installer harness requires a Linux Python runtime' >&2
+    exit 1
+  fi
+  runtime_python="$(command -v python3)"
+fi
 bootstrap_python="${HERMES_TEST_BOOTSTRAP_PYTHON:-$(command -v python3)}"
 bootstrap_python="$(realpath -e -- "${bootstrap_python}")"
 version="$(python3 - "${repo}/plugins/collaboration/dashboard/manifest.json" <<'PY'
@@ -248,6 +255,8 @@ runtime_files=(
   "hermes_services/tool_isolation.py"
   "hermes_services/tool_output_artifacts.py"
   "hermes_services/worker_channel.py"
+  "hermes_services/conversation_history.py"
+  "hermes_services/worker_prewarm.py"
   "hermes_cli/account_identity.py"
   "hermes_cli/account_lifecycle.py"
   "hermes_cli/collaboration_plugin_backend.py"

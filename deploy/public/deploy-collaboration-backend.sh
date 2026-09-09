@@ -169,6 +169,8 @@ required_runtime_sources=(
   "hermes_services/tool_isolation.py"
   "hermes_services/tool_output_artifacts.py"
   "hermes_services/worker_channel.py"
+  "hermes_services/conversation_history.py"
+  "hermes_services/worker_prewarm.py"
   "hermes_runtime/__init__.py"
   "hermes_runtime/capabilities.py"
   "hermes_runtime/collaboration.py"
