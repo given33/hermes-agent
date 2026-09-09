@@ -24,7 +24,11 @@ elif [[ ! -x "${runtime_python}" ]]; then
     runtime_python="$(command -v python3)"
   fi
 fi
-if [[ "$("${runtime_python}" -c 'import sys; print(sys.platform)')" != linux ]]; then
+runtime_platform=""
+if ! runtime_platform="$("${runtime_python}" -c 'import sys; print(sys.platform)' 2>/dev/null)"; then
+  runtime_platform=""
+fi
+if [[ "${runtime_platform}" != linux ]]; then
   if [[ -n "${HERMES_TEST_RUNTIME_PYTHON:-}" ]]; then
     printf '%s\n' 'Installer harness requires a Linux Python runtime' >&2
     exit 1
